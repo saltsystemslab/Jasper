@@ -463,8 +463,8 @@ __host__ uint32_t get_smem_size(const uint32_t beam_width,
 }
 
 template <typename Cfg>
-__host__ BeamSearchResult<typename Cfg::graph_cfg_t>
-beam_search(const BeamSearchParams<Cfg>& p) {
+__host__ beam_search_result<typename Cfg::graph_cfg_t>
+beam_search(const beam_search_params<Cfg>& p) {
 
   using entry_t = typename Cfg::entry_t;
 
@@ -473,7 +473,7 @@ beam_search(const BeamSearchParams<Cfg>& p) {
   uint32_t smem = get_smem_size<typename Cfg::index_t, typename Cfg::distance_t, typename Cfg::data_t>(
       p.beam_width, Cfg::block_size, p.k, p.data_vectors.dim);
 
-  BeamSearchResult<typename Cfg::graph_cfg_t> result{};
+  beam_search_result<typename Cfg::graph_cfg_t> result{};
 
   // Allocate frontier
   cudaMalloc(&result.frontier, sizeof(entry_t) * p.query_vectors.n_vectors * p.k);

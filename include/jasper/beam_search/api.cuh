@@ -6,33 +6,33 @@
 namespace jasper {
 
 // Runtime search parameters — the stuff users actually change between calls
-struct SearchParams {
+struct search_params {
   uint32_t k          = 10;
   uint32_t beam_width = 64;
   uint32_t limit      = 512;
   bool     get_visited = false;
 };
 
-template <typename GraphCfg,
+template <typename GRAPH_CFG,
           uint32_t BLOCK_SIZE,
           uint32_t MAX_SEARCH_WIDTH,
           uint32_t TILE_SIZE,
           uint32_t MAX_RESULT_SIZE,
           bool GET_VISITED>
-BeamSearchResult<GraphCfg> search_impl(const graph<GraphCfg>&             g,
-                 typename GraphCfg::vector_view_t&  d_queries,
-                 const SearchParams&                params) {
+beam_search_result<GRAPH_CFG> search_impl(const graph<GRAPH_CFG>& g,
+                 typename GRAPH_CFG::vector_view_t&  d_queries,
+                 const search_params&                params) {
 
-  using Cfg = BeamSearchConfig<
-      GraphCfg,
-      GraphCfg::dist_func,
+  using Cfg = beam_search_config<
+      GRAPH_CFG,
+      GRAPH_CFG::dist_func,
       BLOCK_SIZE,
       GET_VISITED,
       MAX_SEARCH_WIDTH,
       TILE_SIZE,
       MAX_RESULT_SIZE>;
 
-  BeamSearchParams<Cfg> bp {
+  beam_search_params<Cfg> bp {
     .graph          = g,
     .data_vectors   = g.vectors,
     .query_vectors  = d_queries,
@@ -45,20 +45,20 @@ BeamSearchResult<GraphCfg> search_impl(const graph<GraphCfg>&             g,
   return beam_search<Cfg>(bp);
 }
 
-template <typename GraphCfg,
+template <typename GRAPH_CFG,
           uint32_t BLOCK_SIZE = 64,
           uint32_t MAX_SEARCH_WIDTH = 512,
           uint32_t TILE_SIZE = 4,
           uint32_t MAX_RESULT_SIZE = 1024>
-BeamSearchResult<GraphCfg> search(const graph<GraphCfg>&                          g,
-            typename GraphCfg::vector_view_t                d_queries,
-            const SearchParams&                             params = {}) {
+beam_search_result<GRAPH_CFG> search(const graph<GRAPH_CFG>& g,
+            typename GRAPH_CFG::vector_view_t                d_queries,
+            const search_params&                             params = {}) {
   if (params.get_visited) {
-    return search_impl<GraphCfg, BLOCK_SIZE, MAX_SEARCH_WIDTH,
+    return search_impl<GRAPH_CFG, BLOCK_SIZE, MAX_SEARCH_WIDTH,
                        TILE_SIZE, MAX_RESULT_SIZE, true>(
         g, d_queries, params);
   } else {
-    return search_impl<GraphCfg, BLOCK_SIZE, MAX_SEARCH_WIDTH,
+    return search_impl<GRAPH_CFG, BLOCK_SIZE, MAX_SEARCH_WIDTH,
                        TILE_SIZE, MAX_RESULT_SIZE, false>(
         g, d_queries, params);
   }

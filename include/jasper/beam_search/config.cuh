@@ -12,7 +12,7 @@ template <typename GRAPH_CFG,
           uint32_t MAX_SEARCH_WIDTH = 512,
           uint32_t TILE_SIZE = 4,
           uint32_t MAX_RESULT_SIZE=1024>
-struct BeamSearchConfig {
+struct beam_search_config {
   using graph_cfg_t  = GRAPH_CFG;
   using index_t       = typename GRAPH_CFG::index_t;
   using data_t        = typename GRAPH_CFG::data_t;
@@ -30,7 +30,7 @@ struct BeamSearchConfig {
 };
 
 template <typename Cfg>
-struct BeamSearchParams {
+struct beam_search_params {
   // Graph
   typename Cfg::graph_t       graph;
 
@@ -46,7 +46,7 @@ struct BeamSearchParams {
 };
 
 template <typename GRAPH_CFG>
-struct BeamSearchResult {
+struct beam_search_result {
   using index_t       = typename GRAPH_CFG::index_t;
   using distance_t    = typename GRAPH_CFG::distance_t;
   using entry_t = thrust::pair<index_t, distance_t>;
