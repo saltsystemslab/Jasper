@@ -1,6 +1,10 @@
 #pragma once
 
+#include <limits>
+
 namespace jasper {
+
+// static constexpr uint32_t INVALID_INDEX = 0x7FFFFFFFu;
 
 // Helper function to read an entry.
 // the structure of the entry is

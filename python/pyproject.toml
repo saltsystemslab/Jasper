@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jasper"
+version = "0.1.0"
+description = "GPU graph-based nearest neighbor search"
+requires-python = ">=3.10"
+dependencies = [
+    "torch",
+    "apache-tvm-ffi",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[tool.setuptools.package-data]
+jasper = ["lib/*.so"]
