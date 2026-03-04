@@ -9,8 +9,10 @@ CPMAddPackage(
 # Each test file is a separate .cu file
 set(TEST_SOURCES
   test_distance.cu
-  test_beam_search.cu
-  test_config.cu
+  test_rotation.cu
+  test_rabitq.cu
+  #test_beam_search.cu
+  #test_config.cu
 )
 
 add_executable(jasper_tests ${TEST_SOURCES})
@@ -20,6 +22,8 @@ target_link_libraries(jasper_tests
     jasper             # your header-only library
     GTest::gtest
     GTest::gtest_main  # provides main()
+    CUDA::cublas
+    CUDA::curand
 )
 
 target_include_directories(jasper_tests

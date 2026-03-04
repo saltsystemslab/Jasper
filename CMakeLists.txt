@@ -1,6 +1,10 @@
 cmake_minimum_required(VERSION 3.18 FATAL_ERROR)
 project(Jasper LANGUAGES CXX CUDA)
 
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+  set(CMAKE_CUDA_ARCHITECTURES native)
+endif()
+
 include("cmake/CPM.cmake")
 
 find_package(CUDAToolkit REQUIRED)
@@ -36,6 +40,7 @@ target_link_libraries(jasper
     CUDA::cudart
 )
 
+# Testing
 option(JASPER_BUILD_TESTS "Build unit tests" OFF)
 if(JASPER_BUILD_TESTS)
   enable_testing()

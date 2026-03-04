@@ -1,5 +1,7 @@
 #pragma once
 
+#include <fstream>
+
 namespace jasper {
 
 template <typename DATA_T>

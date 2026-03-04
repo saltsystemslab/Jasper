@@ -1,3 +1,4 @@
+Compile library
 ```bash
 # Install tvm_ffi first
 pip install apache-tvm-ffi
@@ -9,7 +10,11 @@ cmake --install build  # copies libjasper_ffi.so → python/jasper/lib/
 
 # Install the Python package
 pip install -e python/
+```
 
-# Test
-python -c "import jasper; jasper.load_graph('sift1m.graph', dim=128)"
+Run tests
+```bash
+cmake -B build -DJASPER_BUILD_TESTS=ON
+cmake --build build
+cd build && ctest --output-on-failure
 ```
