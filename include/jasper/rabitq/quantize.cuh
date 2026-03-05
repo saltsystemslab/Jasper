@@ -201,10 +201,10 @@ __global__ void rabitq_quantize_kernel(
 
   // Dynamic shared memory: per-tile workspace
   // Layout: [tiles_per_block][dim floats + dim uint8s]
-  extern __shared__ char smem[];
+  extern __shared__ char rq_smem[];
   uint32_t per_tile_bytes = sizeof(float) * dim + sizeof(uint8_t) * dim;
   float* residual_vec = reinterpret_cast<float*>(
-      smem + tile_id_in_block * per_tile_bytes);
+      rq_smem + tile_id_in_block * per_tile_bytes);
   uint8_t* uncompressed_code = reinterpret_cast<uint8_t*>(
       residual_vec + dim);
 

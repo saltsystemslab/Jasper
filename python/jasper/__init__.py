@@ -23,7 +23,6 @@ class DataType(str, Enum):
 
 
 # ── Config registry (must match JASPER_FOR_EACH_CONFIG in C++) ──
-# Maps (data_type, n_neighbors, distance_func) → config_id string
 _CONFIGS: dict[tuple[DataType, int, DistanceFunc], str] = {
     (DataType.FLOAT32, 32,  DistanceFunc.L2):             "f32_r32_l2",
     (DataType.FLOAT32, 64,  DistanceFunc.L2):             "f32_r64_l2",
@@ -34,7 +33,6 @@ _CONFIGS: dict[tuple[DataType, int, DistanceFunc], str] = {
     (DataType.UINT8,   64,  DistanceFunc.L2):             "u8_r64_l2",
 }
 
-# Torch dtype mapping
 _DTYPE_MAP = {
     DataType.FLOAT32: torch.float32,
     DataType.UINT8: torch.uint8,
@@ -69,6 +67,7 @@ def _get_fns(config_id: str):
     if config_id not in _fn_cache:
         _fn_cache[config_id] = (
             getattr(_mod, f"jasper_load_{config_id}"),
+            getattr(_mod, f"jasper_construct_{config_id}"),
             getattr(_mod, f"jasper_search_{config_id}"),
         )
     return _fn_cache[config_id]
@@ -80,18 +79,44 @@ class Graph:
     A GPU-resident graph index for nearest neighbor search.
 
     Usage:
-        g = jasper.Graph("sift1m.graph", dim=128, n_neighbors=32)
+        # Load from file
+        g = jasper.Graph.load("sift1m.graph", dim=128, n_neighbors=32)
+
+        # Build from vectors
+        vectors = torch.randn(100000, 128, device="cuda")
+        g = jasper.Graph.build(vectors, n_neighbors=32)
+
+        # Search
         indices, distances = g.search(queries, k=10)
     """
 
     def __init__(
         self,
+        handle: int,
+        config_id: str,
+        data_type: DataType,
+        distance: DistanceFunc,
+        n_neighbors: int,
+        dim: int,
+    ):
+        self._handle = handle
+        self._config_id = config_id
+        self._data_type = data_type
+        self._distance = distance
+        self._n_neighbors = n_neighbors
+        self._dim = dim
+        self._torch_dtype = _DTYPE_MAP[data_type]
+        _, _, self._search_fn = _get_fns(config_id)
+
+    @classmethod
+    def load(
+        cls,
         path: str,
         dim: int,
         n_neighbors: int = 32,
         data_type: DataType | str = DataType.FLOAT32,
         distance: DistanceFunc | str = DistanceFunc.L2,
-    ):
+    ) -> "Graph":
         """
         Load a graph from a binary file into GPU memory.
 
@@ -107,17 +132,61 @@ class Graph:
         if isinstance(distance, str):
             distance = DistanceFunc(distance)
 
-        self._config_id = _resolve_config(data_type, n_neighbors, distance)
-        self._data_type = data_type
-        self._distance = distance
-        self._n_neighbors = n_neighbors
-        self._dim = dim
-        self._torch_dtype = _DTYPE_MAP[data_type]
+        config_id = _resolve_config(data_type, n_neighbors, distance)
+        load_fn, _, _ = _get_fns(config_id)
+        handle = load_fn(path, dim)
 
-        load_fn, self._search_fn = _get_fns(self._config_id)
-        self._handle: int | None = load_fn(path, dim)
+        return cls(handle, config_id, data_type, distance, n_neighbors, dim)
 
-        self._free_fn = _free_graph_fn
+    @classmethod
+    def build(
+        cls,
+        vectors: torch.Tensor,
+        n_neighbors: int = 32,
+        distance: DistanceFunc | str = DistanceFunc.L2,
+        alpha: float = 1.2,
+        max_batch_size: int = 10000,
+    ) -> "Graph":
+        """
+        Construct a graph index from vectors on GPU.
+
+        Args:
+            vectors:        CUDA tensor of shape [n_vectors, dim].
+            n_neighbors:    Max neighbors per node (R).
+            distance:       Distance function: "l2" or "ip".
+            alpha:          Pruning factor (1.0 = strict, >1.0 = long hops).
+            max_batch_size: Max vectors processed per batch during construction.
+
+        Returns:
+            A Graph ready for search.
+        """
+        if isinstance(distance, str):
+            distance = DistanceFunc(distance)
+
+        if not vectors.is_cuda:
+            raise ValueError("vectors must be a CUDA tensor")
+        if vectors.ndim != 2:
+            raise ValueError(f"vectors must be 2D, got {vectors.ndim}D")
+
+        vectors = vectors.contiguous()
+        dim = vectors.size(1)
+
+        # Infer data type from tensor dtype
+        if vectors.dtype == torch.float32:
+            data_type = DataType.FLOAT32
+        elif vectors.dtype == torch.uint8:
+            data_type = DataType.UINT8
+        else:
+            raise ValueError(
+                f"Unsupported tensor dtype: {vectors.dtype}. "
+                f"Use torch.float32 or torch.uint8."
+            )
+
+        config_id = _resolve_config(data_type, n_neighbors, distance)
+        _, construct_fn, _ = _get_fns(config_id)
+        handle = construct_fn(vectors, dim, alpha, max_batch_size)
+
+        return cls(handle, config_id, data_type, distance, n_neighbors, dim)
 
     @property
     def dim(self) -> int:
@@ -151,7 +220,7 @@ class Graph:
         Run beam search on this graph.
 
         Args:
-            queries:    CUDA tensor of shape [n_queries, dim]
+            queries:    CUDA tensor of shape [n_queries, dim].
             k:          Number of nearest neighbors to return.
             beam_width: Search beam width.
             limit:      Max iterations per query.
@@ -193,9 +262,9 @@ class Graph:
         return out_indices, out_distances
 
     def free(self):
-      if self._handle is not None:
-        self._free_fn(self._handle)
-        self._handle = None
+        if self._handle is not None:
+            _free_graph_fn(self._handle)
+            self._handle = None
 
     def _check_alive(self):
         if self._handle is None:
@@ -218,15 +287,11 @@ class Graph:
 #
 # import jasper
 #
-# # Float32 vectors, 32 neighbors, L2 distance
-# g = jasper.Graph("sift1m.graph", dim=128, n_neighbors=32)
-# print(g)  # Graph(n_vectors=10000000, dim=128, R=32, dtype=f32, dist=l2)
+# # Load from file
+# g = jasper.Graph.load("sift1m.graph", dim=128, n_neighbors=32)
+# indices, distances = g.search(queries, k=10)
 #
-# queries = torch.randn(1000, 128, device="cuda")
-# indices, distances = g.search(queries, k=10, beam_width=64)
-#
-# # Uint8 vectors, 64 neighbors, L2
-# g2 = jasper.Graph("bigann.graph", dim=128, n_neighbors=64, data_type="u8")
-#
-# # Inner product
-# g3 = jasper.Graph("emb.graph", dim=768, n_neighbors=32, distance="ip")
+# # Build from vectors
+# vectors = torch.randn(1_000_000, 128, device="cuda")
+# g = jasper.Graph.build(vectors, n_neighbors=64, alpha=1.2)
+# indices, distances = g.search(queries, k=10)

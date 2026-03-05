@@ -13,7 +13,7 @@ struct rabitq_node_view {
   T* f_add;
   T* f_rescale;
 
-  __host__ __device__ rabitq_node_view() = default;
+  __host__ __device__ rabitq_node_view() {};
 
   // Construct from a pointer to this node's data region
   __host__ __device__ rabitq_node_view(char* data, uint32_t code_bytes)
@@ -28,7 +28,7 @@ struct const_rabitq_node_view {
   const T* f_add;
   const T* f_rescale;
 
-  __host__ __device__ const_rabitq_node_view() = default;
+  __host__ __device__ const_rabitq_node_view() {};
 
   __host__ __device__ const_rabitq_node_view(const char* data, uint32_t code_bytes)
       : bin_code(reinterpret_cast<const uint8_t*>(data))

@@ -13,18 +13,8 @@ namespace jasper_ffi {
 
 namespace ffi = tvm::ffi;
 
-// ═══════════════════════════════════════════════════════════════
-// Compile-time config generation
-//
-// Define all supported configs here. Each macro invocation
-// instantiates the full template chain (load, search, free)
-// for that config.
-// ═══════════════════════════════════════════════════════════════
-
 // ── Enumerate all configs ──────────────────────────────────────
 // (CONFIG_ID, INDEX_T, N_NEIGHBORS, DATA_T, DISTANCE_T, DIST_FUNC)
-//
-// Add new rows to support more configs — everything else is auto-generated.
 
 #define JASPER_FOR_EACH_CONFIG(X)                                              \
   X(f32_r32_l2,   uint32_t, 32, float, float, jasper::distance_func::L2)      \
@@ -35,18 +25,26 @@ namespace ffi = tvm::ffi;
   X(u8_r32_l2,    uint32_t, 32, uint8_t, float, jasper::distance_func::L2)    \
   X(u8_r64_l2,    uint32_t, 64, uint8_t, float, jasper::distance_func::L2)
 
-// ── Generate config types ──────────────────────────────────────
+// ── Generate graph config types ────────────────────────────────
 #define DECLARE_CONFIG(id, IDX, R, DAT, DIST, FUNC) \
   using cfg_##id = jasper::graph_config<IDX, R, DAT, DIST, FUNC>;
 
 JASPER_FOR_EACH_CONFIG(DECLARE_CONFIG)
 #undef DECLARE_CONFIG
 
+// ── Generate construct config types ────────────────────────────
+// (block_size=128, tile_size=4, R from graph config, L=128)
+#define DECLARE_CONSTRUCT_CONFIG(id, IDX, R, DAT, DIST, FUNC) \
+  using construct_cfg_##id = jasper::graph_construct_config<cfg_##id, 128, 4, R, 128>;
+
+JASPER_FOR_EACH_CONFIG(DECLARE_CONSTRUCT_CONFIG)
+#undef DECLARE_CONSTRUCT_CONFIG
+
 // ── Graph storage using variant ────────────────────────────────
 #define VARIANT_ENTRY(id, ...) jasper::graph<cfg_##id>,
 using GraphVariant = std::variant<
   JASPER_FOR_EACH_CONFIG(VARIANT_ENTRY)
-  std::monostate  // sentinel for empty
+  std::monostate
 >;
 #undef VARIANT_ENTRY
 
@@ -67,14 +65,37 @@ __global__ void unpack_results_kernel(
   }
 }
 
-// ── Per-config load/search/free implementations ────────────────
-// The macro generates a typed load, search, and free for each config.
+// ── Per-config load/search/construct implementations ───────────
 
 #define DEFINE_OPS(id, IDX, R, DAT, DIST, FUNC)                               \
                                                                                \
 int64_t LoadGraph_##id(ffi::String path, int64_t dim) {                        \
   auto g = jasper::load_graph_from_file<cfg_##id>(                             \
       std::string(path), static_cast<uint32_t>(dim));                          \
+  std::lock_guard<std::mutex> lock(g_mutex);                                   \
+  int64_t handle = g_next_handle++;                                            \
+  g_graphs[handle] = std::move(g);                                             \
+  return handle;                                                               \
+}                                                                              \
+                                                                               \
+int64_t ConstructGraph_##id(ffi::TensorView vectors,                           \
+                            int64_t dim,                                        \
+                            double alpha,                                       \
+                            int64_t max_batch_size) {                           \
+  uint32_t n_vectors = static_cast<uint32_t>(vectors.size(0));                 \
+  uint32_t d = static_cast<uint32_t>(dim);                                     \
+                                                                               \
+  jasper::vector_view<DAT> vecs(                                               \
+      static_cast<DAT*>(vectors.data_ptr()), d, n_vectors);                    \
+                                                                               \
+  jasper::graph_construct_params<construct_cfg_##id> params;                    \
+  params.data_vectors   = vecs;                                                \
+  params.alpha          = static_cast<float>(alpha);                           \
+  params.max_batch_size = static_cast<uint32_t>(max_batch_size);               \
+  params.on_host        = false;                                               \
+                                                                               \
+  auto g = jasper::construct_graph<construct_cfg_##id>(params);                \
+                                                                               \
   std::lock_guard<std::mutex> lock(g_mutex);                                   \
   int64_t handle = g_next_handle++;                                            \
   g_graphs[handle] = std::move(g);                                             \
@@ -96,10 +117,10 @@ void Search_##id(int64_t handle,                                               \
   auto& g = *gp;                                                               \
                                                                                \
   uint32_t n_queries = static_cast<uint32_t>(queries.size(0));                 \
-  uint32_t dim = g.vectors.dim;                                                \
+  uint32_t dim_ = g.vectors.dim;                                               \
                                                                                \
   jasper::vector_view<DAT> d_queries(                                          \
-      static_cast<DAT*>(queries.data_ptr()), dim, n_queries);                  \
+      static_cast<DAT*>(queries.data_ptr()), dim_, n_queries);                 \
                                                                                \
   jasper::search_params params{                                                 \
       .k          = static_cast<uint32_t>(k),                                  \
@@ -177,8 +198,9 @@ int64_t GetDim(int64_t handle) {
 
 // ── Export all generated functions ──────────────────────────────
 #define EXPORT_OPS(id, ...)                                                    \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_load_##id,   jasper_ffi::LoadGraph_##id); \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_search_##id, jasper_ffi::Search_##id);
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_load_##id,      jasper_ffi::LoadGraph_##id);      \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_construct_##id,  jasper_ffi::ConstructGraph_##id); \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_search_##id,     jasper_ffi::Search_##id);
 
 JASPER_FOR_EACH_CONFIG(EXPORT_OPS)
 #undef EXPORT_OPS

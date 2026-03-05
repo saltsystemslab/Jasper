@@ -9,6 +9,9 @@ include("cmake/CPM.cmake")
 
 find_package(CUDAToolkit REQUIRED)
 
+find_package(Thrust REQUIRED CONFIG)
+thrust_create_target(ThrustInterface)
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -38,6 +41,8 @@ target_compile_options(jasper
 target_link_libraries(jasper
   INTERFACE
     CUDA::cudart
+    CUDA::toolkit
+    ThrustInterface
 )
 
 # Testing
@@ -62,7 +67,13 @@ if(JASPER_BUILD_FFI)
 
   # Build the .so
   add_library(jasper_ffi SHARED ffi/jasper_ffi.cu)
-  target_link_libraries(jasper_ffi PRIVATE jasper)
+  target_link_libraries(jasper_ffi PRIVATE 
+    jasper 
+    CUDA::cublas
+    CUDA::curand
+    CUDA::cusolver
+    CUDA::cusparse
+  )
 
   # tvm_ffi_configure_target sets up:
   #   - include paths for tvm/ffi headers

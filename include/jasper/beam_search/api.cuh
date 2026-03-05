@@ -5,7 +5,6 @@
 
 namespace jasper {
 
-// Runtime search parameters — the stuff users actually change between calls
 struct search_params {
   uint32_t k          = 10;
   uint32_t beam_width = 64;

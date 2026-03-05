@@ -5,6 +5,8 @@
 #include <iostream>
 #include <vector>
 
+#include <cooperative_groups.h>
+
 #include "jasper/index/vector.cuh"
 #include "jasper/index/graph.cuh"
 #include "jasper/beam_search/config.cuh"
@@ -171,9 +173,9 @@ __device__ void merge_sort(ENTRY_T *result_buffer,
 }
 
 // clip the search results to beam_width
-__device__ void clip_k(uint32_t* result_buffer_count, const uint32_t & k) {
+__device__ void clip_k(uint32_t* result_buffer_count, const uint32_t & beam_width) {
   if (threadIdx.x == 0) {
-    result_buffer_count[0] = min(result_buffer_count[0], k);
+    result_buffer_count[0] = min(result_buffer_count[0], beam_width);
   }
   __syncthreads();
 }
@@ -361,9 +363,11 @@ __global__ void beam_search_single_kernel(
           get_index(result_buffer[frontierIdx]);
       visited_results[query_id * MAX_RESULT_SIZE+ visited_counter].second =
           get_distance(result_buffer[frontierIdx]);
-      assert(visited_counter < MAX_RESULT_SIZE);
+      // assert(visited_counter < MAX_RESULT_SIZE);
     }
     visited_counter += 1;
+    // break if we exceeded the result size for visited list.
+    if (visited_counter == MAX_RESULT_SIZE) break;
     __syncthreads();
 
     // record offset so that we know where to start calculating distances
@@ -510,6 +514,45 @@ beam_search(const beam_search_params<Cfg>& p) {
   }
 
   return result;
+}
+
+// beam search with pre allocated buffer for result
+template <typename Cfg>
+__host__ void beam_search(
+  const beam_search_params<Cfg>& p,
+  beam_search_result<typename Cfg::graph_cfg_t> result // pre-allocated.
+) {
+
+  using entry_t = typename Cfg::entry_t;
+
+  dim3 threads(Cfg::block_size, 1, 1);
+  dim3 blocks(p.query_vectors.n_vectors, 1, 1);
+  uint32_t smem = get_smem_size<typename Cfg::index_t, typename Cfg::distance_t, typename Cfg::data_t>(
+      p.beam_width, Cfg::block_size, p.k, p.data_vectors.dim);
+
+  cudaError_t err = cudaDeviceSynchronize();
+  if (err != cudaSuccess) {
+    std::cerr << "Beam search malloc memory failed: " << cudaGetErrorString(err) << std::endl;
+  }
+
+  // Launch
+  beam_search_single_kernel<
+      typename Cfg::index_t, typename Cfg::data_t, 
+      typename Cfg::distance_t, typename Cfg::graph_cfg_t::edge_list_t,
+      Cfg::block_size, Cfg::dist_func,
+      Cfg::max_search_width, Cfg::get_visited,
+      Cfg::tile_size, Cfg::max_result_size>
+    <<<blocks, threads, smem>>>(
+        p.graph.edges, p.graph.edge_counts,
+        result.frontier, result.visited, result.visited_counts,
+        p.data_vectors,
+        p.query_vectors,
+        p.medoid, p.k, p.beam_width, p.limit);
+
+  err = cudaDeviceSynchronize();
+  if (err != cudaSuccess) {
+    std::cerr << "Beam search kernel launch failed: " << cudaGetErrorString(err) << std::endl;
+  }
 }
 
 }  // namespace jasper

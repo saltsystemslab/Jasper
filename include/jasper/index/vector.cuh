@@ -45,6 +45,13 @@ struct __align__(16) vector_view {
   __host__ __device__ const DATA_T* operator[](uint32_t i) const {
     return &data[i * dim];
   }
+
+  // Return a read-only, non-owning view over a contiguous subset of vectors.
+  // Starts at vector index `offset`, spanning `count` vectors.
+  __host__ __device__ vector_view<DATA_T> subview(uint32_t offset, uint32_t count) const {
+    assert(offset + count <= n_vectors);
+    return {data + static_cast<size_t>(offset) * dim, dim, count};
+  }
 };
 
 // Returns a vector_view pointing to pinned host memory.
