@@ -182,6 +182,33 @@ struct graph_construct_workspace {
     std::printf("  total            : %8.2f MB\n", mb(total)); 
   }
 
+  // Returns the largest max_batch_size whose total allocation fits in `budget_bytes`.
+  // Returns 0 if even a batch size of 1 does not fit.
+  static uint32_t max_batch_size_for_budget(size_t budget_bytes) {
+    constexpr uint32_t L              = GRAPH_CONSTRUCT_CONFIG::L;
+    constexpr uint32_t R              = GRAPH_CONSTRUCT_CONFIG::R;
+    constexpr uint32_t max_result_size = GRAPH_CONSTRUCT_CONFIG::beam_search_max_result_size;
+    constexpr uint32_t max_candidates = max_result_size + R;
+
+    // Per-batch-element cost (bytes)
+    constexpr size_t per_item =
+        sizeof(entry_t)            * L                // frontier
+      + sizeof(entry_t)            * max_result_size  // visited
+      + sizeof(uint32_t)                              // visited_counts
+      + sizeof(entry_t)            * max_candidates   // prune_candidates
+      + sizeof(uint32_t)                              // prune_counts
+      + sizeof(edge_pair<index_t>) * R                // reverse_edges
+      + sizeof(index_t)            * R;               // reverse_offsets
+
+    // Fixed overhead: reverse_offsets has one extra element (+1)
+    constexpr size_t fixed = sizeof(index_t);  // the +1 slot in reverse_offsets
+
+    if (budget_bytes <= fixed) return 0;
+
+    uint32_t batch = static_cast<uint32_t>((budget_bytes - fixed) / per_item);
+    return batch;
+  }
+
   void free() {
     cudaFree(frontier);
     cudaFree(visited);

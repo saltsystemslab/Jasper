@@ -81,7 +81,7 @@ int64_t LoadGraph_##id(ffi::String path, int64_t dim) {                        \
 int64_t ConstructGraph_##id(ffi::TensorView vectors,                           \
                             int64_t dim,                                       \
                             double alpha,                                      \
-                            int64_t max_batch_size) {                          \
+                            int64_t workspace_budget_bytes) {                  \
   uint32_t n_vectors = static_cast<uint32_t>(vectors.size(0));                 \
   uint32_t d = static_cast<uint32_t>(dim);                                     \
                                                                                \
@@ -89,9 +89,15 @@ int64_t ConstructGraph_##id(ffi::TensorView vectors,                           \
       static_cast<DAT*>(vectors.data_ptr()), d, n_vectors);                    \
                                                                                \
   jasper::graph_construct_params<construct_cfg_##id> params;                   \
+  jasper::graph_construct_workspace<construct_cfg_##id> ws;                    \
+  uint32_t max_batch_size = min(                                               \
+    ws.max_batch_size_for_budget(workspace_budget_bytes),                      \
+    n_vectors / 50                                                             \
+  );                                                                           \
+                                                                               \
   params.data_vectors   = vecs;                                                \
   params.alpha          = static_cast<float>(alpha);                           \
-  params.max_batch_size = static_cast<uint32_t>(max_batch_size);               \
+  params.max_batch_size = max_batch_size;                                      \
   params.on_host        = false;                                               \
                                                                                \
   auto g = jasper::construct_graph<construct_cfg_##id>(params);                \

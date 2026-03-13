@@ -7,7 +7,7 @@ import torch
 import tvm_ffi
 import struct
 import numpy as np
-import time
+import re
 
 # ── Load the compiled shared library ────────────────────────────
 _lib_path = str(Path(__file__).parent / "lib" / "libjasper_ffi.so")
@@ -75,6 +75,27 @@ def _get_fns(config_id: str):
         )
     return _fn_cache[config_id]
 
+# ── Parse storage util ──────────────────────────────────────────
+STORAGE_SIZE_RE = re.compile(r'^\s*([\d.]+)\s*([KMGTP]?i?B)\s*$', re.IGNORECASE)
+
+STORAGE_UNITS = {
+    "B": 1,
+    "KB": 10**3,
+    "MB": 10**6,
+    "GB": 10**9,
+    "TB": 10**12,
+    "KIB": 2**10,
+    "MIB": 2**20,
+    "GIB": 2**30,
+    "TIB": 2**40,
+}
+
+def parse_storage_size(s: str) -> int:
+    m = STORAGE_SIZE_RE.match(s)
+    if not m:
+        raise ValueError(f"Invalid storage size: {s}")
+    value, unit = m.groups()
+    return int(float(value) * STORAGE_UNITS[unit.upper()])
 
 # ── Graph class ─────────────────────────────────────────────────
 class Graph:
@@ -148,7 +169,7 @@ class Graph:
         n_neighbors: int = 32,
         distance: DistanceFunc | str = DistanceFunc.L2,
         alpha: float = 1.2,
-        max_batch_size: int = 10000,
+        workspace_budget: str = "10GB",
     ) -> "Graph":
         """
         Construct a graph index from vectors on GPU.
@@ -165,6 +186,8 @@ class Graph:
         """
         if isinstance(distance, str):
             distance = DistanceFunc(distance)
+
+        workspace_budget_bytes = parse_storage_size(workspace_budget)
 
         if not vectors.is_cuda:
             raise ValueError("vectors must be a CUDA tensor")
@@ -187,7 +210,7 @@ class Graph:
 
         config_id = _resolve_config(data_type, n_neighbors, distance)
         _, construct_fn, _ = _get_fns(config_id)
-        handle = construct_fn(vectors, dim, alpha, max_batch_size)
+        handle = construct_fn(vectors, dim, alpha, workspace_budget_bytes)
 
         return cls(handle, config_id, data_type, distance, n_neighbors, dim)
 
@@ -258,15 +281,10 @@ class Graph:
             n_queries, k, dtype=torch.float32, device=queries.device
         )
         
-        # start = time.perf_counter()
         self._search_fn(
             self._handle, queries, out_indices, out_distances,
             k, beam_width, limit, print_throughput
         )
-        # end = time.perf_counter()
-        # if print_throughput:
-        #     elapsed_time = end - start
-        #     print(f"[Beam Search] width={beam_width}, time={elapsed_time:.4f}, throughput={n_queries/elapsed_time}")
 
         return out_indices, out_distances
 

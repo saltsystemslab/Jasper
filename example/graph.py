@@ -14,7 +14,7 @@ g = jasper.Graph.build(
     n_neighbors=64,
     distance="l2",
     alpha=1.2,
-    max_batch_size=1_000_000,
+    workspace_budget="10GB",
 )
 end = time.perf_counter()
 elapsed_time = end - start
