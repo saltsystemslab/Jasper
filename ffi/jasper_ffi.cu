@@ -33,9 +33,9 @@ JASPER_FOR_EACH_CONFIG(DECLARE_CONFIG)
 #undef DECLARE_CONFIG
 
 // ── Generate construct config types ────────────────────────────
-// (block_size=128, tile_size=4, R from graph config, L=128)
+// (block_size=128, tile_size=4, R from graph config, L=64)
 #define DECLARE_CONSTRUCT_CONFIG(id, IDX, R, DAT, DIST, FUNC) \
-  using construct_cfg_##id = jasper::graph_construct_config<cfg_##id, 128, 4, R, 128>;
+  using construct_cfg_##id = jasper::graph_construct_config<cfg_##id, 128, 4, R, 64>;
 
 JASPER_FOR_EACH_CONFIG(DECLARE_CONSTRUCT_CONFIG)
 #undef DECLARE_CONSTRUCT_CONFIG
@@ -79,16 +79,16 @@ int64_t LoadGraph_##id(ffi::String path, int64_t dim) {                        \
 }                                                                              \
                                                                                \
 int64_t ConstructGraph_##id(ffi::TensorView vectors,                           \
-                            int64_t dim,                                        \
-                            double alpha,                                       \
-                            int64_t max_batch_size) {                           \
+                            int64_t dim,                                       \
+                            double alpha,                                      \
+                            int64_t max_batch_size) {                          \
   uint32_t n_vectors = static_cast<uint32_t>(vectors.size(0));                 \
   uint32_t d = static_cast<uint32_t>(dim);                                     \
                                                                                \
   jasper::vector_view<DAT> vecs(                                               \
       static_cast<DAT*>(vectors.data_ptr()), d, n_vectors);                    \
                                                                                \
-  jasper::graph_construct_params<construct_cfg_##id> params;                    \
+  jasper::graph_construct_params<construct_cfg_##id> params;                   \
   params.data_vectors   = vecs;                                                \
   params.alpha          = static_cast<float>(alpha);                           \
   params.max_batch_size = static_cast<uint32_t>(max_batch_size);               \
@@ -106,7 +106,8 @@ void Search_##id(int64_t handle,                                               \
                  ffi::TensorView queries,                                      \
                  ffi::TensorView out_indices,                                  \
                  ffi::TensorView out_distances,                                \
-                 int64_t k, int64_t beam_width, int64_t limit) {               \
+                 int64_t k, int64_t beam_width, int64_t limit,                 \
+                 bool print_throughput) {                                      \
   jasper::graph<cfg_##id>* gp;                                                 \
   {                                                                            \
     std::lock_guard<std::mutex> lock(g_mutex);                                 \
@@ -122,14 +123,31 @@ void Search_##id(int64_t handle,                                               \
   jasper::vector_view<DAT> d_queries(                                          \
       static_cast<DAT*>(queries.data_ptr()), dim_, n_queries);                 \
                                                                                \
-  jasper::search_params params{                                                 \
+  jasper::search_params params{                                                \
       .k          = static_cast<uint32_t>(k),                                  \
       .beam_width = static_cast<uint32_t>(beam_width),                         \
       .limit      = static_cast<uint32_t>(limit),                              \
       .get_visited = false,                                                    \
   };                                                                           \
                                                                                \
+  cudaEvent_t e0, e1;                                                          \
+  cudaEventCreate(&e0);                                                        \
+  cudaEventCreate(&e1);                                                        \
+                                                                               \
+  cudaEventRecord(e0);                                                         \
   auto result = jasper::search(g, d_queries, params);                          \
+  cudaEventRecord(e1);                                                         \
+  cudaEventSynchronize(e1);                                                    \
+                                                                               \
+  float duration_ms = 0;                                                       \
+  cudaEventElapsedTime(&duration_ms, e0, e1);                                  \
+                                                                               \
+  cudaEventDestroy(e0);                                                        \
+  cudaEventDestroy(e1);                                                        \
+                                                                               \
+  std::cout << "[beam_search] duration=" << duration_ms                        \
+    << "ms, throughput=" << (n_queries * 1000.0f)/duration_ms                  \
+    << std::endl;                                                              \
                                                                                \
   DLDevice device = queries.device();                                          \
   cudaStream_t stream = static_cast<cudaStream_t>(                             \

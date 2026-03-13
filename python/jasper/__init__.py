@@ -5,6 +5,9 @@ from enum import Enum
 
 import torch
 import tvm_ffi
+import struct
+import numpy as np
+import time
 
 # ── Load the compiled shared library ────────────────────────────
 _lib_path = str(Path(__file__).parent / "lib" / "libjasper_ffi.so")
@@ -19,7 +22,7 @@ class DistanceFunc(str, Enum):
 
 class DataType(str, Enum):
     FLOAT32 = "f32"
-    UINT8 = "u8"
+    UINT8 = "uint8"
 
 
 # ── Config registry (must match JASPER_FOR_EACH_CONFIG in C++) ──
@@ -124,7 +127,7 @@ class Graph:
             path:         Path to the graph binary file.
             dim:          Dimensionality of the vectors.
             n_neighbors:  Max neighbors per node (must match file).
-            data_type:    Vector data type: "f32" or "u8".
+            data_type:    Vector data type: "f32" or "uint8".
             distance:     Distance function: "l2" or "ip".
         """
         if isinstance(data_type, str):
@@ -215,6 +218,7 @@ class Graph:
         k: int = 10,
         beam_width: int = 64,
         limit: int = 512,
+        print_throughput: bool = False
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Run beam search on this graph.
@@ -253,11 +257,16 @@ class Graph:
         out_distances = torch.empty(
             n_queries, k, dtype=torch.float32, device=queries.device
         )
-
+        
+        # start = time.perf_counter()
         self._search_fn(
             self._handle, queries, out_indices, out_distances,
-            k, beam_width, limit
+            k, beam_width, limit, print_throughput
         )
+        # end = time.perf_counter()
+        # if print_throughput:
+        #     elapsed_time = end - start
+        #     print(f"[Beam Search] width={beam_width}, time={elapsed_time:.4f}, throughput={n_queries/elapsed_time}")
 
         return out_indices, out_distances
 
@@ -282,6 +291,20 @@ class Graph:
             f"dist={self._distance.value})"
         )
 
+# ── Utils ───────────────────────────────────────────────────────
+
+def read_bin(path: str, dtype: str = "float32", max_vectors: int = 0) -> torch.Tensor:
+    np_dtype = np.float32 if dtype == "float32" else np.uint8
+    torch_dtype = torch.float32 if dtype == "float32" else torch.uint8
+
+    with open(path, "rb") as f:
+        n_vectors, dim = struct.unpack("II", f.read(8))
+        if max_vectors > 0:
+            n_vectors = min(n_vectors, max_vectors)
+        nbytes = n_vectors * dim * np.dtype(np_dtype).itemsize
+        data = np.frombuffer(f.read(nbytes), dtype=np_dtype).reshape(n_vectors, dim).copy()
+
+    return torch.from_numpy(data).to(device="cuda", dtype=torch_dtype)
 
 # ── Usage ───────────────────────────────────────────────────────
 #

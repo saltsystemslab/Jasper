@@ -15,6 +15,7 @@
 #include "jasper/index/graph.cuh"
 #include "jasper/index/vector.cuh"
 #include "jasper/beam_search/beam_search.cuh"
+#include "jasper/index/utils.cuh"
 
 namespace cg = cooperative_groups;
 
@@ -148,6 +149,37 @@ struct graph_construct_workspace {
     ws.reverse_offsets_ptr = thrust::raw_pointer_cast(ws.reverse_offsets.data());
 
     return ws;
+  }
+
+  void print_space_usage() {
+    constexpr uint32_t L = GRAPH_CONSTRUCT_CONFIG::L;
+    constexpr uint32_t R = GRAPH_CONSTRUCT_CONFIG::R;
+    constexpr uint32_t max_result_size = GRAPH_CONSTRUCT_CONFIG::beam_search_max_result_size;
+    constexpr uint32_t max_candidates = max_result_size + R;
+
+    size_t frontier_bytes     = sizeof(entry_t)           * max_batch_size * L;
+    size_t visited_bytes      = sizeof(entry_t)           * max_batch_size * max_result_size;
+    size_t visited_cnt_bytes  = sizeof(uint32_t)          * max_batch_size;
+    size_t prune_cand_bytes   = sizeof(entry_t)           * max_batch_size * max_candidates;
+    size_t prune_cnt_bytes    = sizeof(uint32_t)          * max_batch_size;
+    size_t rev_edges_bytes    = sizeof(edge_pair<index_t>) * reverse_edges.size();
+    size_t rev_offsets_bytes  = sizeof(index_t)            * reverse_offsets.size();
+
+    size_t total = frontier_bytes + visited_bytes + visited_cnt_bytes
+                 + prune_cand_bytes + prune_cnt_bytes
+                 + rev_edges_bytes + rev_offsets_bytes;
+
+    auto mb = [](size_t b) { return b / (1024.0 * 1024.0); };
+
+    std::printf("[workspace] max_batch_size=%u, R=%u, L=%u\n", max_batch_size, R, L);
+    std::printf("  frontier         : %8.2f MB\n", mb(frontier_bytes));
+    std::printf("  visited          : %8.2f MB\n", mb(visited_bytes));
+    std::printf("  visited_counts   : %8.2f MB\n", mb(visited_cnt_bytes));
+    std::printf("  prune_candidates : %8.2f MB\n", mb(prune_cand_bytes));
+    std::printf("  prune_counts     : %8.2f MB\n", mb(prune_cnt_bytes));
+    std::printf("  reverse_edges    : %8.2f MB\n", mb(rev_edges_bytes));
+    std::printf("  reverse_offsets  : %8.2f MB\n", mb(rev_offsets_bytes));
+    std::printf("  total            : %8.2f MB\n", mb(total)); 
   }
 
   void free() {
@@ -426,22 +458,16 @@ __global__ void process_reverse_edges_kernel(
   constexpr index_t INVALID_INDEX = std::numeric_limits<index_t>::max();
   constexpr entry_t SENTINEL = {INVALID_INDEX, std::numeric_limits<distance_t>::max()};
 
-  index_t vid = static_cast<index_t>(blockIdx.x);
-  if (vid >= num_vertices) return;
+  // merge sort compare
+  struct EntryLess {
+    __device__ __forceinline__ bool operator()(
+        const entry_t& a, const entry_t& b) const {
+      if (a.second != b.second) return a.second < b.second;
+      return a.first < b.first;
+    }
+  };
 
-  index_t rev_start = reverse_offsets[vid];
-  index_t rev_end   = reverse_offsets[vid + 1];
-  uint32_t n_reverse = rev_end - rev_start;
-  if (n_reverse == 0) return;
-
-  // allocate shared memory
-  // using BlockMergeSortT = cub::BlockMergeSort<entry_t, BLOCK_SIZE, ITEMS_PER_THREAD>;
-  // union shared_storage {
-  //   entry_t candidates[MAX_CANDS];
-  //   typename BlockMergeSortT::TempStorage sort_storage;
-  // };
-  // __shared__ shared_storage shared;
-
+  // merge sort state shares with s_candidate since they don't overlap.
   using BlockMergeSortT = cub::BlockMergeSort<entry_t, BLOCK_SIZE, ITEMS_PER_THREAD>;
   constexpr size_t cand_bytes = sizeof(entry_t) * MAX_CANDS;
   constexpr size_t sort_bytes = sizeof(typename BlockMergeSortT::TempStorage);
@@ -450,135 +476,141 @@ __global__ void process_reverse_edges_kernel(
   entry_t* s_candidates = reinterpret_cast<entry_t*>(shared_buf);
   auto& sort_storage = reinterpret_cast<typename BlockMergeSortT::TempStorage&>(shared_buf);
 
+  __shared__ uint32_t s_count;
+  __shared__ index_t  s_selected[R];
+  __shared__ uint32_t s_n_selected;
+  __shared__ bool     s_pruned;
+
+  // block merge sort state
+  entry_t items[ITEMS_PER_THREAD];
+
+  // cg tile
   auto thread_block = cg::this_thread_block();
   auto my_tile = cg::tiled_partition<TILE_SIZE>(thread_block);
   uint64_t tile_id = my_tile.meta_group_rank();
   uint64_t n_tiles = my_tile.meta_group_size();
 
-  const data_t* src_vec = all_vectors + static_cast<uint64_t>(vid) * dim;
+  for (index_t vid = blockIdx.x; vid < num_vertices; vid += gridDim.x) {
+    index_t rev_start = reverse_offsets[vid];
+    index_t rev_end   = reverse_offsets[vid + 1];
+    uint32_t n_reverse = rev_end - rev_start;
+    if (n_reverse == 0) continue;
 
-  // merge existing edges + reverse edges to candidates
-  __shared__ uint32_t s_count;
-  if (threadIdx.x == 0) s_count = 0;
-  __syncthreads();
+    const data_t* src_vec = all_vectors + static_cast<uint64_t>(vid) * dim;
 
-  // grab existing edges
-  uint8_t n_edges = edge_counts[vid];
-  for (uint32_t i=tile_id; i<n_edges; i+=n_tiles) {
-    index_t neighbor = graph_edges[vid].edges[i];
-    if (neighbor == INVALID_INDEX) continue;
-
-    const data_t* neighbor_vec = all_vectors + static_cast<uint64_t>(neighbor) * dim;
-    distance_t d = compute_distance<CONSTRUCT_GRAPH_CONFIG::graph_cfg_t::dist_func,
-      data_t, distance_t, TILE_SIZE>(src_vec, neighbor_vec, dim, my_tile);
-
-    if (my_tile.thread_rank() == 0) {
-      uint32_t slot = atomicAdd(&s_count, 1u);
-      if (slot < MAX_CANDS) s_candidates[slot] = {neighbor, d};
-    }
-  }
-
-  // grab reversed edge sinks
-  for (uint32_t i=tile_id; i<n_reverse; i+=n_tiles) {
-    index_t sink = reverse_edges[rev_start + i].sink;
-    if (sink == INVALID_INDEX || sink == vid) continue;
-
-    const data_t* sink_vec = all_vectors + static_cast<uint64_t>(sink) * dim;
-    distance_t d = compute_distance<CONSTRUCT_GRAPH_CONFIG::graph_cfg_t::dist_func,
-        data_t, distance_t, TILE_SIZE>(src_vec, sink_vec, dim, my_tile);
-
-    if (my_tile.thread_rank() == 0) {
-      uint32_t slot = atomicAdd(&s_count, 1u);
-      if (slot < MAX_CANDS) s_candidates[slot] = {sink, d};
-    }
-  }
-  __syncthreads();
-
-  uint32_t count = min(s_count, (uint32_t)MAX_CANDS);
-
-  // block merge sort
-  entry_t items[ITEMS_PER_THREAD];
-  #pragma unroll
-  for (uint32_t i=0; i<ITEMS_PER_THREAD; i++) {
-    uint32_t idx = threadIdx.x * ITEMS_PER_THREAD + i;
-    items[i] = (idx < count) ? s_candidates[idx] : SENTINEL;
-  }
-
-  struct EntryLess {
-    __device__ __forceinline__ bool operator()(
-        const entry_t& a, const entry_t& b) const {
-      if (a.second != b.second) return a.second < b.second;
-      return a.first < b.first;
-    }
-  };
-  __syncthreads();
-  BlockMergeSortT(sort_storage).Sort(items, EntryLess());
-  __syncthreads();
-
-  #pragma unroll
-  for (uint32_t i=0; i<ITEMS_PER_THREAD; i++) {
-    uint32_t idx = threadIdx.x * ITEMS_PER_THREAD + i;
-    if (idx < count) s_candidates[idx] = items[i];
-  }
-  __syncthreads();
-
-  // robust prune
-  __shared__ index_t  s_selected[R];
-  __shared__ uint32_t s_n_selected;
-  __shared__ bool     s_pruned;
-  if (threadIdx.x == 0) s_n_selected = 0;
-  __syncthreads();
-
-  for (uint32_t i=0; i<count; i++) {
-    if (s_n_selected >= R) break;
-
-    index_t cand_id = s_candidates[i].first;
-    distance_t cand_dist = s_candidates[i].second;
-
-    if (cand_id == vid || cand_id == INVALID_INDEX) continue;
-
-    const data_t* cand_vec = all_vectors + static_cast<uint64_t>(cand_id) * dim;
-
-    if (threadIdx.x == 0) s_pruned = false;
+    // merge existing edges + reverse edges to candidates
+    if (threadIdx.x == 0) s_count = 0;
     __syncthreads();
 
-    uint32_t n_sel = s_n_selected;
-    for (uint32_t j=tile_id; j<n_sel; j+=n_tiles) {
-      const data_t* selected_vec = all_vectors + static_cast<uint64_t>(s_selected[j]) * dim;
-      distance_t d = compute_distance<CONSTRUCT_GRAPH_CONFIG::graph_cfg_t::dist_func, data_t, distance_t, TILE_SIZE>(
-        cand_vec, selected_vec, dim, my_tile
-      );
+    // grab existing edges
+    uint8_t n_edges = edge_counts[vid];
+    for (uint32_t i=tile_id; i<n_edges; i+=n_tiles) {
+      index_t neighbor = graph_edges[vid].edges[i];
+      if (neighbor == INVALID_INDEX) continue;
+
+      const data_t* neighbor_vec = all_vectors + static_cast<uint64_t>(neighbor) * dim;
+      distance_t d = compute_distance<CONSTRUCT_GRAPH_CONFIG::graph_cfg_t::dist_func,
+        data_t, distance_t, TILE_SIZE>(src_vec, neighbor_vec, dim, my_tile);
 
       if (my_tile.thread_rank() == 0) {
-        if (d * alpha < cand_dist) {
-          s_pruned = true;
-        }
+        uint32_t slot = atomicAdd(&s_count, 1u);
+        if (slot < MAX_CANDS) s_candidates[slot] = {neighbor, d};
+      }
+    }
+
+    // grab reversed edge sinks
+    for (uint32_t i=tile_id; i<n_reverse; i+=n_tiles) {
+      index_t sink = reverse_edges[rev_start + i].sink;
+      if (sink == INVALID_INDEX || sink == vid) continue;
+
+      const data_t* sink_vec = all_vectors + static_cast<uint64_t>(sink) * dim;
+      distance_t d = compute_distance<CONSTRUCT_GRAPH_CONFIG::graph_cfg_t::dist_func,
+          data_t, distance_t, TILE_SIZE>(src_vec, sink_vec, dim, my_tile);
+
+      if (my_tile.thread_rank() == 0) {
+        uint32_t slot = atomicAdd(&s_count, 1u);
+        if (slot < MAX_CANDS) s_candidates[slot] = {sink, d};
       }
     }
     __syncthreads();
 
-    if (!s_pruned) {
-      if (threadIdx.x == 0) {
-        uint32_t slot = s_n_selected;
-        if (slot < R) {
-          s_selected[slot] = cand_id;
-          s_n_selected = slot + 1;
+    uint32_t count = min(s_count, (uint32_t)MAX_CANDS);
+
+    // block merge sort
+    #pragma unroll
+    for (uint32_t i=0; i<ITEMS_PER_THREAD; i++) {
+      uint32_t idx = threadIdx.x * ITEMS_PER_THREAD + i;
+      items[i] = (idx < count) ? s_candidates[idx] : SENTINEL;
+    }
+
+    __syncthreads();
+    BlockMergeSortT(sort_storage).Sort(items, EntryLess());
+    __syncthreads();
+
+    #pragma unroll
+    for (uint32_t i=0; i<ITEMS_PER_THREAD; i++) {
+      uint32_t idx = threadIdx.x * ITEMS_PER_THREAD + i;
+      if (idx < count) s_candidates[idx] = items[i];
+    }
+    __syncthreads();
+
+    // robust prune
+    if (threadIdx.x == 0) s_n_selected = 0;
+    __syncthreads();
+
+    for (uint32_t i=0; i<count; i++) {
+      if (s_n_selected >= R) break;
+
+      index_t cand_id = s_candidates[i].first;
+      distance_t cand_dist = s_candidates[i].second;
+
+      if (cand_id == vid || cand_id == INVALID_INDEX) continue;
+
+      const data_t* cand_vec = all_vectors + static_cast<uint64_t>(cand_id) * dim;
+
+      if (threadIdx.x == 0) s_pruned = false;
+      __syncthreads();
+
+      uint32_t n_sel = s_n_selected;
+      for (uint32_t j=tile_id; j<n_sel; j+=n_tiles) {
+        const data_t* selected_vec = all_vectors + static_cast<uint64_t>(s_selected[j]) * dim;
+        distance_t d = compute_distance<CONSTRUCT_GRAPH_CONFIG::graph_cfg_t::dist_func, data_t, distance_t, TILE_SIZE>(
+          cand_vec, selected_vec, dim, my_tile
+        );
+
+        if (my_tile.thread_rank() == 0) {
+          if (d * alpha < cand_dist) {
+            s_pruned = true;
+          }
         }
       }
+      __syncthreads();
+
+      if (!s_pruned) {
+        if (threadIdx.x == 0) {
+          uint32_t slot = s_n_selected;
+          if (slot < R) {
+            s_selected[slot] = cand_id;
+            s_n_selected = slot + 1;
+          }
+        }
+      }
+      
+      __syncthreads();
     }
+
+    // write back to graph
+    uint32_t final_count = s_n_selected;
+    for (uint32_t i=threadIdx.x; i<final_count; i+=blockDim.x) {
+      graph_edges[vid].edges[i] = s_selected[i];
+    }
+    if (threadIdx.x == 0) {
+      edge_counts[vid] = static_cast<uint8_t>(final_count);
+    }
+
+    __syncthreads();
     
-    __syncthreads();
-  }
-
-  // write back to graph
-  uint32_t final_count = s_n_selected;
-  for (uint32_t i=threadIdx.x; i<final_count; i+=blockDim.x) {
-    graph_edges[vid].edges[i] = s_selected[i];
-  }
-
-  if (threadIdx.x == 0) {
-    edge_counts[vid] = static_cast<uint8_t>(final_count);
-  }
+  } // end for
 }
 
 template <typename CONSTRUCT_GRAPH_CONFIG,
@@ -588,7 +620,8 @@ __host__ void process_batch(
   graph_construct_workspace<CONSTRUCT_GRAPH_CONFIG>& ws,
   uint32_t batch_offset,
   uint32_t batch_size, 
-  float alpha
+  float alpha,
+  construct_timer& timer
 ) {
   using data_t      = typename CONSTRUCT_GRAPH_CONFIG::data_t;
   using entry_t     = typename CONSTRUCT_GRAPH_CONFIG::entry_t;
@@ -603,7 +636,13 @@ __host__ void process_batch(
   constexpr uint32_t BLOCK_SIZE = CONSTRUCT_GRAPH_CONFIG::block_size;
   constexpr uint32_t TILE_SIZE  = CONSTRUCT_GRAPH_CONFIG::tile_size;
 
+  cudaEvent_t e0, e1, e2, e3, e4, e5, e6;
+  cudaEventCreate(&e0); cudaEventCreate(&e1); cudaEventCreate(&e2);
+  cudaEventCreate(&e3); cudaEventCreate(&e4); cudaEventCreate(&e5);
+  cudaEventCreate(&e6);
+
   // beam search
+  cudaEventRecord(e0);
   vector_view<data_t> d_query_vectors = graph.vectors.subview(batch_offset, batch_size);
   beam_search_params<BEAM_SEARCH_CONFIG> bp {
     .graph          = graph,
@@ -619,6 +658,7 @@ __host__ void process_batch(
   bs_result.visited        = ws.visited;
   bs_result.visited_counts = ws.visited_counts;
   beam_search<BEAM_SEARCH_CONFIG>(bp, bs_result);
+  cudaEventRecord(e1);
 
   // add the edges to the points in batch
   merge_candidates_kernel<CONSTRUCT_GRAPH_CONFIG, TILE_SIZE, BLOCK_SIZE><<<batch_size, BLOCK_SIZE>>>(
@@ -628,7 +668,11 @@ __host__ void process_batch(
       dim, batch_offset, batch_size,
       max_result, max_candidates,
       ws.prune_candidates, ws.prune_counts);
-  cudaDeviceSynchronize();
+  cudaError_t err = cudaDeviceSynchronize();
+  if (err != cudaSuccess) {
+    std::cerr << "merge_candidates_kernel failed: " << cudaGetErrorString(err) << std::endl;
+  }
+  cudaEventRecord(e2);
   
   // robust prune
   robust_prune_kernel<CONSTRUCT_GRAPH_CONFIG, TILE_SIZE><<<batch_size, BLOCK_SIZE>>>(
@@ -637,7 +681,11 @@ __host__ void process_batch(
       graph.vectors.data, dim,
       batch_offset, batch_size,
       max_candidates, alpha);
-  cudaDeviceSynchronize();
+  err = cudaDeviceSynchronize();
+  if (err != cudaSuccess) {
+    std::cerr << "robust_prune_kernel failed: " << cudaGetErrorString(err) << std::endl;
+  }
+  cudaEventRecord(e3);
   
   // reverse edges
   uint32_t total_slots = batch_size * R;
@@ -645,8 +693,14 @@ __host__ void process_batch(
   fill_reverse_edges<CONSTRUCT_GRAPH_CONFIG><<<grid, BLOCK_SIZE>>>(
     graph.edges, graph.edge_counts,
     ws.reverse_edges_ptr,
-    batch_size, batch_offset, R);
-  cudaDeviceSynchronize();
+    batch_size, 
+    batch_offset, 
+    R);
+  err = cudaDeviceSynchronize();
+  if (err != cudaSuccess) {
+    std::cerr << "reverse edges failed: " << cudaGetErrorString(err) << std::endl;
+  }
+  cudaEventRecord(e4);
 
   // semisort using thrust
   // after this step, the reversed edges will be stored 
@@ -654,12 +708,12 @@ __host__ void process_batch(
   edge_pair<index_t> sentinel = edge_pair<index_t>::sentinel();
   thrust::sort(
     ws.reverse_edges.begin(), 
-    ws.reverse_edges.end(), 
+    ws.reverse_edges.begin() + total_slots, 
     semi_sort_compare_edge_pair<index_t>{});
 
   auto it = thrust::lower_bound(
     ws.reverse_edges.begin(), 
-    ws.reverse_edges.end(),
+    ws.reverse_edges.begin() + total_slots,
     sentinel, 
     semi_sort_compare_edge_pair<index_t>{});
   index_t n_edges = static_cast<index_t>(it - ws.reverse_edges.begin());
@@ -668,6 +722,25 @@ __host__ void process_batch(
 
   edge_pair<index_t> last_edge = ws.reverse_edges[n_edges - 1]; 
   index_t num_vertices = last_edge.source + 1;
+
+  std::cout << "batch_size=" << static_cast<uint32_t>(batch_size) 
+    << " n_reverse_edges="<< static_cast<uint32_t>(n_edges) << " num_vertices=" << static_cast<uint32_t>(num_vertices) << std::endl;
+
+  // thrust::host_vector<edge_pair<index_t>> h_reverse_edges = reverse_edges;
+  // std::cout << "reverse_edges=[";
+  // for(auto i = h_reverse_edges.begin(); i != h_reverse_edges.end(); ++i) std::cout << *i << " ";
+  // std::cout << "]" << std::endl;
+
+  // thrust::host_vector<index_t> h_reverse_edges = reverse_edges;
+  // std::cout << "reverse_edges=[";
+  // for(auto i = h_reverse_edges.begin(); i != h_reverse_edges.end(); ++i) std::cout << *i << " ";
+  // std::cout << "]" << std::endl;
+
+  // if (num_vertices + 1 > ws.reverse_offsets.size()) {
+  //   ws.reverse_offsets.resize(num_vertices + 1);
+  //   ws.reverse_offsets_ptr = thrust::raw_pointer_cast(ws.reverse_offsets.data());
+  // }
+
   auto src_begin = thrust::make_transform_iterator(
             ws.reverse_edges.begin(), extract_source_from_edge_pair<index_t>{});
   thrust::counting_iterator<index_t> count(0);
@@ -675,9 +748,15 @@ __host__ void process_batch(
                       count, count + num_vertices + 1,
                       ws.reverse_offsets.begin());
 
+  // get unique sources
+  
+
+  cudaEventRecord(e5);
+
   // add edges + robust prune
+  constexpr uint64_t process_reverse_edges_kernel_grid_size = 1024; // fix size
   process_reverse_edges_kernel<CONSTRUCT_GRAPH_CONFIG, TILE_SIZE>
-      <<<num_vertices, BLOCK_SIZE>>>(
+       <<<process_reverse_edges_kernel_grid_size, BLOCK_SIZE>>>( //<<<num_vertices, BLOCK_SIZE>>>(
           ws.reverse_edges_ptr,
           ws.reverse_offsets_ptr,
           graph.edges,
@@ -686,7 +765,24 @@ __host__ void process_batch(
           dim,
           num_vertices,
           alpha);
-  cudaDeviceSynchronize();
+  err = cudaDeviceSynchronize();
+  if (err != cudaSuccess) {
+    std::cerr << "process_reverse_edges_kernel failed: " << cudaGetErrorString(err) << std::endl;
+  }
+  cudaEventRecord(e6);
+
+  cudaEventSynchronize(e6);
+  timer.beam_search_ms   += elapsed_ms(e0, e1);
+  timer.merge_cands_ms   += elapsed_ms(e1, e2);
+  timer.robust_prune_ms  += elapsed_ms(e2, e3);
+  timer.fill_reverse_ms  += elapsed_ms(e3, e4);
+  timer.sort_offsets_ms  += elapsed_ms(e4, e5);
+  timer.reverse_prune_ms += elapsed_ms(e5, e6);
+  timer.n_batches++;
+
+  cudaEventDestroy(e0); cudaEventDestroy(e1); cudaEventDestroy(e2);
+  cudaEventDestroy(e3); cudaEventDestroy(e4); cudaEventDestroy(e5);
+  cudaEventDestroy(e6);
 }
 
 template <typename CONSTRUCT_GRAPH_CONFIG,
@@ -695,26 +791,33 @@ __host__ void construction_round(
   typename CONSTRUCT_GRAPH_CONFIG::graph_t &graph, 
   graph_construct_workspace<CONSTRUCT_GRAPH_CONFIG> &ws,
   float alpha, 
-  uint32_t max_batch_size
+  uint32_t max_batch_size,
+  construct_timer& timer
 ){
   uint32_t count = 0;
   uint32_t batch_size = 1;
 
+  std::printf("[construct] round alpha=%.2f, n_vectors=%u\n", alpha, graph.n_vectors);
+
   while (count < graph.n_vectors) {
-    // Clamp batch to remaining vectors
     batch_size = std::min(batch_size, graph.n_vectors - count);
     batch_size = std::min(batch_size, max_batch_size);
 
     process_batch<CONSTRUCT_GRAPH_CONFIG, BEAM_SEARCH_CONFIG>(
-        graph, ws, count, batch_size, alpha);
+        graph, ws, count, batch_size, alpha, timer);
 
     count += batch_size;
 
-    // Exponentially grow batch size
+    // std::printf("\r[construct] %u / %u (%.1f%%)", count, graph.n_vectors,
+    //             100.0f * count / graph.n_vectors);
+    // std::fflush(stdout);
+
     if (batch_size < max_batch_size) {
       batch_size = std::min(max_batch_size, batch_size * 2);
     }
   }
+
+  std::printf("\n[construct] round complete\n");
 }
 
 template <typename CONSTRUCT_GRAPH_CONFIG>
@@ -754,6 +857,7 @@ __host__ graph<typename CONSTRUCT_GRAPH_CONFIG::graph_cfg_t> construct_graph(
 
   // workspace
   auto ws = graph_construct_workspace<CONSTRUCT_GRAPH_CONFIG>::allocate(params.max_batch_size);
+  ws.print_space_usage();
 
   constexpr uint32_t beam_search_tile_size = 4;
   constexpr uint32_t beam_search_block_size = 64;
@@ -766,14 +870,18 @@ __host__ graph<typename CONSTRUCT_GRAPH_CONFIG::graph_cfg_t> construct_graph(
     CONSTRUCT_GRAPH_CONFIG::beam_search_max_result_size>;
 
   // first round establish edges
-  construction_round<CONSTRUCT_GRAPH_CONFIG, beam_search_cfg>(
-    g, ws, 1.0, params.max_batch_size
-  );  
+  // construct_timer first_round_timer;
+  // construction_round<CONSTRUCT_GRAPH_CONFIG, beam_search_cfg>(
+  //   g, ws, 1.0, params.max_batch_size, first_round_timer
+  // );  
+  // first_round_timer.print();
 
-   // second round add long hop edges
+  // second round add long hop edges
+  construct_timer second_round_timer;
   construction_round<CONSTRUCT_GRAPH_CONFIG, beam_search_cfg>(
-    g, ws, alpha, params.max_batch_size
+    g, ws, alpha, params.max_batch_size, second_round_timer
   );
+  second_round_timer.print();
 
   ws.free();
   return g;
