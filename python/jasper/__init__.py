@@ -324,6 +324,44 @@ def read_bin(path: str, dtype: str = "float32", max_vectors: int = 0) -> torch.T
 
     return torch.from_numpy(data).to(device="cuda", dtype=torch_dtype)
 
+def read_groundtruth(path: str, k: int = 10) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Read ground truth from a binary file.
+
+    Format: [n_queries: uint32][gt_k: uint32][ids: n_queries * gt_k * uint32][distances: n_queries * gt_k * float32]
+
+    Args:
+        path: Path to the ground truth .bin file.
+        k:    Number of neighbors to return (must be <= gt_k in file).
+
+    Returns:
+        indices:   int32 tensor [n_queries, k]
+        distances: float32 tensor [n_queries, k]
+    """
+    with open(path, "rb") as f:
+        n_queries, gt_k = struct.unpack("II", f.read(8))
+
+        if gt_k < k:
+            raise ValueError(
+                f"Requested k={k} but ground truth only has k={gt_k}"
+            )
+
+        ids = np.frombuffer(f.read(n_queries * gt_k * 4), dtype=np.uint32).reshape(n_queries, gt_k)
+        distances = np.frombuffer(f.read(n_queries * gt_k * 4), dtype=np.float32).reshape(n_queries, gt_k)
+
+    return (
+        torch.from_numpy(ids[:, :k].copy()).to(dtype=torch.int32),
+        torch.from_numpy(distances[:, :k].copy()),
+    )
+
+def get_recall(gt, result_indices, k, n_queries):
+    recall = sum(
+        len(set(result_indices[i].tolist()) & set(gt[i].tolist()))
+        for i in range(n_queries)
+    ) / (n_queries * k)
+    print(f"Recall@10: {recall:.3f}")
+    return recall
+
 # ── Usage ───────────────────────────────────────────────────────
 #
 # import jasper

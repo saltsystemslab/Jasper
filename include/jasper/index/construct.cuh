@@ -738,7 +738,7 @@ __host__ void process_batch(
     .data_vectors   = graph.vectors,
     .query_vectors  = d_query_vectors,
     .medoid         = graph.medoid,
-    .k              = 1,
+    .k              = L,
     .beam_width     = L,
     .limit          = CONSTRUCT_GRAPH_CONFIG::BEAM_SEARCH_LIMIT,
   };
@@ -840,7 +840,7 @@ __host__ void process_batch(
   cudaEventRecord(e5);
 
   // add edges + robust prune
-  constexpr uint64_t process_reverse_edges_kernel_grid_size = 4096; // fix size
+  constexpr uint64_t process_reverse_edges_kernel_grid_size = 1024; // fix size
   process_reverse_edges_kernel<CONSTRUCT_GRAPH_CONFIG, TILE_SIZE>
        <<<process_reverse_edges_kernel_grid_size, BLOCK_SIZE>>>( //<<<num_vertices, BLOCK_SIZE>>>(
           ws.reverse_edges_ptr,
