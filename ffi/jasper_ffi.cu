@@ -33,9 +33,9 @@ JASPER_FOR_EACH_CONFIG(DECLARE_CONFIG)
 #undef DECLARE_CONFIG
 
 // ── Generate construct config types ────────────────────────────
-// (block_size=128, tile_size=4, R from graph config, L=64)
+// (block_size=64, tile_size=4, R from graph config, L=64)
 #define DECLARE_CONSTRUCT_CONFIG(id, IDX, R, DAT, DIST, FUNC) \
-  using construct_cfg_##id = jasper::graph_construct_config<cfg_##id, 128, 4, R, 64>;
+  using construct_cfg_##id = jasper::graph_construct_config<cfg_##id, 64, 4, R, 64>;
 
 JASPER_FOR_EACH_CONFIG(DECLARE_CONSTRUCT_CONFIG)
 #undef DECLARE_CONSTRUCT_CONFIG
