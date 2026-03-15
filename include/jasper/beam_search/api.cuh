@@ -46,9 +46,9 @@ beam_search_result<GRAPH_CFG> search_impl(const graph<GRAPH_CFG>& g,
 
 template <typename GRAPH_CFG,
           uint32_t BLOCK_SIZE = 64,
-          uint32_t MAX_SEARCH_WIDTH = 128,
+          uint32_t MAX_SEARCH_WIDTH = 512,
           uint32_t TILE_SIZE = 4,
-          uint32_t MAX_RESULT_SIZE = 128>
+          uint32_t MAX_RESULT_SIZE = 1024>
 beam_search_result<GRAPH_CFG> search(const graph<GRAPH_CFG>& g,
             typename GRAPH_CFG::vector_view_t                d_queries,
             const search_params&                             params = {}) {

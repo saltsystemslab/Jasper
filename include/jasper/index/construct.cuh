@@ -10,6 +10,7 @@
 #include <thrust/device_vector.h>
 #include <thrust/iterator/transform_iterator.h>
 #include <thrust/binary_search.h>
+#include <thrust/adjacent_difference.h>
 #include <thrust/iterator/counting_iterator.h>
 
 #include "jasper/index/graph.cuh"
@@ -124,8 +125,10 @@ struct graph_construct_workspace {
 
   // reverse edge workspace
   thrust::device_vector<edge_pair<index_t>> reverse_edges; // [batch_size * R]
+  thrust::device_vector<index_t> reverse_offsets_flags;    // [batch_size * R]
   thrust::device_vector<index_t> reverse_offsets;          // [batch_size * R + 1]
   edge_pair<index_t>* reverse_edges_ptr;
+  index_t* reverse_offsets_flags_ptr;
   index_t* reverse_offsets_ptr;
 
   static graph_construct_workspace allocate(uint32_t max_batch_size) {
@@ -143,9 +146,11 @@ struct graph_construct_workspace {
     cudaMalloc(&ws.prune_counts,        sizeof(uint32_t) * max_batch_size);
     
     ws.reverse_edges.resize(max_batch_size * R);
+    ws.reverse_offsets_flags.resize(max_batch_size * R);
     ws.reverse_offsets.resize(max_batch_size * R + 1);
 
     ws.reverse_edges_ptr = thrust::raw_pointer_cast(ws.reverse_edges.data());
+    ws.reverse_offsets_flags_ptr = thrust::raw_pointer_cast(ws.reverse_offsets_flags.data());
     ws.reverse_offsets_ptr = thrust::raw_pointer_cast(ws.reverse_offsets.data());
 
     return ws;
@@ -163,11 +168,12 @@ struct graph_construct_workspace {
     size_t prune_cand_bytes   = sizeof(entry_t)           * max_batch_size * max_candidates;
     size_t prune_cnt_bytes    = sizeof(uint32_t)          * max_batch_size;
     size_t rev_edges_bytes    = sizeof(edge_pair<index_t>) * reverse_edges.size();
+    size_t rev_offsets_flags_bytes = sizeof(index_t)       * reverse_offsets_flags.size();
     size_t rev_offsets_bytes  = sizeof(index_t)            * reverse_offsets.size();
 
     size_t total = frontier_bytes + visited_bytes + visited_cnt_bytes
                  + prune_cand_bytes + prune_cnt_bytes
-                 + rev_edges_bytes + rev_offsets_bytes;
+                 + rev_edges_bytes + rev_offsets_bytes + rev_offsets_flags_bytes;
 
     auto mb = [](size_t b) { return b / (1024.0 * 1024.0); };
 
@@ -178,6 +184,7 @@ struct graph_construct_workspace {
     std::printf("  prune_candidates : %8.2f MB\n", mb(prune_cand_bytes));
     std::printf("  prune_counts     : %8.2f MB\n", mb(prune_cnt_bytes));
     std::printf("  reverse_edges    : %8.2f MB\n", mb(rev_edges_bytes));
+    std::printf("  reverse_flags    : %8.2f MB\n", mb(rev_offsets_flags_bytes));
     std::printf("  reverse_offsets  : %8.2f MB\n", mb(rev_offsets_bytes));
     std::printf("  total            : %8.2f MB\n", mb(total)); 
   }
@@ -198,6 +205,7 @@ struct graph_construct_workspace {
       + sizeof(entry_t)            * max_candidates   // prune_candidates
       + sizeof(uint32_t)                              // prune_counts
       + sizeof(edge_pair<index_t>) * R                // reverse_edges
+      + sizeof(index_t)            * R                // rev_offsets_flags
       + sizeof(index_t)            * R;               // reverse_offsets
 
     // Fixed overhead: reverse_offsets has one extra element (+1)
@@ -218,6 +226,8 @@ struct graph_construct_workspace {
     
     reverse_edges.clear();
     reverse_edges.shrink_to_fit();
+    reverse_offsets_flags.clear();
+    reverse_offsets_flags.shrink_to_fit();
     reverse_offsets.clear();
     reverse_offsets.shrink_to_fit();
   }
@@ -462,6 +472,57 @@ __global__ void fill_reverse_edges(
   }
 }
 
+// Given a sorted-by-source vector of (source, sink) pairs,
+// returns a vector of starting indices for each unique source,
+// and (via reference) the count of unique sources.
+template <typename CONSTRUCT_GRAPH_CONFIG>
+void get_unique_source_offsets(
+  thrust::device_vector<edge_pair<typename CONSTRUCT_GRAPH_CONFIG::index_t>>& reversed_edges,
+  typename CONSTRUCT_GRAPH_CONFIG::index_t n_reversed_edges,
+  thrust::device_vector<typename CONSTRUCT_GRAPH_CONFIG::index_t>& reverse_offsets_flags,
+  thrust::device_vector<typename CONSTRUCT_GRAPH_CONFIG::index_t>& reverse_offsets,
+  typename CONSTRUCT_GRAPH_CONFIG::index_t& num_unique_sources
+){
+  using index_t = typename CONSTRUCT_GRAPH_CONFIG::index_t;
+
+  if (n_reversed_edges == 0) {
+    num_unique_sources = 0; 
+    return;
+  }
+
+  auto src_begin = thrust::make_transform_iterator(
+    reversed_edges.begin(), extract_source_from_edge_pair<index_t>());
+  auto src_end   = thrust::make_transform_iterator(
+    reversed_edges.begin()+n_reversed_edges, extract_source_from_edge_pair<index_t>());
+
+  // mark where a new source group begins:
+  // flags[i] = 1 if i == 0 or source[i] != source[i-1]
+  thrust::adjacent_difference(src_begin, src_end, reverse_offsets_flags.begin());
+
+  // adjacent_difference copies the first element as-is; force it to 1
+  reverse_offsets_flags[0] = 1;
+
+  // For the remaining elements, we just need != 0 → 1
+  thrust::transform(reverse_offsets_flags.begin() + 1, reverse_offsets_flags.end(),
+                    reverse_offsets_flags.begin() + 1,
+                    [] __device__ (int v) { return v != 0 ? 1 : 0; });
+
+  // count unique sources
+  num_unique_sources = thrust::reduce(
+    reverse_offsets_flags.begin(), 
+    reverse_offsets_flags.begin()+n_reversed_edges);
+
+  // collect the indices where flags == 1
+  thrust::copy_if(
+    thrust::counting_iterator<int>(0),
+    thrust::counting_iterator<int>(n_reversed_edges),
+    reverse_offsets_flags.begin(),
+    reverse_offsets.begin(),
+    [] __device__ (int f) { return f == 1; });
+
+  reverse_offsets[num_unique_sources] = n_reversed_edges;
+}
+
 template <typename CONSTRUCT_GRAPH_CONFIG, uint32_t TILE_SIZE>
 __global__ void process_reverse_edges_kernel(
   const edge_pair<typename CONSTRUCT_GRAPH_CONFIG::index_t>* __restrict__ reverse_edges,
@@ -523,16 +584,17 @@ __global__ void process_reverse_edges_kernel(
     uint32_t n_reverse = rev_end - rev_start;
     if (n_reverse == 0) continue;
 
-    const data_t* src_vec = all_vectors + static_cast<uint64_t>(vid) * dim;
+    index_t actual_vertex = reverse_edges[rev_start].source;
+    const data_t* src_vec = all_vectors + static_cast<uint64_t>(actual_vertex) * dim;
 
     // merge existing edges + reverse edges to candidates
     if (threadIdx.x == 0) s_count = 0;
     __syncthreads();
 
     // grab existing edges
-    uint8_t n_edges = edge_counts[vid];
+    uint8_t n_edges = edge_counts[actual_vertex];
     for (uint32_t i=tile_id; i<n_edges; i+=n_tiles) {
-      index_t neighbor = graph_edges[vid].edges[i];
+      index_t neighbor = graph_edges[actual_vertex].edges[i];
       if (neighbor == INVALID_INDEX) continue;
 
       const data_t* neighbor_vec = all_vectors + static_cast<uint64_t>(neighbor) * dim;
@@ -548,7 +610,7 @@ __global__ void process_reverse_edges_kernel(
     // grab reversed edge sinks
     for (uint32_t i=tile_id; i<n_reverse; i+=n_tiles) {
       index_t sink = reverse_edges[rev_start + i].sink;
-      if (sink == INVALID_INDEX || sink == vid) continue;
+      if (sink == INVALID_INDEX || sink == actual_vertex) continue;
 
       const data_t* sink_vec = all_vectors + static_cast<uint64_t>(sink) * dim;
       distance_t d = compute_distance<CONSTRUCT_GRAPH_CONFIG::graph_cfg_t::dist_func,
@@ -591,7 +653,7 @@ __global__ void process_reverse_edges_kernel(
       index_t cand_id = s_candidates[i].first;
       distance_t cand_dist = s_candidates[i].second;
 
-      if (cand_id == vid || cand_id == INVALID_INDEX) continue;
+      if (cand_id == actual_vertex || cand_id == INVALID_INDEX) continue;
 
       const data_t* cand_vec = all_vectors + static_cast<uint64_t>(cand_id) * dim;
 
@@ -629,10 +691,10 @@ __global__ void process_reverse_edges_kernel(
     // write back to graph
     uint32_t final_count = s_n_selected;
     for (uint32_t i=threadIdx.x; i<final_count; i+=blockDim.x) {
-      graph_edges[vid].edges[i] = s_selected[i];
+      graph_edges[actual_vertex].edges[i] = s_selected[i];
     }
     if (threadIdx.x == 0) {
-      edge_counts[vid] = static_cast<uint8_t>(final_count);
+      edge_counts[actual_vertex] = static_cast<uint8_t>(final_count);
     }
 
     __syncthreads();
@@ -747,41 +809,38 @@ __host__ void process_batch(
 
   if (n_edges == 0) return;
 
-  edge_pair<index_t> last_edge = ws.reverse_edges[n_edges - 1]; 
-  index_t num_vertices = last_edge.source + 1;
+  index_t num_unique_sources = 0;
+  get_unique_source_offsets<CONSTRUCT_GRAPH_CONFIG>(
+    ws.reverse_edges, 
+    n_edges,
+    ws.reverse_offsets_flags,
+    ws.reverse_offsets,
+    num_unique_sources
+  );
 
-  std::cout << "batch_size=" << static_cast<uint32_t>(batch_size) 
-    << " n_reverse_edges="<< static_cast<uint32_t>(n_edges) << " num_vertices=" << static_cast<uint32_t>(num_vertices) << std::endl;
+  // std::cout << "batch_size=" << static_cast<uint32_t>(batch_size) 
+  //   << " n_reverse_edges="<< static_cast<uint32_t>(n_edges) 
+  //   << " num_unique_sources=" << static_cast<uint32_t>(num_unique_sources) 
+  //   << std::endl;
 
-  // thrust::host_vector<edge_pair<index_t>> h_reverse_edges = reverse_edges;
   // std::cout << "reverse_edges=[";
-  // for(auto i = h_reverse_edges.begin(); i != h_reverse_edges.end(); ++i) std::cout << *i << " ";
-  // std::cout << "]" << std::endl;
-
-  // thrust::host_vector<index_t> h_reverse_edges = reverse_edges;
-  // std::cout << "reverse_edges=[";
-  // for(auto i = h_reverse_edges.begin(); i != h_reverse_edges.end(); ++i) std::cout << *i << " ";
-  // std::cout << "]" << std::endl;
-
-  // if (num_vertices + 1 > ws.reverse_offsets.size()) {
-  //   ws.reverse_offsets.resize(num_vertices + 1);
-  //   ws.reverse_offsets_ptr = thrust::raw_pointer_cast(ws.reverse_offsets.data());
+  // for (uint i=0; i<20 && i < n_edges; i++) {
+  //   edge_pair<index_t> n = ws.reverse_edges[i];
+  //   std::cout << "(" << n.source << "," << n.sink << "), ";
   // }
+  // std::cout << "]" << std::endl;
 
-  auto src_begin = thrust::make_transform_iterator(
-            ws.reverse_edges.begin(), extract_source_from_edge_pair<index_t>{});
-  thrust::counting_iterator<index_t> count(0);
-  thrust::lower_bound(src_begin, src_begin + n_edges,
-                      count, count + num_vertices + 1,
-                      ws.reverse_offsets.begin());
-
-  // get unique sources
-  
+  // std::cout << "reverse_offsets=[";
+  // for (uint i=0; i<20 && i < num_unique_sources; i++) {
+  //   index_t n = ws.reverse_offsets[i];
+  //   std::cout << n << ",";
+  // }
+  // std::cout << "]" << std::endl;
 
   cudaEventRecord(e5);
 
   // add edges + robust prune
-  constexpr uint64_t process_reverse_edges_kernel_grid_size = 1024; // fix size
+  constexpr uint64_t process_reverse_edges_kernel_grid_size = 4096; // fix size
   process_reverse_edges_kernel<CONSTRUCT_GRAPH_CONFIG, TILE_SIZE>
        <<<process_reverse_edges_kernel_grid_size, BLOCK_SIZE>>>( //<<<num_vertices, BLOCK_SIZE>>>(
           ws.reverse_edges_ptr,
@@ -790,7 +849,7 @@ __host__ void process_batch(
           graph.edge_counts,
           graph.vectors.data,
           dim,
-          num_vertices,
+          num_unique_sources,
           alpha);
   err = cudaDeviceSynchronize();
   if (err != cudaSuccess) {
@@ -835,9 +894,9 @@ __host__ void construction_round(
 
     count += batch_size;
 
-    // std::printf("\r[construct] %u / %u (%.1f%%)", count, graph.n_vectors,
-    //             100.0f * count / graph.n_vectors);
-    // std::fflush(stdout);
+    std::printf("\r[construct] %u / %u (%.1f%%)", count, graph.n_vectors,
+                100.0f * count / graph.n_vectors);
+    std::fflush(stdout);
 
     if (batch_size < max_batch_size) {
       batch_size = std::min(max_batch_size, batch_size * 2);
