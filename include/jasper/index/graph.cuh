@@ -60,6 +60,37 @@ struct graph {
   vector_view_t vectors;
 };
 
+// // after 
+// template <typename graph_cfg>
+// struct graph_segment {
+//   using index_t     = typename graph_cfg::index_t;
+//   using edge_list_t = typename graph_cfg::edge_list_t;
+//   using vector_view_t    = typename graph_cfg::vector_view_t;
+
+//   constexpr index_t vector_per_segment = graph_cfg::vector_per_segment;
+
+//   index_t n_vectors_in_segment;
+
+//   edge_list_t *edges;
+//   uint8_t *edge_counts;
+//   vector_view_t vectors;
+// }
+
+// template <typename graph_cfg>
+// struct graph {
+//   using index_t     = typename graph_cfg::index_t;
+//   using edge_list_t = typename graph_cfg::edge_list_t;
+//   using vector_view_t    = typename graph_cfg::vector_view_t;
+
+//   uint32_t dim;
+//   index_t n_vectors;
+//   index_t medoid;
+
+//   thrust::device_vector<graph_segment<graph_cfg>> segments;
+
+//   // TODO: helper function to get edges, edge_counts, and vectors from segments by giving offset.
+// };
+
 template <typename graph_config>
 __host__ graph<graph_config> load_graph_from_file(std::string input_fname,
                                                   uint32_t dim,

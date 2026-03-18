@@ -2,13 +2,17 @@ import jasper
 import torch
 import time
 
-g = jasper.Graph(
-  "/projects/SaltSystemsLab/ann_index/deep10M.index", 
-  dim=96, n_neighbors=64, data_type="f32", distance="l2")
+# g = jasper.Graph(
+#   "/projects/SaltSystemsLab/ann_index/deep10M.index", 
+#   dim=96, n_neighbors=64, data_type="f32", distance="l2")
+g = jasper.Graph.load("~/data/bigann10M.index", 
+                      dim=128, n_neighbors=64, data_type="uint8", distance="l2")
 
 print(g)
 
-queries = torch.randn(10000, 96, device="cuda", dtype=torch.float32)
+# queries = torch.randn(10000, 96, device="cuda", dtype=torch.float32)
+queries = jasper.read_bin("/projects/SaltSystemsLab/ann_data/bigann/bigann10kquery", "uint8")
+
 
 start = time.perf_counter()
 indices, distances = g.search(queries, k=10, beam_width=64)
