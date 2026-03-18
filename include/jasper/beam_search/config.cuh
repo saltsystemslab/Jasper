@@ -1,5 +1,7 @@
 #pragma once
 
+#include <thrust/pair.h>
+
 #include "jasper/distance/distance.cuh"
 #include "jasper/index/vector.cuh"
 

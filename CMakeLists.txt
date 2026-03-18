@@ -26,6 +26,18 @@ if(CMAKE_BUILD_TYPE STREQUAL "Debug")
   set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -G -g -lineinfo")
 endif()
 
+CPMAddPackage(
+  NAME gallatin
+  GITHUB_REPOSITORY saltsystemslab/gallatin
+  GIT_TAG origin/inlined_commands
+)
+
+CPMAddPackage (
+  NAME argparse
+  GITHUB_REPOSITORY p-ranav/argparse
+  GIT_TAG origin/master
+)
+
 # ── Header-only library ──
 add_library(jasper INTERFACE)
 target_include_directories(jasper
@@ -40,8 +52,12 @@ target_compile_options(jasper
 )
 target_link_libraries(jasper
   INTERFACE
+    gallatin
+    argparse
     CUDA::cudart
     CUDA::toolkit
+    CUDA::cublas 
+    CUDA::curand
     ThrustInterface
 )
 
@@ -50,6 +66,32 @@ option(JASPER_BUILD_TESTS "Build unit tests" OFF)
 if(JASPER_BUILD_TESTS)
   enable_testing()
   add_subdirectory(tests)
+endif()
+
+# CLI tool directly calling c++
+option(JASPER_BUILD_CMD "Build command-line tools" ON)
+if(JASPER_BUILD_CMD)
+  add_executable(create_index cmd/create_index.cu)
+  target_link_libraries(create_index PRIVATE jasper)
+  set_target_properties(create_index PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+  )
+  set_target_properties(create_index PROPERTIES
+    CUDA_ARCHITECTURES "80;86;89;90"
+    CUDA_SEPARABLE_COMPILATION ON
+  )
+
+  add_executable(run_query cmd/run_query.cu)
+  target_link_libraries(run_query PRIVATE jasper)
+  set_target_properties(run_query PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+  )
+  set_target_properties(create_index PROPERTIES
+    CUDA_ARCHITECTURES "80;86;89;90"
+    CUDA_SEPARABLE_COMPILATION ON
+  )
 endif()
 
 # ── TVM FFI shared library ──────────────────────────────────────
