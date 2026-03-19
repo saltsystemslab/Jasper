@@ -22,7 +22,7 @@ class DistanceFunc(str, Enum):
 
 class DataType(str, Enum):
     FLOAT32 = "f32"
-    UINT8 = "uint8"
+    UINT8 = "u8"
 
 
 # ── Config registry (must match JASPER_FOR_EACH_CONFIG in C++) ──
@@ -148,7 +148,7 @@ class Graph:
             path:         Path to the graph binary file.
             dim:          Dimensionality of the vectors.
             n_neighbors:  Max neighbors per node (must match file).
-            data_type:    Vector data type: "f32" or "uint8".
+            data_type:    Vector data type: "f32" or "u8".
             distance:     Distance function: "l2" or "ip".
         """
         if isinstance(data_type, str):
@@ -311,9 +311,9 @@ class Graph:
 
 # ── Utils ───────────────────────────────────────────────────────
 
-def read_bin(path: str, dtype: str = "float32", max_vectors: int = 0) -> torch.Tensor:
-    np_dtype = np.float32 if dtype == "float32" else np.uint8
-    torch_dtype = torch.float32 if dtype == "float32" else torch.uint8
+def read_bin(path: str, dtype: str = "f32", max_vectors: int = 0) -> torch.Tensor:
+    np_dtype = np.float32 if dtype == "f32" else np.uint8
+    torch_dtype = torch.float32 if dtype == "f32" else torch.uint8
 
     with open(path, "rb") as f:
         n_vectors, dim = struct.unpack("II", f.read(8))
@@ -355,11 +355,12 @@ def read_groundtruth(path: str, k: int = 10) -> tuple[torch.Tensor, torch.Tensor
     )
 
 def get_recall(gt, result_indices, k, n_queries):
-    recall = sum(
+    count = sum(
         len(set(result_indices[i].tolist()) & set(gt[i].tolist()))
         for i in range(n_queries)
-    ) / (n_queries * k)
-    print(f"Recall@10: {recall:.3f}")
+    )
+    recall = count / (n_queries * k)
+    print(f"Recall@{k}: {recall:.3f} ({count}/{(n_queries * k)})")
     return recall
 
 # ── Usage ───────────────────────────────────────────────────────
