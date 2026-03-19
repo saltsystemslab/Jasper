@@ -30,6 +30,12 @@ gt_indices, gt_distances =  jasper.read_groundtruth("/root/bigann-10M", k)
 # warmup
 indices, distances = g.search(queries, k=k, beam_width=16, limit=128, print_throughput=False)
 
+indices, distances = g.search(queries, k=k, beam_width=1, limit=128, print_throughput=True)
+jasper.get_recall(gt_indices, indices, k, len(queries))
+
+indices, distances = g.search(queries, k=k, beam_width=2, limit=128, print_throughput=True)
+jasper.get_recall(gt_indices, indices, k, len(queries))
+
 indices, distances = g.search(queries, k=k, beam_width=4, limit=128, print_throughput=True)
 jasper.get_recall(gt_indices, indices, k, len(queries))
 

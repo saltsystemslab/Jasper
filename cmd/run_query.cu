@@ -241,8 +241,6 @@ void load_and_bench(const std::string& index_path,
   CUDA_CHECK(cudaMemcpy(d_queries, h_queries, query_bytes, cudaMemcpyHostToDevice));
   delete[] h_queries;
 
-  std::cout << "  d_queries=" << static_cast<void*>(d_queries) << std::endl;
-
   // Load ground truth
   GroundTruth gt;
   bool has_gt = !gt_path.empty();
@@ -334,7 +332,7 @@ int main(int argc, char** argv) {
 
   program.add_argument("--beam_limits", "-b")
     .default_value(std::vector<std::string>{
-      "4:128", "8:128", "16:128", "32:128", "64:128", "128:256", "256:512"
+      "1:128", "2:128", "4:128", "8:128", "16:128", "32:128", "64:128", "128:256", "256:512"
     })
     .nargs(argparse::nargs_pattern::at_least_one)
     .help("beam_width:limit pairs to benchmark (e.g. 16:128 64:256)");

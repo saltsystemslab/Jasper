@@ -92,7 +92,7 @@ int64_t ConstructGraph_##id(ffi::TensorView vectors,                           \
   jasper::graph_construct_workspace<construct_cfg_##id> ws;                    \
   uint32_t max_batch_size = min(                                               \
     ws.max_batch_size_for_budget(workspace_budget_bytes),                      \
-    n_vectors / 20                                                             \
+    n_vectors / 50                                                             \
   );                                                                           \
                                                                                \
   params.data_vectors   = vecs;                                                \
