@@ -6,12 +6,12 @@ import time
 #   "/projects/SaltSystemsLab/ann_index/deep10M.index", 
 #   dim=96, n_neighbors=64, data_type="f32", distance="l2")
 g = jasper.Graph.load("~/data/bigann10M.index", 
-                      dim=128, n_neighbors=64, data_type="uint8", distance="l2")
+                      dim=128, n_neighbors=64, data_type="u8", distance="l2")
 
 print(g)
 
 # queries = torch.randn(10000, 96, device="cuda", dtype=torch.float32)
-queries = jasper.read_bin("/projects/SaltSystemsLab/ann_data/bigann/bigann10kquery", "uint8")
+queries = jasper.read_bin("/projects/SaltSystemsLab/ann_data/bigann/bigann10kquery", "u8")
 
 
 start = time.perf_counter()

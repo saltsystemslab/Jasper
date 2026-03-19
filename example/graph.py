@@ -5,7 +5,7 @@ import time
 k = 1
 
 print("Loading vectors")
-vectors = jasper.read_bin("/root/data/bigann10M", "uint8")
+vectors = jasper.read_bin("/root/data/deep10M", "f32")
 print(f"Loaded {len(vectors)} vectors.")
 
 print("Start build graph")
@@ -22,10 +22,10 @@ elapsed_time = end - start
 print(g)
 print(f"Graph construction complete, time: {elapsed_time:.4f} seconds.")
 
-queries = jasper.read_bin("/root/data/bigann10kquery", "uint8")
+queries = jasper.read_bin("/root/data/deep10kquery", "f32")
 
 # gt
-gt_indices, gt_distances =  jasper.read_groundtruth("/root/bigann-10M", k)
+gt_indices, gt_distances =  jasper.read_groundtruth("/root/deep-10M", k)
 
 # warmup
 indices, distances = g.search(queries, k=k, beam_width=16, limit=128, print_throughput=False)
@@ -56,8 +56,6 @@ jasper.get_recall(gt_indices, indices, k, len(queries))
 
 indices, distances = g.search(queries, k=k, beam_width=256, limit=512, print_throughput=True)
 jasper.get_recall(gt_indices, indices, k, len(queries))
-    
-    
-     
+
     
 g.free()
