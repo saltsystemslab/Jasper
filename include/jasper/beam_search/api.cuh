@@ -101,7 +101,7 @@ beam_search_result<GRAPH_CFG> search_dispatch_width(
 template <typename GRAPH_CFG,
           uint32_t BLOCK_SIZE = 64,
           uint32_t TILE_SIZE = 4,
-          uint32_t MAX_RESULT_SIZE = 1024>
+          uint32_t MAX_RESULT_SIZE = 512>
 beam_search_result<GRAPH_CFG> search(
     const graph<GRAPH_CFG>&               g,
     typename GRAPH_CFG::vector_view_t     d_queries,

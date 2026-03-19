@@ -59,38 +59,6 @@ struct graph {
   // flat vectors DATA_T[n_vectors * dim]
   vector_view_t vectors;
 };
-
-// // after 
-// template <typename graph_cfg>
-// struct graph_segment {
-//   using index_t     = typename graph_cfg::index_t;
-//   using edge_list_t = typename graph_cfg::edge_list_t;
-//   using vector_view_t    = typename graph_cfg::vector_view_t;
-
-//   constexpr index_t vector_per_segment = graph_cfg::vector_per_segment;
-
-//   index_t n_vectors_in_segment;
-
-//   edge_list_t *edges;
-//   uint8_t *edge_counts;
-//   vector_view_t vectors;
-// }
-
-// template <typename graph_cfg>
-// struct graph {
-//   using index_t     = typename graph_cfg::index_t;
-//   using edge_list_t = typename graph_cfg::edge_list_t;
-//   using vector_view_t    = typename graph_cfg::vector_view_t;
-
-//   uint32_t dim;
-//   index_t n_vectors;
-//   index_t medoid;
-
-//   thrust::device_vector<graph_segment<graph_cfg>> segments;
-
-//   // TODO: helper function to get edges, edge_counts, and vectors from segments by giving offset.
-// };
-
 template <typename graph_config>
 __host__ graph<graph_config> load_graph_from_file(std::string input_fname,
                                                   uint32_t dim,
@@ -127,25 +95,25 @@ __host__ graph<graph_config> load_graph_from_file(std::string input_fname,
   std::cout << "bytes_per_node: "  << bytes_per_node << "\n";
   std::cout << "dim: "             << dim << "\n";
 
-  // Allocate pinned host memory
+  uint32_t padded_dim = vector_view<data_t>::pad(dim);
+
+  // Allocate pinned host memory (padded layout for vectors)
   uint8_t*     host_edge_counts;
   edge_list_t* host_edges;
   data_t*      host_vectors;
 
   cudaMallocHost(&host_edge_counts, sizeof(uint8_t)     * big_n_vectors);
   cudaMallocHost(&host_edges,       sizeof(edge_list_t)  * big_n_vectors);
-  cudaMallocHost(&host_vectors,     sizeof(data_t)       * big_n_vectors * dim);
+  cudaMallocHost(&host_vectors,     sizeof(data_t)       * big_n_vectors * padded_dim);
+  memset(host_vectors, 0,           sizeof(data_t)       * big_n_vectors * padded_dim);
 
-  // Read per-node data
+  // Read per-node data (disk is packed at dim, memory is strided at padded_dim)
   for (uint64_t i = 0; i < big_n_vectors; i++) {
-    // Read vector (dim elements)
-    inputFile.read(reinterpret_cast<char*>(&host_vectors[i * dim]),
+    inputFile.read(reinterpret_cast<char*>(&host_vectors[i * padded_dim]),
                    sizeof(data_t) * dim);
-    // Read neighbor count
     uint8_t n_neighbors;
     inputFile.read(reinterpret_cast<char*>(&n_neighbors), sizeof(uint8_t));
     host_edge_counts[i] = n_neighbors;
-    // Read neighbor list
     inputFile.read(reinterpret_cast<char*>(&host_edges[i]), sizeof(edge_list_t));
   }
 
@@ -154,23 +122,21 @@ __host__ graph<graph_config> load_graph_from_file(std::string input_fname,
     g.edges       = host_edges;
     g.vectors     = {host_vectors, dim, static_cast<uint32_t>(big_n_vectors)};
   } else {
-    // Allocate device memory
+    // Allocate device memory (padded layout)
     data_t* d_vectors;
     cudaMalloc(&g.edge_counts, sizeof(uint8_t)     * big_n_vectors);
     cudaMalloc(&g.edges,       sizeof(edge_list_t)  * big_n_vectors);
-    cudaMalloc(&d_vectors,     sizeof(data_t)       * big_n_vectors * dim);
+    cudaMalloc(&d_vectors,     sizeof(data_t)       * big_n_vectors * padded_dim);
 
-    // Copy to device
     cudaMemcpy(g.edge_counts, host_edge_counts,
                sizeof(uint8_t) * big_n_vectors, cudaMemcpyHostToDevice);
     cudaMemcpy(g.edges, host_edges,
                sizeof(edge_list_t) * big_n_vectors, cudaMemcpyHostToDevice);
     cudaMemcpy(d_vectors, host_vectors,
-               sizeof(data_t) * big_n_vectors * dim, cudaMemcpyHostToDevice);
+               sizeof(data_t) * big_n_vectors * padded_dim, cudaMemcpyHostToDevice);
 
     g.vectors = {d_vectors, dim, static_cast<uint32_t>(big_n_vectors)};
 
-    // Free pinned host memory
     cudaFreeHost(host_edge_counts);
     cudaFreeHost(host_edges);
     cudaFreeHost(host_vectors);
@@ -196,6 +162,8 @@ __host__ void save_graph_to_file(const graph<graph_config>& g,
   uint64_t big_n_vectors    = static_cast<uint64_t>(g.n_vectors);
   uint64_t medoid_as_uint64 = static_cast<uint64_t>(g.medoid);
   uint32_t dim              = g.vectors.dim;
+  uint32_t padded_dim       = g.vectors.padded_dim;
+  // File format uses packed dim, not padded
   uint64_t bytes_per_node   = sizeof(data_t) * dim + sizeof(uint8_t) + sizeof(edge_list_t);
   uint64_t total_file_size  = 4 * sizeof(uint64_t) + big_n_vectors * bytes_per_node;
 
@@ -217,20 +185,20 @@ __host__ void save_graph_to_file(const graph<graph_config>& g,
   } else {
     cudaMallocHost(&host_edge_counts, sizeof(uint8_t)     * big_n_vectors);
     cudaMallocHost(&host_edges,       sizeof(edge_list_t)  * big_n_vectors);
-    cudaMallocHost(&host_vectors,     sizeof(data_t)       * big_n_vectors * dim);
+    cudaMallocHost(&host_vectors,     sizeof(data_t)       * big_n_vectors * padded_dim);
 
     cudaMemcpy(host_edge_counts, g.edge_counts,
                sizeof(uint8_t) * big_n_vectors, cudaMemcpyDeviceToHost);
     cudaMemcpy(host_edges, g.edges,
                sizeof(edge_list_t) * big_n_vectors, cudaMemcpyDeviceToHost);
     cudaMemcpy(host_vectors, g.vectors.data,
-               sizeof(data_t) * big_n_vectors * dim, cudaMemcpyDeviceToHost);
+               sizeof(data_t) * big_n_vectors * padded_dim, cudaMemcpyDeviceToHost);
     cudaDeviceSynchronize();
   }
 
-  // Write per-node data
+  // Write per-node data (strip padding, write only dim elements per vector)
   for (uint64_t i = 0; i < big_n_vectors; i++) {
-    outFile.write(reinterpret_cast<const char*>(&host_vectors[i * dim]),
+    outFile.write(reinterpret_cast<const char*>(&host_vectors[i * padded_dim]),
                   sizeof(data_t) * dim);
     outFile.write(reinterpret_cast<const char*>(&host_edge_counts[i]),
                   sizeof(uint8_t));

@@ -20,7 +20,6 @@ namespace cg = cooperative_groups;
 
 namespace jasper {
 
-// distance calculation
 template <typename DATA_T, typename INDEX_T,
           typename DISTANCE_T, uint32_t TILE_SIZE,
           distance_func DIST_FUNC>
@@ -35,14 +34,14 @@ __device__ void populate_distances(
       cg::tiled_partition<TILE_SIZE>(thread_block);
   uint64_t tid = my_tile.meta_group_rank();
   constexpr INDEX_T INVALID_INDEX = std::numeric_limits<INDEX_T>::max();
-  uint32_t dim = data_vectors.dim;
+  uint32_t padded_dim = data_vectors.padded_dim;
 
   uint32_t count = result_buffer_count[0];
   for (unsigned i = tid + offset; i < count; i += my_tile.meta_group_size()) {
     auto dest = get_index(result_buffer[i]);
     if (dest != INVALID_INDEX) {
       float dist = compute_distance<DIST_FUNC, DATA_T, DISTANCE_T, TILE_SIZE>(
-        query_vec, data_vectors[dest], dim, my_tile);
+        query_vec, data_vectors[dest], padded_dim, my_tile);
       if (my_tile.thread_rank() == 0) {
         result_buffer[i] = set_distance(result_buffer[i], dist);
       }
@@ -288,11 +287,16 @@ __global__ void beam_search_single_kernel(
   extern __shared__ __align__(128) uint32_t smem[];
   auto *__restrict__ result_buffer = reinterpret_cast<ENTRY_T *>(smem);
   auto *__restrict__ result_buffer_count = reinterpret_cast<uint32_t *>(result_buffer + result_buffer_size);
-  auto *__restrict__ smem_query_vec = reinterpret_cast<DATA_T *>(result_buffer_count + 1);
 
-  // load query vector to shared memory 
+  // Align smem_query_vec to 16 bytes
+  uintptr_t query_vec_offset = reinterpret_cast<uintptr_t>(result_buffer_count + 1);
+  query_vec_offset = (query_vec_offset + 15) & ~uintptr_t(15);
+  auto *__restrict__ smem_query_vec = reinterpret_cast<DATA_T *>(query_vec_offset);
+
+  // Load query vector to shared memory (including zero padding for aligned loads)
+  uint32_t padded_dim = query_vectors.padded_dim;
   DATA_T *query_vec = query_vectors[query_id];
-  for (uint i = threadIdx.x; i < query_vectors.dim; i += blockDim.x) {
+  for (uint i = threadIdx.x; i < padded_dim; i += blockDim.x) {
     smem_query_vec[i] = query_vec[i];
   }
 
@@ -458,11 +462,12 @@ template <typename INDEX_T, typename DISTANCE_T, typename DATA_T>
 __host__ uint32_t get_smem_size(const uint32_t beam_width,
                                 const uint32_t block_size,
                                 const uint32_t k,
-                                const uint32_t dim) {
+                                const uint32_t padded_dim) {
   uint32_t smem_size = 0;
-  smem_size += sizeof(ENTRY_T) * (beam_width + 64);
-  smem_size += sizeof(uint32_t);
-  smem_size += sizeof(DATA_T) * dim;
+  smem_size += sizeof(ENTRY_T) * (beam_width + 64);  // result_buffer
+  smem_size += sizeof(uint32_t);                      // result_buffer_count
+  smem_size = (smem_size + 15) & ~15u;                // align to 16 bytes
+  smem_size += sizeof(DATA_T) * padded_dim;           // smem_query_vec
   return smem_size;
 }
 
@@ -475,7 +480,7 @@ beam_search(const beam_search_params<Cfg>& p) {
   dim3 threads(Cfg::block_size, 1, 1);
   dim3 blocks(p.query_vectors.n_vectors, 1, 1);
   uint32_t smem = get_smem_size<typename Cfg::index_t, typename Cfg::distance_t, typename Cfg::data_t>(
-      p.beam_width, Cfg::block_size, p.k, p.data_vectors.dim);
+      p.beam_width, Cfg::block_size, p.k, p.data_vectors.padded_dim);
 
   beam_search_result<typename Cfg::graph_cfg_t> result{};
 
