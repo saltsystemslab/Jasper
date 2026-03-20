@@ -1,61 +1,67 @@
+import argparse
 import torch
 import jasper
 import time
 
-k = 1
 
-print("Loading vectors")
-vectors = jasper.read_bin("/root/data/deep10M", "f32")
-print(f"Loaded {len(vectors)} vectors.")
+def parse_args():
+    p = argparse.ArgumentParser(description="Jasper graph build & search benchmark")
 
-print("Start build graph")
-start = time.perf_counter()
-g = jasper.Graph.build(
-    vectors,
-    n_neighbors=64,
-    distance="l2",
-    alpha=1.2,
-    workspace_budget="10GB",
-)
-end = time.perf_counter()
-elapsed_time = end - start
-print(g)
-print(f"Graph construction complete, time: {elapsed_time:.4f} seconds.")
+    # files
+    p.add_argument("--vectors", required=True, help="Path to vectors bin file")
+    p.add_argument("--queries", required=True, help="Path to query vectors bin file")
+    p.add_argument("--groundtruth", required=True, help="Path to groundtruth file")
+    p.add_argument("--dtype", default="f32", choices=["f32", "f16", "u8"], help="Vector data type (default: f32)")
 
-queries = jasper.read_bin("/root/data/deep10kquery", "f32")
+    # graph build settings
+    p.add_argument("--n-neighbors", type=int, default=64, help="Number of neighbors (default: 64)")
+    p.add_argument("--distance", default="l2", choices=["l2", "cosine", "ip"], help="Distance metric (default: l2)")
+    p.add_argument("--alpha", type=float, default=1.2, help="Pruning alpha (default: 1.2)")
+    p.add_argument("--workspace-budget", default="10GB", help="Workspace memory budget (default: 10GB)")
 
-# gt
-gt_indices, gt_distances =  jasper.read_groundtruth("/root/deep-10M", k)
+    # search settings
+    p.add_argument("-k", type=int, default=1, help="Top-k results (default: 1)")
+    p.add_argument("--beam-widths", type=int, nargs="+", default=[1, 2, 4, 8, 16, 32, 64, 128, 256],
+                    help="Beam widths to sweep (default: 1 2 4 8 16 32 64 128 256)")
+    p.add_argument("--limit", type=int, default=128, help="Base search limit (default: 128)")
 
-# warmup
-indices, distances = g.search(queries, k=k, beam_width=16, limit=128, print_throughput=False)
+    return p.parse_args()
 
-indices, distances = g.search(queries, k=k, beam_width=1, limit=128, print_throughput=True)
-jasper.get_recall(gt_indices, indices, k, len(queries))
 
-indices, distances = g.search(queries, k=k, beam_width=2, limit=128, print_throughput=True)
-jasper.get_recall(gt_indices, indices, k, len(queries))
+def main():
+    args = parse_args()
 
-indices, distances = g.search(queries, k=k, beam_width=4, limit=128, print_throughput=True)
-jasper.get_recall(gt_indices, indices, k, len(queries))
+    print("Loading vectors")
+    vectors = jasper.read_bin(args.vectors, args.dtype)
+    print(f"Loaded {len(vectors)} vectors.")
 
-indices, distances = g.search(queries, k=k, beam_width=8, limit=128, print_throughput=True)
-jasper.get_recall(gt_indices, indices, k, len(queries))
+    print("Start build graph")
+    start = time.perf_counter()
+    g = jasper.Graph.build(
+        vectors,
+        n_neighbors=args.n_neighbors,
+        distance=args.distance,
+        alpha=args.alpha,
+        workspace_budget=args.workspace_budget,
+    )
+    elapsed = time.perf_counter() - start
+    print(g)
+    print(f"Graph construction complete, time: {elapsed:.4f} seconds.")
 
-indices, distances = g.search(queries, k=k, beam_width=16, limit=128, print_throughput=True)
-jasper.get_recall(gt_indices, indices, k, len(queries))
+    queries = jasper.read_bin(args.queries, args.dtype)
+    gt_indices, gt_distances = jasper.read_groundtruth(args.groundtruth, args.k)
 
-indices, distances = g.search(queries, k=k, beam_width=32, limit=128, print_throughput=True)
-jasper.get_recall(gt_indices, indices, k, len(queries))
+    # warmup
+    g.search(queries, k=args.k, beam_width=max(args.beam_widths), limit=args.limit, print_throughput=False)
 
-indices, distances = g.search(queries, k=k, beam_width=64, limit=128, print_throughput=True)
-jasper.get_recall(gt_indices, indices, k, len(queries))
+    # sweep beam widths
+    for bw in args.beam_widths:
+        limit = max(args.limit, 2 * bw)
+        indices, distances = g.search(queries, k=args.k, beam_width=bw, limit=limit, print_throughput=True)
+        jasper.get_recall(gt_indices, indices, args.k, len(queries))
 
-indices, distances = g.search(queries, k=k, beam_width=128, limit=256, print_throughput=True)
-jasper.get_recall(gt_indices, indices, k, len(queries))
+    g.free()
 
-indices, distances = g.search(queries, k=k, beam_width=256, limit=512, print_throughput=True)
-jasper.get_recall(gt_indices, indices, k, len(queries))
 
-    
-g.free()
+if __name__ == "__main__":
+    main()
