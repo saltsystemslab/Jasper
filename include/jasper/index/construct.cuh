@@ -137,17 +137,49 @@ struct graph_construct_workspace {
     constexpr uint32_t L = GRAPH_CONSTRUCT_CONFIG::L;
     constexpr uint32_t R = GRAPH_CONSTRUCT_CONFIG::R;
     constexpr uint32_t max_result_size = GRAPH_CONSTRUCT_CONFIG::beam_search_max_result_size;
-    constexpr uint32_t max_candidates = max_result_size + R; // default = 256 + 64
+    constexpr uint32_t max_candidates = max_result_size + R;
 
-    cudaMalloc(&ws.frontier,            sizeof(entry_t)  * max_batch_size * L);
-    cudaMalloc(&ws.visited,             sizeof(entry_t)  * max_batch_size * max_result_size);
-    cudaMalloc(&ws.visited_counts,      sizeof(uint32_t) * max_batch_size);
-    cudaMalloc(&ws.prune_candidates,    sizeof(entry_t)  * max_batch_size * max_candidates);
-    cudaMalloc(&ws.prune_counts,        sizeof(uint32_t) * max_batch_size);
-    
-    ws.reverse_edges.resize(max_batch_size * R);
-    ws.reverse_offsets_flags.resize(max_batch_size * R);
-    ws.reverse_offsets.resize(max_batch_size * R + 1);
+    size_t total_bytes =
+        sizeof(entry_t)  * max_batch_size * L +
+        sizeof(entry_t)  * max_batch_size * max_result_size +
+        sizeof(uint32_t) * max_batch_size +
+        sizeof(entry_t)  * max_batch_size * max_candidates +
+        sizeof(uint32_t) * max_batch_size;
+
+    auto check = [&](cudaError_t err, const char* name) {
+      if (err != cudaSuccess) {
+        const char* err_str = cudaGetErrorString(err);
+        // Clear the sticky error so subsequent CUDA calls don't fail
+        cudaGetLastError();
+        // Free any buffers that were already allocated
+        ws.free();
+
+        size_t free_mem = 0, total_mem = 0;
+        cudaMemGetInfo(&free_mem, &total_mem);
+
+        throw std::runtime_error(
+          std::string("cudaMalloc failed for ") + name + ": " + err_str +
+          " (requested workspace: " + std::to_string(total_bytes / (1 << 20)) + " MB, "
+          "GPU free: " + std::to_string(free_mem / (1 << 20)) + " MB). "
+          "Try increasing --workspace-budget or reducing batch size.");
+      }
+    };
+
+    try {
+      check(cudaMalloc(&ws.frontier,         sizeof(entry_t)  * max_batch_size * L),              "frontier");
+      check(cudaMalloc(&ws.visited,          sizeof(entry_t)  * max_batch_size * max_result_size), "visited");
+      check(cudaMalloc(&ws.visited_counts,   sizeof(uint32_t) * max_batch_size),                  "visited_counts");
+      check(cudaMalloc(&ws.prune_candidates, sizeof(entry_t)  * max_batch_size * max_candidates), "prune_candidates");
+      check(cudaMalloc(&ws.prune_counts,     sizeof(uint32_t) * max_batch_size),                  "prune_counts");
+
+      ws.reverse_edges.resize(max_batch_size * R);
+      ws.reverse_offsets_flags.resize(max_batch_size * R);
+      ws.reverse_offsets.resize(max_batch_size * R + 1);
+    } catch (...) {
+      cudaGetLastError();  // Clear any sticky error from thrust
+      ws.free();
+      throw;
+    }
 
     ws.reverse_edges_ptr = thrust::raw_pointer_cast(ws.reverse_edges.data());
     ws.reverse_offsets_flags_ptr = thrust::raw_pointer_cast(ws.reverse_offsets_flags.data());
@@ -918,28 +950,39 @@ __host__ graph<typename CONSTRUCT_GRAPH_CONFIG::graph_cfg_t> construct_graph(
   using vector_view_t = typename graph_cfg_t::vector_view_t;
   using entry_t       = thrust::pair<index_t, distance_t>;
 
-  // constexpr uint32_t L = CONSTRUCT_GRAPH_CONFIG::L;
   float alpha = params.alpha;
-  // Hard code medoid to be the first vector.
-  // From empirical data it does not affect the performance.
   index_t medoid = 0;
 
   uint32_t vector_dim = params.data_vectors.dim;
   uint32_t n_vectors = params.data_vectors.n_vectors;
 
   if (params.on_host) {
-    std::cerr << "on_host index construction is not supported." << std::endl;
-    std::exit(EXIT_FAILURE);
+    throw std::runtime_error("on_host index construction is not supported.");
   }
+
+  auto check_cuda = [](cudaError_t err, const char* name) {
+    if (err != cudaSuccess) {
+      const char* err_str = cudaGetErrorString(err);
+      cudaGetLastError();  // clear sticky error
+      throw std::runtime_error(
+        std::string("CUDA error in construct_graph at ") + name + ": " + err_str);
+    }
+  };
 
   // allocate graph on device memory
   graph_t g;
   g.dim = vector_dim;
   g.n_vectors = n_vectors;
   g.medoid = medoid;
-  cudaMalloc(&g.edge_counts, sizeof(uint8_t)      * n_vectors);
-  cudaMalloc(&g.edges,       sizeof(edge_list_t)  * n_vectors);
-  g.vectors = params.data_vectors.to_device();
+  g.vectors = params.data_vectors;
+
+  try {
+    check_cuda(cudaMalloc(&g.edge_counts, sizeof(uint8_t)     * n_vectors), "edge_counts");
+    check_cuda(cudaMalloc(&g.edges,       sizeof(edge_list_t) * n_vectors), "edges");
+  } catch (...) {
+    cudaGetLastError();
+    throw;
+  }
 
   // workspace
   auto ws = graph_construct_workspace<CONSTRUCT_GRAPH_CONFIG>::allocate(params.max_batch_size);
