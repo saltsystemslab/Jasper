@@ -34,8 +34,31 @@ struct __align__(16) vector_view {
   // Caller is responsible for freeing the returned view's data via cudaFree.
   __host__ vector_view<DATA_T> to_device() const {
     DATA_T* d_data = nullptr;
-    cudaMalloc(&d_data, size_bytes());
-    cudaMemcpy(d_data, data, size_bytes(), cudaMemcpyHostToDevice);
+    size_t bytes = size_bytes();
+
+    cudaError_t err = cudaMalloc(&d_data, bytes);
+    if (err != cudaSuccess) {
+      const char* err_str = cudaGetErrorString(err);
+      cudaGetLastError();
+
+      size_t free_mem = 0, total_mem = 0;
+      cudaMemGetInfo(&free_mem, &total_mem);
+
+      throw std::runtime_error(
+        std::string("vector_view::to_device cudaMalloc failed: ") + err_str +
+        " (requested: " + std::to_string(bytes / (1 << 20)) + " MB, "
+        "GPU free: " + std::to_string(free_mem / (1 << 20)) + " MB)");
+    }
+
+    err = cudaMemcpy(d_data, data, bytes, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+      const char* err_str = cudaGetErrorString(err);
+      cudaGetLastError();
+      cudaFree(d_data);
+      throw std::runtime_error(
+        std::string("vector_view::to_device cudaMemcpy failed: ") + err_str);
+    }
+
     return {d_data, dim, padded_dim, n_vectors};
   }
 
@@ -64,6 +87,7 @@ struct __align__(16) vector_view {
     return {data + static_cast<size_t>(offset) * padded_dim, dim, padded_dim, count};
   }
 };
+
 // Returns a vector_view pointing to pinned host memory.
 // The caller is responsible for freeing the data via cudaFreeHost.
 template <typename DATA_T>

@@ -59,6 +59,7 @@ struct graph {
   // flat vectors DATA_T[n_vectors * dim]
   vector_view_t vectors;
 };
+
 template <typename graph_config>
 __host__ graph<graph_config> load_graph_from_file(std::string input_fname,
                                                   uint32_t dim,

@@ -11,11 +11,11 @@ def parse_args():
     p.add_argument("--vectors", required=True, help="Path to vectors bin file")
     p.add_argument("--queries", required=True, help="Path to query vectors bin file")
     p.add_argument("--groundtruth", required=True, help="Path to groundtruth file")
-    p.add_argument("--dtype", default="f32", choices=["f32", "f16", "u8"], help="Vector data type (default: f32)")
+    p.add_argument("--dtype", default="f32", choices=["f32", "u8"], help="Vector data type (default: f32)")
 
     # graph build settings
     p.add_argument("--n-neighbors", type=int, default=64, help="Number of neighbors (default: 64)")
-    p.add_argument("--distance", default="l2", choices=["l2", "cosine", "ip"], help="Distance metric (default: l2)")
+    p.add_argument("--distance", default="l2", choices=["l2", "ip"], help="Distance metric (default: l2)")
     p.add_argument("--alpha", type=float, default=1.2, help="Pruning alpha (default: 1.2)")
     p.add_argument("--workspace-budget", default="10GB", help="Workspace memory budget (default: 10GB)")
 
