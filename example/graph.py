@@ -24,7 +24,7 @@ def parse_args():
 
     # search settings
     p.add_argument("-k", type=int, default=1, help="Top-k results (default: 1)")
-    p.add_argument("--beam-widths", type=int, nargs="+", default=[1, 2, 4, 8, 16, 32, 64, 128, 256],
+    p.add_argument("--beam-widths", type=int, nargs="+", default=[1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 768],
                     help="Beam widths to sweep (default: 1 2 4 8 16 32 64 128 256)")
     p.add_argument("--limit", type=int, default=128, help="Base search limit (default: 128)")
 
@@ -58,7 +58,8 @@ def main():
         print(f"Storing graph to {args.out_index}")
         
     # warmup
-    g.search(queries, k=args.k, beam_width=max(args.beam_widths), limit=args.limit, print_throughput=False)
+    g.search(queries, k=args.k, beam_width=max(args.beam_widths), limit=args.limit, print_throughput=True)
+    time.sleep(1)
 
     # sweep beam widths
     for bw in args.beam_widths:
