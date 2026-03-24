@@ -78,6 +78,17 @@ int64_t LoadGraph_##id(ffi::String path, int64_t dim) {                        \
   return handle;                                                               \
 }                                                                              \
                                                                                \
+void SaveGraph_##id(int64_t handle, ffi::String path) {                        \
+  jasper::graph<cfg_##id>* gp;                                                 \
+  {                                                                            \
+    std::lock_guard<std::mutex> lock(g_mutex);                                 \
+    auto it = g_graphs.find(handle);                                           \
+    TVM_FFI_ICHECK(it != g_graphs.end()) << "Invalid handle: " << handle;      \
+    gp = &std::get<jasper::graph<cfg_##id>>(it->second);                       \
+  }                                                                            \
+  jasper::save_graph_to_file<cfg_##id>(*gp, std::string(path), /*on_host=*/false); \
+}                                                                              \
+                                                                               \
 int64_t ConstructGraph_##id(ffi::TensorView vectors,                           \
                             int64_t dim,                                       \
                             double alpha,                                      \
@@ -106,6 +117,26 @@ int64_t ConstructGraph_##id(ffi::TensorView vectors,                           \
   int64_t handle = g_next_handle++;                                            \
   g_graphs[handle] = std::move(g);                                             \
   return handle;                                                               \
+}                                                                              \
+                                                                               \
+void GetVector_##id(int64_t handle, int64_t index,                             \
+                    ffi::TensorView out) {                                     \
+  jasper::graph<cfg_##id>* gp;                                                 \
+  {                                                                            \
+    std::lock_guard<std::mutex> lock(g_mutex);                                 \
+    auto it = g_graphs.find(handle);                                           \
+    TVM_FFI_ICHECK(it != g_graphs.end()) << "Invalid handle: " << handle;      \
+    gp = &std::get<jasper::graph<cfg_##id>>(it->second);                       \
+  }                                                                            \
+  auto& g = *gp;                                                               \
+  uint32_t idx = static_cast<uint32_t>(index);                                 \
+  TVM_FFI_ICHECK(idx < g.n_vectors) << "Index " << idx << " out of range";     \
+                                                                               \
+  cudaMemcpy(                                                                  \
+      static_cast<DAT*>(out.data_ptr()),                                       \
+      g.vectors[idx],                                                          \
+      sizeof(DAT) * g.vectors.dim,                                             \
+      cudaMemcpyDeviceToDevice);                                               \
 }                                                                              \
                                                                                \
 void Search_##id(int64_t handle,                                               \
@@ -151,9 +182,10 @@ void Search_##id(int64_t handle,                                               \
   cudaEventDestroy(e0);                                                        \
   cudaEventDestroy(e1);                                                        \
                                                                                \
-  std::cout << "[beam_search] duration=" << duration_ms                        \
-    << "ms, throughput=" << (n_queries * 1000.0f)/duration_ms                  \
-    << std::endl;                                                              \
+  if (print_throughput)                                                        \
+    std::cout << "[beam_search] duration=" << duration_ms                      \
+      << "ms, throughput=" << (n_queries * 1000.0f)/duration_ms                \
+      << std::endl;                                                            \
                                                                                \
   DLDevice device = queries.device();                                          \
   cudaStream_t stream = static_cast<cudaStream_t>(                             \
@@ -224,7 +256,9 @@ int64_t GetDim(int64_t handle) {
 #define EXPORT_OPS(id, ...)                                                    \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_load_##id,      jasper_ffi::LoadGraph_##id);      \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_construct_##id,  jasper_ffi::ConstructGraph_##id); \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_search_##id,     jasper_ffi::Search_##id);
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_search_##id,     jasper_ffi::Search_##id); \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_save_##id,       jasper_ffi::SaveGraph_##id); \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_get_vector_##id, jasper_ffi::GetVector_##id);
 
 JASPER_FOR_EACH_CONFIG(EXPORT_OPS)
 #undef EXPORT_OPS

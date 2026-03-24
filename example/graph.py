@@ -19,6 +19,9 @@ def parse_args():
     p.add_argument("--alpha", type=float, default=1.2, help="Pruning alpha (default: 1.2)")
     p.add_argument("--workspace-budget", default="10GB", help="Workspace memory budget (default: 10GB)")
 
+    # store graph?
+    p.add_argument("--out_index", default="", help="Output index path")
+
     # search settings
     p.add_argument("-k", type=int, default=1, help="Top-k results (default: 1)")
     p.add_argument("--beam-widths", type=int, nargs="+", default=[1, 2, 4, 8, 16, 32, 64, 128, 256],
@@ -51,6 +54,9 @@ def main():
     queries = jasper.read_bin(args.queries, args.dtype)
     gt_indices, gt_distances = jasper.read_groundtruth(args.groundtruth, args.k)
 
+    if args.out_index != "":
+        print(f"Storing graph to {args.out_index}")
+        
     # warmup
     g.search(queries, k=args.k, beam_width=max(args.beam_widths), limit=args.limit, print_throughput=False)
 
