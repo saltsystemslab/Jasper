@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <assert.h>
 
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
@@ -38,10 +39,8 @@ struct l2_distance {
     const uint4* r_ptr = reinterpret_cast<const uint4*>(b);
 
     // Alignment is guaranteed by vector_view's padded stride
-    // gpu_assert((reinterpret_cast<uintptr_t>(l_ptr) % 16) == 0,
-    //            "Left vector not 16-byte aligned\n");
-    // gpu_assert((reinterpret_cast<uintptr_t>(r_ptr) % 16) == 0,
-    //            "Right vector not 16-byte aligned\n");
+    assert((reinterpret_cast<uintptr_t>(l_ptr) % 16) == 0);
+    assert((reinterpret_cast<uintptr_t>(r_ptr) % 16) == 0);
 
     // Process elements using uint4 (16 bytes at a time)
     // Use the padded dim — pad elements are zero so they don't affect the sum

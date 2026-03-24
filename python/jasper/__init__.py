@@ -72,6 +72,8 @@ def _get_fns(config_id: str):
             getattr(_mod, f"jasper_load_{config_id}"),
             getattr(_mod, f"jasper_construct_{config_id}"),
             getattr(_mod, f"jasper_search_{config_id}"),
+            getattr(_mod, f"jasper_save_{config_id}"),
+            getattr(_mod, f"jasper_get_vector_{config_id}"),
         )
     return _fn_cache[config_id]
 
@@ -130,7 +132,7 @@ class Graph:
         self._n_neighbors = n_neighbors
         self._dim = dim
         self._torch_dtype = _DTYPE_MAP[data_type]
-        _, _, self._search_fn = _get_fns(config_id)
+        _, _, self._search_fn, self._save_fn, self._get_vector_fn = _get_fns(config_id)
 
     @classmethod
     def load(
@@ -157,10 +159,24 @@ class Graph:
             distance = DistanceFunc(distance)
 
         config_id = _resolve_config(data_type, n_neighbors, distance)
-        load_fn, _, _ = _get_fns(config_id)
+        load_fn, _, _, _, _ = _get_fns(config_id)
         handle = load_fn(path, dim)
 
         return cls(handle, config_id, data_type, distance, n_neighbors, dim)
+    
+    def save(self, path: str) -> None:
+        """
+        Save this graph to a binary file.
+
+        The file can later be reloaded with ``Graph.load()``, using the
+        same ``dim``, ``n_neighbors``, ``data_type``, and ``distance``
+        that were used when the graph was built or originally loaded.
+
+        Args:
+            path: Destination file path.
+        """
+        self._check_alive()
+        self._save_fn(self._handle, path)
 
     @classmethod
     def build(
@@ -209,7 +225,7 @@ class Graph:
             )
 
         config_id = _resolve_config(data_type, n_neighbors, distance)
-        _, construct_fn, _ = _get_fns(config_id)
+        _, construct_fn, _, _, _ = _get_fns(config_id)
         handle = construct_fn(vectors, dim, alpha, workspace_budget_bytes)
 
         return cls(handle, config_id, data_type, distance, n_neighbors, dim)
@@ -287,6 +303,25 @@ class Graph:
         )
 
         return out_indices, out_distances
+    
+    def get_vector(self, index: int) -> torch.Tensor:
+        """
+        Return the *index*-th vector stored in this graph.
+
+        Args:
+            index: Zero-based vector index.
+
+        Returns:
+            A 1-D CUDA tensor of shape [dim] with the graph's data type.
+        """
+        self._check_alive()
+        if index < 0 or index >= self.n_vectors:
+            raise IndexError(
+                f"Index {index} out of range [0, {self.n_vectors})"
+            )
+        out = torch.empty(self._dim, dtype=self._torch_dtype, device="cuda")
+        self._get_vector_fn(self._handle, index, out)
+        return out
 
     def free(self):
         if self._handle is not None:
@@ -362,6 +397,115 @@ def get_recall(gt, result_indices, k, n_queries):
     recall = count / (n_queries * k)
     print(f"Recall@{k}: {recall:.3f} ({count}/{(n_queries * k)})")
     return recall
+
+def generate_groundtruth(
+    vectors: torch.Tensor,
+    queries: torch.Tensor,
+    k: int = 100,
+    distance: str = "l2",
+    query_batch_size: int = 1024,
+    vector_batch_size: int = 100_000,
+    device: str = "cuda",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Brute-force exact k-NN on GPU, streaming both vectors and queries
+    in batches to stay within device memory.
+
+    Args:
+        vectors:           [n, dim] CPU tensor (float32) — the database.
+        queries:           [nq, dim] CPU tensor (float32) — the queries.
+        k:                 Number of nearest neighbors.
+        distance:          "l2" or "ip" (inner product).
+        query_batch_size:  Queries transferred to device per batch.
+        vector_batch_size: Vectors transferred to device per batch.
+        device:            Target device.
+
+    Returns:
+        indices:   int32   [nq, k]  (CPU)
+        distances: float32 [nq, k]  (CPU)
+    """
+    assert vectors.dtype == torch.float32 and queries.dtype == torch.float32
+    assert vectors.size(1) == queries.size(1)
+
+    n, dim = vectors.shape
+    nq = queries.size(0)
+
+    # Final results live on CPU
+    final_ids = torch.empty(nq, k, dtype=torch.int32)
+    final_dists = torch.empty(nq, k, dtype=torch.float32)
+
+    n_query_batches = (nq + query_batch_size - 1) // query_batch_size
+    n_vector_batches = (n + vector_batch_size - 1) // vector_batch_size
+
+    for qi, q_start in enumerate(range(0, nq, query_batch_size)):
+        q_end = min(q_start + query_batch_size, nq)
+        q_batch = queries[q_start:q_end].to(device)  # [qbs, dim]
+        qbs = q_batch.size(0)
+
+        if distance == "l2":
+            q_sq = (q_batch * q_batch).sum(dim=1, keepdim=True)  # [qbs, 1]
+
+        # Accumulate top-k across vector batches on device
+        top_dists = torch.full((qbs, k), float("inf"), device=device)
+        top_ids = torch.zeros((qbs, k), dtype=torch.int64, device=device)
+
+        for vi, v_start in enumerate(range(0, n, vector_batch_size)):
+            print(
+                f"\r[groundtruth] query batch {qi+1}/{n_query_batches}, "
+                f"vector batch {vi+1}/{n_vector_batches}",
+                end="", flush=True,
+            )
+            v_end = min(v_start + vector_batch_size, n)
+            v_batch = vectors[v_start:v_end].to(device)  # [vbs, dim]
+
+            if distance == "l2":
+                v_sq = (v_batch * v_batch).sum(dim=1)  # [vbs]
+                dists = q_sq + v_sq.unsqueeze(0) - 2.0 * (q_batch @ v_batch.T)
+                dists.clamp_(min=0.0)
+            elif distance == "ip":
+                dists = -(q_batch @ v_batch.T)  # negate so smaller = better
+            else:
+                raise ValueError(f"Unknown distance: {distance}")
+
+            # Offset local indices to global vector indices
+            local_ids = torch.arange(v_start, v_end, device=device).unsqueeze(0).expand(qbs, -1)
+
+            # Merge with running top-k: concat then re-select top-k
+            merged_dists = torch.cat([top_dists, dists], dim=1)     # [qbs, k + vbs]
+            merged_ids = torch.cat([top_ids, local_ids], dim=1)     # [qbs, k + vbs]
+
+            top_dists, sel = merged_dists.topk(k, dim=1, largest=False)
+            top_ids = merged_ids.gather(1, sel)
+
+            del v_batch, dists, local_ids, merged_dists, merged_ids, sel
+
+        final_ids[q_start:q_end] = top_ids.to(torch.int32).cpu()
+        final_dists[q_start:q_end] = top_dists.cpu()
+
+        del q_batch, top_dists, top_ids
+
+    print(f"\r[groundtruth] done — {nq} queries, {n} vectors, k={k}" + " " * 20)
+    return final_ids, final_dists
+
+
+def save_groundtruth(
+    path: str,
+    indices: torch.Tensor,
+    distances: torch.Tensor,
+):
+    """
+    Write ground truth to the binary format expected by `jasper.read_groundtruth`.
+
+    Format: [n_queries: u32][k: u32][ids: u32 * nq * k][dists: f32 * nq * k]
+    """
+    ids_np = indices.cpu().numpy().astype(np.uint32)
+    dists_np = distances.cpu().numpy().astype(np.float32)
+    nq, k = ids_np.shape
+
+    with open(path, "wb") as f:
+        f.write(struct.pack("II", nq, k))
+        f.write(ids_np.tobytes())
+        f.write(dists_np.tobytes())
 
 # ── Usage ───────────────────────────────────────────────────────
 #

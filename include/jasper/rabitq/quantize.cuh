@@ -81,12 +81,12 @@ __host__ inline double best_rescale_factor(
   return t;
 }
 
-__global__ void abs_kernel(float* data, int n) {
+static __global__ void abs_kernel(float* data, int n) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx < n) data[idx] = fabsf(data[idx]);
 }
 
-__host__ double get_const_scaling_factors(uint32_t dim, uint32_t bits_per_dim) {
+static __host__ double get_const_scaling_factors(uint32_t dim, uint32_t bits_per_dim) {
   constexpr int32_t n_samples = 1000;
 
   float* d_vectors;

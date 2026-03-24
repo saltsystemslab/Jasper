@@ -499,6 +499,36 @@ beam_search(const beam_search_params<Cfg>& p) {
     std::cerr << "Beam search malloc memory failed: " << cudaGetErrorString(err) << std::endl;
   }
 
+  // // ---- Log template parameters ----
+  // printf("=== beam_search_single_kernel launch ===\n");
+  // printf("Template parameters:\n");
+  // printf("  block_size:        %d\n", static_cast<int>(Cfg::block_size));
+  // printf("  dist_func:         %d\n", static_cast<int>(Cfg::dist_func));
+  // printf("  max_search_width:  %d\n", static_cast<int>(Cfg::max_search_width));
+  // printf("  get_visited:       %d\n", static_cast<int>(Cfg::get_visited));
+  // printf("  tile_size:         %d\n", static_cast<int>(Cfg::tile_size));
+  // printf("  max_result_size:   %d\n", static_cast<int>(Cfg::max_result_size));
+
+  // // ---- Log launch configuration ----
+  // printf("Launch config:\n");
+  // printf("  blocks:  %d\n", static_cast<int>(p.query_vectors.n_vectors));
+  // printf("  threads: %d\n", static_cast<int>(Cfg::block_size));
+  // printf("  smem:    %zu bytes\n", static_cast<size_t>(smem));
+
+  // // ---- Log runtime arguments ----
+  // printf("Runtime arguments:\n");
+  // printf("  data_dim:             %d\n", static_cast<int>(p.data_vectors.dim));
+  // printf("  data_padded_dim:      %d\n", static_cast<int>(p.data_vectors.padded_dim));
+  // printf("  data_n_vectors:       %d\n", static_cast<int>(p.data_vectors.n_vectors));
+  // printf("  query_dim:            %d\n", static_cast<int>(p.query_vectors.dim));
+  // printf("  query_padded_dim:     %d\n", static_cast<int>(p.query_vectors.padded_dim));
+  // printf("  query_n_vectors:      %d\n", static_cast<int>(p.query_vectors.n_vectors));
+  // printf("  p.medoid:             %d\n", static_cast<int>(p.medoid));
+  // printf("  p.k:                  %d\n", static_cast<int>(p.k));
+  // printf("  p.beam_width:         %d\n", static_cast<int>(p.beam_width));
+  // printf("  p.limit:              %d\n", static_cast<int>(p.limit));
+  // printf("========================================\n");
+
   // Launch
   beam_search_single_kernel<
       typename Cfg::index_t, typename Cfg::data_t, 

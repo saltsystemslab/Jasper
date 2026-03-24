@@ -73,11 +73,11 @@ struct __align__(16) vector_view {
 
   // Access vector i as a pointer: &data[i * padded_dim]
   __host__ __device__ DATA_T* operator[](uint32_t i) {
-    return &data[i * padded_dim];
+    return &data[static_cast<size_t>(i) * padded_dim];
   }
 
   __host__ __device__ const DATA_T* operator[](uint32_t i) const {
-    return &data[i * padded_dim];
+    return &data[static_cast<size_t>(i) * padded_dim];
   }
 
   // Return a read-only, non-owning view over a contiguous subset of vectors.

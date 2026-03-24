@@ -56,7 +56,6 @@ struct graph {
   edge_list_t *edges;
   uint8_t *edge_counts;
 
-  // flat vectors DATA_T[n_vectors * dim]
   vector_view_t vectors;
 };
 
