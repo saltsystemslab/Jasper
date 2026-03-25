@@ -1,0 +1,3 @@
+[submodule "external/gpu_error"]
+	path = external/gpu_error
+	url = git@github.com:saltsystemslab/gpu_error.git
