@@ -38,6 +38,8 @@ CPMAddPackage (
   GIT_TAG origin/master
 )
 
+add_subdirectory(external/gpu_error)
+
 # ── Header-only library ──
 add_library(jasper INTERFACE)
 target_include_directories(jasper
