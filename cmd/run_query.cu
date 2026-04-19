@@ -214,7 +214,7 @@ void load_and_bench(const std::string& index_path,
   // Load graph
   std::cout << "Loading index..." << std::endl;
   auto graph = jasper::load_graph_from_file<GraphCfg>(index_path, dim);
-  std::cout << "  " << graph.n_vectors << " vectors, dim=" << graph.vectors.dim << std::endl;
+  std::cout << "  " << graph.n_vectors << " vectors, dim=" << graph.dim << std::endl;
 
   // Load queries (format: [n_vectors: u32][dim: u32][data])
   std::cout << "Loading queries..." << std::endl;
@@ -269,9 +269,7 @@ void load_and_bench(const std::string& index_path,
 
   // Cleanup
   cudaFree(d_queries);
-  if (graph.edges)        cudaFree(graph.edges);
-  if (graph.edge_counts)  cudaFree(graph.edge_counts);
-  if (graph.vectors.data) cudaFree(graph.vectors.data);
+  graph.deallocate();
 }
 
 // ── Parse "beam_width:limit" pairs ─────────────────────────────

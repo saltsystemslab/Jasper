@@ -84,9 +84,7 @@ void construct_and_save(const std::string& filename,
 
   // Cleanup
   cudaFree(d_data);
-  if (graph.edges)       cudaFree(graph.edges);
-  if (graph.edge_counts) cudaFree(graph.edge_counts);
-  if (graph.vectors.data) cudaFree(graph.vectors.data);
+  graph.deallocate();
 }
 
 // ── Dispatch: (datatype, n_neighbors, distance) → config ───────

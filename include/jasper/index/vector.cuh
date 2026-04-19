@@ -22,6 +22,30 @@ struct __align__(16) vector_view {
   __host__ __device__ vector_view(DATA_T* data, uint32_t dim, uint32_t n_vectors)
       : data(data), dim(dim), padded_dim(pad(dim)), n_vectors(n_vectors) {}
 
+  // allocating an empty vector view with dim + n_vectors
+  static vector_view allocate(uint32_t dim, uint32_t n_vectors, bool on_device=true){
+    vector_view view;
+    view.dim = dim;
+    view.padded_dim = pad(dim);
+    view.n_vectors = n_vectors;
+    size_t bytes = view.size_bytes();
+    if (on_device) {
+      cudaMalloc(&view.data, bytes);
+    } else {
+      cudaMallocHost(&view.data, bytes);
+    }
+    return view;
+  }
+
+  // deallocate
+  void deallocate(bool on_device=true) {
+    if (on_device) {
+      cudaFree(data);
+    } else {
+      cudaFreeHost(data);
+    }
+  }
+
   // Private ctor that preserves an existing padded_dim (used by subview)
   __host__ __device__ vector_view(DATA_T* data, uint32_t dim, uint32_t padded_dim, uint32_t n_vectors)
       : data(data), dim(dim), padded_dim(padded_dim), n_vectors(n_vectors) {}

@@ -132,10 +132,20 @@ void GetVector_##id(int64_t handle, int64_t index,                             \
   uint32_t idx = static_cast<uint32_t>(index);                                 \
   TVM_FFI_ICHECK(idx < g.n_vectors) << "Index " << idx << " out of range";     \
                                                                                \
+  uint32_t seg_id    = jasper::graph<cfg_##id>::segment_of(idx);               \
+  uint32_t local_idx = jasper::graph<cfg_##id>::local_of(idx);                 \
+  uint32_t padded_dim = jasper::vector_view<DAT>::pad(g.dim);                  \
+                                                                               \
+  /* Copy the segment struct from device to read its device pointers */        \
+  jasper::graph_segment<cfg_##id> h_seg;                                       \
+  cudaMemcpy(&h_seg,                                                           \
+             thrust::raw_pointer_cast(g.segments.data()) + seg_id,             \
+             sizeof(h_seg), cudaMemcpyDeviceToHost);                           \
+                                                                               \
   cudaMemcpy(                                                                  \
       static_cast<DAT*>(out.data_ptr()),                                       \
-      g.vectors[idx],                                                          \
-      sizeof(DAT) * g.vectors.dim,                                             \
+      h_seg.vectors.data + static_cast<size_t>(local_idx) * padded_dim,        \
+      sizeof(DAT) * g.dim,                                                     \
       cudaMemcpyDeviceToDevice);                                               \
 }                                                                              \
                                                                                \
@@ -155,7 +165,7 @@ void Search_##id(int64_t handle,                                               \
   auto& g = *gp;                                                               \
                                                                                \
   uint32_t n_queries = static_cast<uint32_t>(queries.size(0));                 \
-  uint32_t dim_ = g.vectors.dim;                                               \
+  uint32_t dim_ = g.dim;                                                       \
                                                                                \
   jasper::vector_view<DAT> d_queries(                                          \
       static_cast<DAT*>(queries.data_ptr()), dim_, n_queries);                 \
@@ -216,9 +226,7 @@ void FreeGraph(int64_t handle) {
   std::visit([](auto& g) {
     using T = std::decay_t<decltype(g)>;
     if constexpr (!std::is_same_v<T, std::monostate>) {
-      if (g.edges)        cudaFree(g.edges);
-      if (g.edge_counts)  cudaFree(g.edge_counts);
-      if (g.vectors.data) cudaFree(g.vectors.data);
+      g.deallocate();
     }
   }, it->second);
 
@@ -246,7 +254,7 @@ int64_t GetDim(int64_t handle) {
   return std::visit([](auto& g) -> int64_t {
     using T = std::decay_t<decltype(g)>;
     if constexpr (!std::is_same_v<T, std::monostate>)
-      return static_cast<int64_t>(g.vectors.dim);
+      return static_cast<int64_t>(g.dim);
     else
       return 0;
   }, it->second);

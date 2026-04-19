@@ -33,8 +33,8 @@ beam_search_result<GRAPH_CFG> search_impl(const graph<GRAPH_CFG>& g,
 
   beam_search_params<Cfg> bp {
     .graph          = g,
-    .data_vectors   = g.vectors,
     .query_vectors  = d_queries,
+    .use_range      = false,
     .medoid         = g.medoid,
     .k              = params.k,
     .beam_width     = params.beam_width,
@@ -43,25 +43,6 @@ beam_search_result<GRAPH_CFG> search_impl(const graph<GRAPH_CFG>& g,
 
   return beam_search<Cfg>(bp);
 }
-
-// template <typename GRAPH_CFG,
-//           uint32_t BLOCK_SIZE = 64,
-//           uint32_t MAX_SEARCH_WIDTH = 512,
-//           uint32_t TILE_SIZE = 4,
-//           uint32_t MAX_RESULT_SIZE = 1024>
-// beam_search_result<GRAPH_CFG> search(const graph<GRAPH_CFG>& g,
-//             typename GRAPH_CFG::vector_view_t                d_queries,
-//             const search_params&                             params = {}) {
-//   if (params.get_visited) {
-//     return search_impl<GRAPH_CFG, BLOCK_SIZE, MAX_SEARCH_WIDTH,
-//                        TILE_SIZE, MAX_RESULT_SIZE, true>(
-//         g, d_queries, params);
-//   } else {
-//     return search_impl<GRAPH_CFG, BLOCK_SIZE, MAX_SEARCH_WIDTH,
-//                        TILE_SIZE, MAX_RESULT_SIZE, false>(
-//         g, d_queries, params);
-//   }
-// }
 
 template <typename GRAPH_CFG,
           uint32_t BLOCK_SIZE,

@@ -68,7 +68,7 @@ struct graph_construct_params {
 
   // Maximum batch size decides how much vectors do we consider at once.
   // Normally this number should be
-  // 1. less or equal to 10% of the total vector.
+  // 1. less or equal to 2% of the total vector.
   // 2. batch size needs to be fit inside device memory.
   uint32_t max_batch_size = 10000;
 
@@ -269,10 +269,7 @@ template <typename CONSTRUCT_GRAPH_CONFIG, uint32_t TILE_SIZE, uint32_t BLOCK_SI
 __global__ void merge_candidates_kernel(
   const typename CONSTRUCT_GRAPH_CONFIG::entry_t* __restrict__ visited,
   const uint32_t* __restrict__ visited_counts,
-  const typename CONSTRUCT_GRAPH_CONFIG::edge_list_t* __restrict__ edges,
-  const uint8_t* __restrict__ edge_counts,
-  const typename CONSTRUCT_GRAPH_CONFIG::data_t* __restrict__ all_vectors,
-  const typename CONSTRUCT_GRAPH_CONFIG::data_t* __restrict__ query_vectors,
+  typename CONSTRUCT_GRAPH_CONFIG::graph_t::device_view graph,
   uint32_t dim,
   uint32_t batch_offset,
   uint32_t batch_size,
@@ -305,13 +302,13 @@ __global__ void merge_candidates_kernel(
   constexpr entry_t SENTINEL = {INVALID_INDEX, std::numeric_limits<distance_t>::max()};
 
   // add existing neighbors (compute distance to query)
-  uint8_t n_edges = edge_counts[global_id];
-  const data_t* query_vec = query_vectors + static_cast<uint64_t>(bid) * dim;
+  uint8_t n_edges = graph.get_edge_count(global_id);
+  data_t* query_vec = graph.get_vector(batch_offset + bid);
   for (uint32_t i = tid; i < n_edges; i+=n_tiles) {
-    index_t neighbor = edges[global_id].edges[i];
+    index_t neighbor = graph.get_neighbor(global_id, i);
     if (neighbor == INVALID_INDEX) continue;
 
-    const data_t* neighbor_vec = all_vectors + static_cast<uint64_t>(neighbor) * dim;
+    const data_t* neighbor_vec = graph.get_vector(neighbor);
 
     distance_t d = compute_distance<CONSTRUCT_GRAPH_CONFIG::graph_cfg_t::dist_func, data_t, distance_t, TILE_SIZE>(
       query_vec, neighbor_vec, dim, my_tile);
@@ -381,9 +378,7 @@ template <typename CONSTRUCT_GRAPH_CONFIG, uint32_t TILE_SIZE>
 __global__ void robust_prune_kernel(
   const typename CONSTRUCT_GRAPH_CONFIG::entry_t* __restrict__ candidates, // [batch_size * max_candidates]
   const uint32_t* __restrict__ candidate_counts,                  // [batch_size]
-  typename CONSTRUCT_GRAPH_CONFIG::edge_list_t* __restrict__ edges,        // graph edges
-  uint8_t* __restrict__ edge_counts,                              // graph edge counts
-  const typename CONSTRUCT_GRAPH_CONFIG::data_t* __restrict__ all_vectors, // flat [n_vectors * dim]
+  typename CONSTRUCT_GRAPH_CONFIG::graph_t::device_view graph,
   uint32_t dim,
   uint32_t batch_offset,    // global index of first vector in this batch
   uint32_t batch_size,
@@ -427,7 +422,7 @@ __global__ void robust_prune_kernel(
 
     if (cand_id == global_id || cand_id == INVALID_INDEX) continue;
 
-    const data_t* cand_vec = all_vectors + static_cast<uint64_t>(cand_id) * dim;
+    data_t* cand_vec = graph.get_vector(cand_id);
 
     // Reset prune flag
     if (threadIdx.x == 0) s_pruned = false;
@@ -437,13 +432,11 @@ __global__ void robust_prune_kernel(
     // Tiles round-robin over selected neighbors.
     uint32_t n_sel = s_n_selected;
     for (uint32_t j = tile_id; j < n_sel; j += n_tiles) {
-      const data_t* sel_vec = all_vectors + static_cast<uint64_t>(s_selected[j]) * dim;
+      data_t* sel_vec = graph.get_vector(s_selected[j]);
 
-      // Tile-parallel distance: each thread in tile handles a chunk of dims
       distance_t d = compute_distance<CONSTRUCT_GRAPH_CONFIG::graph_cfg_t::dist_func, data_t, distance_t, TILE_SIZE>(
         cand_vec, sel_vec, dim, my_tile);
 
-      // Tile leader checks the prune condition
       if (my_tile.thread_rank() == 0) {
         if (d * alpha < cand_dist) {
           s_pruned = true;
@@ -465,20 +458,18 @@ __global__ void robust_prune_kernel(
     __syncthreads();
   }
 
-  // Write to graph — one thread writes, all threads read shared state
   uint32_t final_count = s_n_selected;
   for (uint32_t i = threadIdx.x; i < final_count; i += blockDim.x) {
-    edges[global_id].edges[i] = s_selected[i];
+    graph.set_neighbor(global_id, i, s_selected[i]);
   }
   if (threadIdx.x == 0) {
-    edge_counts[global_id] = static_cast<uint8_t>(final_count);
+    graph.set_edge_count(global_id, final_count);
   }
 }
 
 template <typename CONSTRUCT_GRAPH_CONFIG>
 __global__ void fill_reverse_edges(
-  const typename CONSTRUCT_GRAPH_CONFIG::edge_list_t* __restrict__ graph_edges,
-  const uint8_t* __restrict__ edge_counts,
+  typename CONSTRUCT_GRAPH_CONFIG::graph_t::device_view graph,
   edge_pair<typename CONSTRUCT_GRAPH_CONFIG::index_t>* reverse_edges,
   uint32_t batch_size,
   uint32_t batch_offset,
@@ -494,8 +485,8 @@ __global__ void fill_reverse_edges(
   uint32_t edge_idx = tid % max_edges_per_node;
   index_t  global_id = local_id + batch_offset;
 
-  if (edge_idx < edge_counts[global_id]) {
-    index_t neighbor = graph_edges[global_id].edges[edge_idx];
+  if (edge_idx < graph.get_edge_count(global_id)) {
+    index_t neighbor = graph.get_neighbor(global_id, edge_idx);
     // edge in graph:   global_id -> neighbor
     // reversed:        source=neighbor, sink=global_id
     reverse_edges[tid] = {neighbor, global_id};
@@ -559,9 +550,7 @@ template <typename CONSTRUCT_GRAPH_CONFIG, uint32_t TILE_SIZE>
 __global__ void process_reverse_edges_kernel(
   const edge_pair<typename CONSTRUCT_GRAPH_CONFIG::index_t>* __restrict__ reverse_edges,
   const typename CONSTRUCT_GRAPH_CONFIG::index_t* __restrict__ reverse_offsets,
-  typename CONSTRUCT_GRAPH_CONFIG::edge_list_t* __restrict__ graph_edges,
-  uint8_t* __restrict__ edge_counts,
-  const typename CONSTRUCT_GRAPH_CONFIG::data_t* __restrict__ all_vectors,
+  typename CONSTRUCT_GRAPH_CONFIG::graph_t::device_view graph,
   uint32_t dim,
   typename CONSTRUCT_GRAPH_CONFIG::index_t num_vertices,
   float alpha
@@ -617,19 +606,19 @@ __global__ void process_reverse_edges_kernel(
     if (n_reverse == 0) continue;
 
     index_t actual_vertex = reverse_edges[rev_start].source;
-    const data_t* src_vec = all_vectors + static_cast<uint64_t>(actual_vertex) * dim;
+    data_t* src_vec = graph.get_vector(actual_vertex);
 
     // merge existing edges + reverse edges to candidates
     if (threadIdx.x == 0) s_count = 0;
     __syncthreads();
 
     // grab existing edges
-    uint8_t n_edges = edge_counts[actual_vertex];
+    uint8_t n_edges = graph.get_edge_count(actual_vertex);
     for (uint32_t i=tile_id; i<n_edges; i+=n_tiles) {
-      index_t neighbor = graph_edges[actual_vertex].edges[i];
+      index_t neighbor = graph.get_neighbor(actual_vertex, i);
       if (neighbor == INVALID_INDEX) continue;
 
-      const data_t* neighbor_vec = all_vectors + static_cast<uint64_t>(neighbor) * dim;
+      data_t* neighbor_vec = graph.get_vector(neighbor);
       distance_t d = compute_distance<CONSTRUCT_GRAPH_CONFIG::graph_cfg_t::dist_func,
         data_t, distance_t, TILE_SIZE>(src_vec, neighbor_vec, dim, my_tile);
 
@@ -644,7 +633,7 @@ __global__ void process_reverse_edges_kernel(
       index_t sink = reverse_edges[rev_start + i].sink;
       if (sink == INVALID_INDEX || sink == actual_vertex) continue;
 
-      const data_t* sink_vec = all_vectors + static_cast<uint64_t>(sink) * dim;
+      data_t* sink_vec = graph.get_vector(sink);
       distance_t d = compute_distance<CONSTRUCT_GRAPH_CONFIG::graph_cfg_t::dist_func,
           data_t, distance_t, TILE_SIZE>(src_vec, sink_vec, dim, my_tile);
 
@@ -687,14 +676,14 @@ __global__ void process_reverse_edges_kernel(
 
       if (cand_id == actual_vertex || cand_id == INVALID_INDEX) continue;
 
-      const data_t* cand_vec = all_vectors + static_cast<uint64_t>(cand_id) * dim;
+      data_t* cand_vec = graph.get_vector(cand_id);
 
       if (threadIdx.x == 0) s_pruned = false;
       __syncthreads();
 
       uint32_t n_sel = s_n_selected;
       for (uint32_t j=tile_id; j<n_sel; j+=n_tiles) {
-        const data_t* selected_vec = all_vectors + static_cast<uint64_t>(s_selected[j]) * dim;
+        data_t* selected_vec = graph.get_vector(s_selected[j]);
         distance_t d = compute_distance<CONSTRUCT_GRAPH_CONFIG::graph_cfg_t::dist_func, data_t, distance_t, TILE_SIZE>(
           cand_vec, selected_vec, dim, my_tile
         );
@@ -723,10 +712,10 @@ __global__ void process_reverse_edges_kernel(
     // write back to graph
     uint32_t final_count = s_n_selected;
     for (uint32_t i=threadIdx.x; i<final_count; i+=blockDim.x) {
-      graph_edges[actual_vertex].edges[i] = s_selected[i];
+      graph.set_neighbor(actual_vertex, i, s_selected[i]);
     }
     if (threadIdx.x == 0) {
-      edge_counts[actual_vertex] = static_cast<uint8_t>(final_count);
+      graph.set_edge_count(actual_vertex, static_cast<uint8_t>(final_count));
     }
 
     __syncthreads();
@@ -752,10 +741,12 @@ __host__ void process_batch(
   constexpr uint32_t R = CONSTRUCT_GRAPH_CONFIG::R;
   constexpr uint32_t max_result = CONSTRUCT_GRAPH_CONFIG::beam_search_max_result_size;
   uint32_t max_candidates = max_result + R;
-  uint32_t dim = graph.vectors.dim;
+  uint32_t dim = graph.dim;
 
   constexpr uint32_t BLOCK_SIZE = CONSTRUCT_GRAPH_CONFIG::block_size;
   constexpr uint32_t TILE_SIZE  = CONSTRUCT_GRAPH_CONFIG::tile_size;
+
+  typename CONSTRUCT_GRAPH_CONFIG::graph_t::device_view device_graph_view = graph.view();
 
   cudaEvent_t e0, e1, e2, e3, e4, e5, e6;
   cudaEventCreate(&e0); cudaEventCreate(&e1); cudaEventCreate(&e2);
@@ -764,11 +755,11 @@ __host__ void process_batch(
 
   // beam search
   cudaEventRecord(e0);
-  vector_view<data_t> d_query_vectors = graph.vectors.subview(batch_offset, batch_size);
   beam_search_params<BEAM_SEARCH_CONFIG> bp {
     .graph          = graph,
-    .data_vectors   = graph.vectors,
-    .query_vectors  = d_query_vectors,
+    .use_range      = true,
+    .query_start    = batch_offset,
+    .query_end      = batch_offset + batch_size,
     .medoid         = graph.medoid,
     .k              = L,
     .beam_width     = L,
@@ -783,12 +774,16 @@ __host__ void process_batch(
 
   // add the edges to the points in batch
   merge_candidates_kernel<CONSTRUCT_GRAPH_CONFIG, TILE_SIZE, BLOCK_SIZE><<<batch_size, BLOCK_SIZE>>>(
-      ws.visited, ws.visited_counts,
-      graph.edges, graph.edge_counts,
-      graph.vectors.data, d_query_vectors.data,
-      dim, batch_offset, batch_size,
-      max_result, max_candidates,
-      ws.prune_candidates, ws.prune_counts);
+      ws.visited, 
+      ws.visited_counts,
+      device_graph_view,
+      dim, 
+      batch_offset, 
+      batch_size,
+      max_result, 
+      max_candidates,
+      ws.prune_candidates, 
+      ws.prune_counts);
   cudaError_t err = cudaDeviceSynchronize();
   if (err != cudaSuccess) {
     std::cerr << "merge_candidates_kernel failed: " << cudaGetErrorString(err) << std::endl;
@@ -797,11 +792,14 @@ __host__ void process_batch(
   
   // robust prune
   robust_prune_kernel<CONSTRUCT_GRAPH_CONFIG, TILE_SIZE><<<batch_size, BLOCK_SIZE>>>(
-      ws.prune_candidates, ws.prune_counts,
-      graph.edges, graph.edge_counts,
-      graph.vectors.data, dim,
-      batch_offset, batch_size,
-      max_candidates, alpha);
+      ws.prune_candidates, 
+      ws.prune_counts,
+      device_graph_view, 
+      dim,
+      batch_offset, 
+      batch_size,
+      max_candidates, 
+      alpha);
   err = cudaDeviceSynchronize();
   if (err != cudaSuccess) {
     std::cerr << "robust_prune_kernel failed: " << cudaGetErrorString(err) << std::endl;
@@ -812,7 +810,7 @@ __host__ void process_batch(
   uint32_t total_slots = batch_size * R;
   dim3 grid((total_slots + BLOCK_SIZE - 1) / BLOCK_SIZE);
   fill_reverse_edges<CONSTRUCT_GRAPH_CONFIG><<<grid, BLOCK_SIZE>>>(
-    graph.edges, graph.edge_counts,
+    device_graph_view,
     ws.reverse_edges_ptr,
     batch_size, 
     batch_offset, 
@@ -877,9 +875,7 @@ __host__ void process_batch(
        <<<process_reverse_edges_kernel_grid_size, BLOCK_SIZE>>>( //<<<num_vertices, BLOCK_SIZE>>>(
           ws.reverse_edges_ptr,
           ws.reverse_offsets_ptr,
-          graph.edges,
-          graph.edge_counts,
-          graph.vectors.data,
+          device_graph_view,
           dim,
           num_unique_sources,
           alpha);
@@ -951,7 +947,6 @@ __host__ graph<typename CONSTRUCT_GRAPH_CONFIG::graph_cfg_t> construct_graph(
   using entry_t       = thrust::pair<index_t, distance_t>;
 
   float alpha = params.alpha;
-  index_t medoid = 0;
 
   uint32_t vector_dim = params.data_vectors.dim;
   uint32_t n_vectors = params.data_vectors.n_vectors;
@@ -969,20 +964,8 @@ __host__ graph<typename CONSTRUCT_GRAPH_CONFIG::graph_cfg_t> construct_graph(
     }
   };
 
-  // allocate graph on device memory
-  graph_t g;
-  g.dim = vector_dim;
-  g.n_vectors = n_vectors;
-  g.medoid = medoid;
-  g.vectors = params.data_vectors;
-
-  try {
-    check_cuda(cudaMalloc(&g.edge_counts, sizeof(uint8_t)     * n_vectors), "edge_counts");
-    check_cuda(cudaMalloc(&g.edges,       sizeof(edge_list_t) * n_vectors), "edges");
-  } catch (...) {
-    cudaGetLastError();
-    throw;
-  }
+  // allocate a graph with only vector populated.
+  graph_t g = graph_t::allocate_and_load(params.data_vectors);
 
   // workspace
   auto ws = graph_construct_workspace<CONSTRUCT_GRAPH_CONFIG>::allocate(params.max_batch_size);
