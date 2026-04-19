@@ -20,28 +20,32 @@ namespace cg = cooperative_groups;
 
 namespace jasper {
 
-template <typename DATA_T, typename INDEX_T,
-          typename DISTANCE_T, uint32_t TILE_SIZE,
-          distance_func DIST_FUNC>
+template <typename GRAPH_CFG, uint32_t TILE_SIZE, distance_func DIST_FUNC>
 __device__ void populate_distances(
-    DATA_T *query_vec,
-    vector_view<DATA_T> data_vectors,
+    typename GRAPH_CFG::data_t *query_vec,
+    typename graph<GRAPH_CFG>::device_view& graph,
     ENTRY_T *result_buffer,
     uint32_t *result_buffer_count, 
     uint32_t offset) {
+
+  using INDEX_T = typename GRAPH_CFG::index_t;
+  using DATA_T = typename GRAPH_CFG::data_t;
+  using DISTANCE_T = typename GRAPH_CFG::distance_t;
+  using EDGE_LIST_T = typename GRAPH_CFG::edge_list_t;
+  
   auto thread_block = cg::this_thread_block();
   cg::thread_block_tile<TILE_SIZE> my_tile =
       cg::tiled_partition<TILE_SIZE>(thread_block);
   uint64_t tid = my_tile.meta_group_rank();
   constexpr INDEX_T INVALID_INDEX = std::numeric_limits<INDEX_T>::max();
-  uint32_t padded_dim = data_vectors.padded_dim;
+  uint32_t padded_dim = graph.get_padded_dim();
 
   uint32_t count = result_buffer_count[0];
   for (unsigned i = tid + offset; i < count; i += my_tile.meta_group_size()) {
     auto dest = get_index(result_buffer[i]);
     if (dest != INVALID_INDEX) {
       float dist = compute_distance<DIST_FUNC, DATA_T, DISTANCE_T, TILE_SIZE>(
-        query_vec, data_vectors[dest], padded_dim, my_tile);
+        query_vec, graph.get_vector(dest), padded_dim, my_tile);
       if (my_tile.thread_rank() == 0) {
         result_buffer[i] = set_distance(result_buffer[i], dist);
       }
@@ -87,18 +91,23 @@ __device__ thrust::pair<INDEX_T, bool> choose_new_frontier(
 }
 
 // adding the newly selected frontier's neighbors to the frontier list
-template <typename INDEX_T, typename DISTANCE_T, typename EDGE_LIST_T>
+template <typename GRAPH_CFG>
 __device__ void add_frontier_out(
-    const EDGE_LIST_T * __restrict__ graph, const uint8_t * __restrict__ edge_count,
+    typename graph<GRAPH_CFG>::device_view& graph, 
     ENTRY_T *result_buffer,
-    uint32_t *result_buffer_count, const INDEX_T & frontier, const uint32_t & k,
+    uint32_t *result_buffer_count, 
+    const typename GRAPH_CFG::index_t & frontier, 
+    const uint32_t & k,
     const uint32_t & beam_width) {
 
-  uint8_t n_edges = edge_count[frontier];
+  using INDEX_T = typename GRAPH_CFG::index_t;
+  using EDGE_LIST_T = typename GRAPH_CFG::edge_list_t;
+
+  uint8_t n_edges = graph.get_edge_count(frontier);
   uint32_t offset = result_buffer_count[0];
   __syncthreads();
 
-  const uint4* l_ptr = reinterpret_cast<const uint4*>(&graph[frontier].edges);
+  const uint4* l_ptr = reinterpret_cast<const uint4*>(&graph.get_neighbor_list(frontier).edges);
 
   for (uint i = threadIdx.x*4; i < n_edges; i += blockDim.x*4){
     uint4 loaded_edges = l_ptr[i/4];
@@ -239,19 +248,18 @@ __device__ void dedup_results(ENTRY_T *result_buffer,
 }
 
 // main search kernel
-template <typename INDEX_T, typename DATA_T,
-          typename DISTANCE_T, typename EDGE_LIST_T, uint32_t BLOCK_SIZE,
-          distance_func DISTANCE_FUNC,
+template <typename GRAPH_CFG, uint32_t BLOCK_SIZE, distance_func DISTANCE_FUNC,
           uint32_t MAX_SEARCH_WIDTH, bool GET_VISITED, uint32_t TILE_SIZE = 4, uint32_t MAX_RESULT_SIZE = 1024>
 __global__ void beam_search_single_kernel(
-    EDGE_LIST_T *graph, 
-    uint8_t *edge_count,
-    thrust::pair<INDEX_T, DISTANCE_T> *frontier_results,
-    thrust::pair<INDEX_T, DISTANCE_T> *visited_results,
-    uint32_t *visited_counts, 
-    vector_view<DATA_T> data_vectors,
-    vector_view<DATA_T> query_vectors,
-    INDEX_T medoid, 
+    typename graph<GRAPH_CFG>::device_view graph,
+    thrust::pair<typename GRAPH_CFG::index_t, typename GRAPH_CFG::distance_t> *frontier_results,
+    thrust::pair<typename GRAPH_CFG::index_t, typename GRAPH_CFG::distance_t> *visited_results,
+    uint32_t *visited_counts,
+    vector_view<typename GRAPH_CFG::data_t> query_vectors,
+    bool use_range,
+    uint32_t query_start,
+    uint32_t query_end,
+    typename GRAPH_CFG::index_t medoid, 
     uint32_t k, 
     uint32_t beam_width,
     uint32_t limit) {
@@ -275,6 +283,11 @@ __global__ void beam_search_single_kernel(
     #define _CLK_REC(V);
   #endif
 
+  using INDEX_T = typename GRAPH_CFG::index_t;
+  using DATA_T = typename GRAPH_CFG::data_t;
+  using DISTANCE_T = typename GRAPH_CFG::distance_t;
+  using EDGE_LIST_T = typename GRAPH_CFG::edge_list_t;
+
   // get the query vector for this block
   const auto query_id = blockIdx.x;
   uint32_t visited_counter = 0;
@@ -294,12 +307,16 @@ __global__ void beam_search_single_kernel(
   auto *__restrict__ smem_query_vec = reinterpret_cast<DATA_T *>(query_vec_offset);
 
   // Load query vector to shared memory (including zero padding for aligned loads)
-  uint32_t padded_dim = query_vectors.padded_dim;
-  DATA_T *query_vec = query_vectors[query_id];
-  for (uint i = threadIdx.x; i < padded_dim; i += blockDim.x) {
+  DATA_T *query_vec;
+  if (use_range) {
+    query_vec = graph.get_vector(query_start + query_id);
+  } else {
+    query_vec = query_vectors[query_id];
+  }
+  for (uint i = threadIdx.x; i < graph.get_padded_dim(); i += blockDim.x) {
     smem_query_vec[i] = query_vec[i];
   }
-
+  
   // cub temporary workspace
   constexpr uint32_t ELEMENTS_PER_THREAD = (MAX_SEARCH_WIDTH - 1) / BLOCK_SIZE + 1;
   using BlockMergeSortT = cub::BlockMergeSort<ENTRY_T, BLOCK_SIZE, ELEMENTS_PER_THREAD>;
@@ -326,8 +343,7 @@ __global__ void beam_search_single_kernel(
   _CLK_REC(clk_init);
 
   _CLK_START();
-  populate_distances<DATA_T, INDEX_T, DISTANCE_T, TILE_SIZE,
-                     DISTANCE_FUNC>(smem_query_vec, data_vectors,
+  populate_distances<GRAPH_CFG, TILE_SIZE, DISTANCE_FUNC>(smem_query_vec, graph,
                                        result_buffer, result_buffer_count, 0);
   _CLK_REC(clk_1st_opulate_distance);
 
@@ -381,15 +397,14 @@ __global__ void beam_search_single_kernel(
 
     // Add frontier's neighbor to results
     _CLK_START();
-    add_frontier_out<INDEX_T, DISTANCE_T, EDGE_LIST_T>(graph, edge_count, result_buffer, result_buffer_count,
+    add_frontier_out<GRAPH_CFG>(graph, result_buffer, result_buffer_count,
                      get_index(result_buffer[frontierIdx]), k, beam_width);
     __syncthreads();
     _CLK_REC(clk_add_frontier_out);
 
     // populate distance
     _CLK_START();
-    populate_distances<DATA_T, INDEX_T, DISTANCE_T, TILE_SIZE,
-                       DISTANCE_FUNC>(smem_query_vec, data_vectors,
+    populate_distances<GRAPH_CFG, TILE_SIZE, DISTANCE_FUNC>(smem_query_vec, graph,
                                          result_buffer, result_buffer_count,
                                          offset);
     __syncthreads();
@@ -477,21 +492,29 @@ beam_search(const beam_search_params<Cfg>& p) {
 
   using entry_t = typename Cfg::entry_t;
 
+  uint32_t n_data_vectors = p.graph.n_vectors;
+  uint32_t n_query_vectors;
+  if (p.use_range) {
+    n_query_vectors = p.query_end - p.query_start;
+  } else {
+    n_query_vectors = p.query_vectors.n_vectors;
+  }
+
   dim3 threads(Cfg::block_size, 1, 1);
-  dim3 blocks(p.query_vectors.n_vectors, 1, 1);
+  dim3 blocks(n_query_vectors, 1, 1);
   uint32_t smem = get_smem_size<typename Cfg::index_t, typename Cfg::distance_t, typename Cfg::data_t>(
-      p.beam_width, Cfg::block_size, p.k, p.data_vectors.padded_dim);
+      p.beam_width, Cfg::block_size, p.k, p.graph.get_padded_dim());
 
   beam_search_result<typename Cfg::graph_cfg_t> result{};
 
   // Allocate frontier
-  cudaMalloc(&result.frontier, sizeof(entry_t) * p.query_vectors.n_vectors * p.k);
+  cudaMalloc(&result.frontier, sizeof(entry_t) * n_query_vectors * p.k);
   // Allocate visited
   if constexpr (Cfg::get_visited) {
     cudaMalloc(&result.visited,
-               sizeof(entry_t) * p.query_vectors.n_vectors * Cfg::max_result_size);
+               sizeof(entry_t) * n_query_vectors * Cfg::max_result_size);
     cudaMalloc(&result.visited_counts,
-               sizeof(uint32_t) * p.query_vectors.n_vectors);
+               sizeof(uint32_t) * n_query_vectors);
   }
 
   cudaError_t err = cudaDeviceSynchronize();
@@ -499,49 +522,27 @@ beam_search(const beam_search_params<Cfg>& p) {
     std::cerr << "Beam search malloc memory failed: " << cudaGetErrorString(err) << std::endl;
   }
 
-  // // ---- Log template parameters ----
-  // printf("=== beam_search_single_kernel launch ===\n");
-  // printf("Template parameters:\n");
-  // printf("  block_size:        %d\n", static_cast<int>(Cfg::block_size));
-  // printf("  dist_func:         %d\n", static_cast<int>(Cfg::dist_func));
-  // printf("  max_search_width:  %d\n", static_cast<int>(Cfg::max_search_width));
-  // printf("  get_visited:       %d\n", static_cast<int>(Cfg::get_visited));
-  // printf("  tile_size:         %d\n", static_cast<int>(Cfg::tile_size));
-  // printf("  max_result_size:   %d\n", static_cast<int>(Cfg::max_result_size));
-
-  // // ---- Log launch configuration ----
-  // printf("Launch config:\n");
-  // printf("  blocks:  %d\n", static_cast<int>(p.query_vectors.n_vectors));
-  // printf("  threads: %d\n", static_cast<int>(Cfg::block_size));
-  // printf("  smem:    %zu bytes\n", static_cast<size_t>(smem));
-
-  // // ---- Log runtime arguments ----
-  // printf("Runtime arguments:\n");
-  // printf("  data_dim:             %d\n", static_cast<int>(p.data_vectors.dim));
-  // printf("  data_padded_dim:      %d\n", static_cast<int>(p.data_vectors.padded_dim));
-  // printf("  data_n_vectors:       %d\n", static_cast<int>(p.data_vectors.n_vectors));
-  // printf("  query_dim:            %d\n", static_cast<int>(p.query_vectors.dim));
-  // printf("  query_padded_dim:     %d\n", static_cast<int>(p.query_vectors.padded_dim));
-  // printf("  query_n_vectors:      %d\n", static_cast<int>(p.query_vectors.n_vectors));
-  // printf("  p.medoid:             %d\n", static_cast<int>(p.medoid));
-  // printf("  p.k:                  %d\n", static_cast<int>(p.k));
-  // printf("  p.beam_width:         %d\n", static_cast<int>(p.beam_width));
-  // printf("  p.limit:              %d\n", static_cast<int>(p.limit));
-  // printf("========================================\n");
+  auto graph_device_view = p.graph.view();
 
   // Launch
   beam_search_single_kernel<
-      typename Cfg::index_t, typename Cfg::data_t, 
-      typename Cfg::distance_t, typename Cfg::graph_cfg_t::edge_list_t,
+      typename Cfg::graph_cfg_t,
       Cfg::block_size, Cfg::dist_func,
       Cfg::max_search_width, Cfg::get_visited,
       Cfg::tile_size, Cfg::max_result_size>
     <<<blocks, threads, smem>>>(
-        p.graph.edges, p.graph.edge_counts,
-        result.frontier, result.visited, result.visited_counts,
-        p.data_vectors,
+        graph_device_view,
+        result.frontier, 
+        result.visited, 
+        result.visited_counts,
         p.query_vectors,
-        p.medoid, p.k, p.beam_width, p.limit);
+        p.use_range,
+        p.query_start,
+        p.query_end,
+        p.medoid, 
+        p.k, 
+        p.beam_width, 
+        p.limit);
 
   err = cudaDeviceSynchronize();
   if (err != cudaSuccess) {
@@ -560,31 +561,41 @@ __host__ void beam_search(
 
   using entry_t = typename Cfg::entry_t;
 
-  dim3 threads(Cfg::block_size, 1, 1);
-  dim3 blocks(p.query_vectors.n_vectors, 1, 1);
-  uint32_t smem = get_smem_size<typename Cfg::index_t, typename Cfg::distance_t, typename Cfg::data_t>(
-      p.beam_width, Cfg::block_size, p.k, p.data_vectors.dim);
-
-  cudaError_t err = cudaDeviceSynchronize();
-  if (err != cudaSuccess) {
-    std::cerr << "Beam search malloc memory failed: " << cudaGetErrorString(err) << std::endl;
+  uint32_t n_query_vectors;
+  if (p.use_range) {
+    n_query_vectors = p.query_end - p.query_start;
+  } else {
+    n_query_vectors = p.query_vectors.n_vectors;
   }
+
+  dim3 threads(Cfg::block_size, 1, 1);
+  dim3 blocks(n_query_vectors, 1, 1);
+  uint32_t smem = get_smem_size<typename Cfg::index_t, typename Cfg::distance_t, typename Cfg::data_t>(
+      p.beam_width, Cfg::block_size, p.k, p.graph.dim);
+
+  auto graph_device_view = p.graph.view();
 
   // Launch
   beam_search_single_kernel<
-      typename Cfg::index_t, typename Cfg::data_t, 
-      typename Cfg::distance_t, typename Cfg::graph_cfg_t::edge_list_t,
+      typename Cfg::graph_cfg_t,
       Cfg::block_size, Cfg::dist_func,
       Cfg::max_search_width, Cfg::get_visited,
       Cfg::tile_size, Cfg::max_result_size>
     <<<blocks, threads, smem>>>(
-        p.graph.edges, p.graph.edge_counts,
-        result.frontier, result.visited, result.visited_counts,
-        p.data_vectors,
+        graph_device_view,
+        result.frontier, 
+        result.visited, 
+        result.visited_counts,
         p.query_vectors,
-        p.medoid, p.k, p.beam_width, p.limit);
+        p.use_range,
+        p.query_start,
+        p.query_end,
+        p.medoid, 
+        p.k, 
+        p.beam_width, 
+        p.limit);
 
-  err = cudaDeviceSynchronize();
+  cudaError_t err = cudaDeviceSynchronize();
   if (err != cudaSuccess) {
     std::cerr << "Beam search kernel launch failed: " << cudaGetErrorString(err) << std::endl;
   }

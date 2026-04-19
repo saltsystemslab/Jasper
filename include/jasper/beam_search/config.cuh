@@ -36,9 +36,14 @@ struct beam_search_params {
   // Graph
   typename Cfg::graph_t       graph;
 
-  // Vectors
-  typename Cfg::vector_view_t data_vectors;
+  // Query vectors
+  // if use_range, the query vector will be selected from the graph [start, end).
+  // otherwise use query_vectors.
   typename Cfg::vector_view_t query_vectors;
+
+  bool use_range = false;
+  typename Cfg::index_t query_start;
+  typename Cfg::index_t query_end;
 
   // Search settings
   typename Cfg::index_t       medoid;
