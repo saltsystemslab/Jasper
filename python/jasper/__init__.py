@@ -256,7 +256,6 @@ class Graph:
         queries: torch.Tensor,
         k: int = 10,
         beam_width: int = 64,
-        limit: int = 512,
         print_throughput: bool = False
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
@@ -266,8 +265,6 @@ class Graph:
             queries:    CUDA tensor of shape [n_queries, dim].
             k:          Number of nearest neighbors to return.
             beam_width: Search beam width.
-            limit:      Max iterations per query.
-
         Returns:
             indices:   int32  tensor [n_queries, k]
             distances: float32 tensor [n_queries, k]
@@ -296,6 +293,9 @@ class Graph:
         out_distances = torch.empty(
             n_queries, k, dtype=torch.float32, device=queries.device
         )
+
+        # limit is automaticall set to 2x the beam_width
+        limit = beam_width * 2
         
         self._search_fn(
             self._handle, queries, out_indices, out_distances,

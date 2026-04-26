@@ -26,7 +26,6 @@ def parse_args():
     p.add_argument("-k", type=int, default=1, help="Top-k results (default: 1)")
     p.add_argument("--beam-widths", type=int, nargs="+", default=[1, 2, 4, 8, 16, 32, 64, 128, 256],
                     help="Beam widths to sweep (default: 1 2 4 8 16 32 64 128 256)")
-    p.add_argument("--limit", type=int, default=128, help="Base search limit (default: 128)")
 
     return p.parse_args()
 
@@ -47,12 +46,11 @@ def main():
     gt_indices, _ = jasper.read_groundtruth(args.groundtruth, args.k)
 
     # warmup
-    g.search(queries, k=args.k, beam_width=max(args.beam_widths), limit=args.limit, print_throughput=False)
+    g.search(queries, k=args.k, beam_width=max(args.beam_widths), print_throughput=False)
 
     # sweep beam widths
     for bw in args.beam_widths:
-        limit = max(args.limit, 2 * bw)
-        indices, _ = g.search(queries, k=args.k, beam_width=bw, limit=limit, print_throughput=True)
+        indices, _ = g.search(queries, k=args.k, beam_width=bw, print_throughput=True)
         jasper.get_recall(gt_indices, indices, args.k, len(queries))
 
     g.free()

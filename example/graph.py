@@ -26,7 +26,6 @@ def parse_args():
     p.add_argument("-k", type=int, default=1, help="Top-k results (default: 1)")
     p.add_argument("--beam-widths", type=int, nargs="+", default=[1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 768],
                     help="Beam widths to sweep (default: 1 2 4 8 16 32 64 128 256)")
-    p.add_argument("--limit", type=int, default=128, help="Base search limit (default: 128)")
 
     return p.parse_args()
 
@@ -58,13 +57,13 @@ def main():
         print(f"Storing graph to {args.out_index}")
         
     # warmup
-    g.search(queries, k=args.k, beam_width=max(args.beam_widths), limit=args.limit, print_throughput=True)
+    g.search(queries, k=args.k, beam_width=max(args.beam_widths), print_throughput=True)
     time.sleep(1)
 
     # sweep beam widths
     for bw in args.beam_widths:
         limit = max(args.limit, 2 * bw)
-        indices, distances = g.search(queries, k=args.k, beam_width=bw, limit=limit, print_throughput=True)
+        indices, distances = g.search(queries, k=args.k, beam_width=bw,  print_throughput=True)
         jasper.get_recall(gt_indices, indices, args.k, len(queries))
 
     g.free()
