@@ -414,18 +414,17 @@ __host__ graph<graph_cfg> load_graph_from_file(std::string input_fname,
   std::cout << "dim: "             << dim << "\n";
 
   uint32_t padded_dim = vector_view<data_t>::pad(dim);
-  uint32_t n_segments  = static_cast<uint32_t>((big_n_vectors + vector_per_segment - 1) / vector_per_segment);
+  uint32_t n_segments = static_cast<uint32_t>((big_n_vectors + vector_per_segment - 1) / vector_per_segment);
 
-  // Allocate pinned host memory (padded layout for vectors)
+  // Pinned host staging buffers (always pinned, regardless of on_host, for fast file I/O)
   uint8_t*     h_edge_counts;
   edge_list_t* h_edges;
   data_t*      h_vectors;
 
-  // Read graph into main memory
   cudaMallocHost(&h_edge_counts, sizeof(uint8_t)     * big_n_vectors);
-  cudaMallocHost(&h_edges,       sizeof(edge_list_t)  * big_n_vectors);
-  cudaMallocHost(&h_vectors,     sizeof(data_t)       * big_n_vectors * padded_dim);
-  memset(h_vectors, 0,           sizeof(data_t)       * big_n_vectors * padded_dim);
+  cudaMallocHost(&h_edges,       sizeof(edge_list_t) * big_n_vectors);
+  cudaMallocHost(&h_vectors,     sizeof(data_t)      * big_n_vectors * padded_dim);
+  memset(h_vectors, 0,           sizeof(data_t)      * big_n_vectors * padded_dim);
 
   for (uint64_t i = 0; i < big_n_vectors; i++) {
     inputFile.read(reinterpret_cast<char*>(&h_vectors[i * padded_dim]),
@@ -437,7 +436,10 @@ __host__ graph<graph_cfg> load_graph_from_file(std::string input_fname,
   }
   inputFile.close();
 
-  // partition and load the data into n segments
+  // Source is pinned host; destination depends on where the segment lives.
+  const cudaMemcpyKind copy_kind =
+      on_host ? cudaMemcpyHostToHost : cudaMemcpyHostToDevice;
+
   cudaStream_t stream;
   cudaStreamCreate(&stream);
 
@@ -451,28 +453,35 @@ __host__ graph<graph_cfg> load_graph_from_file(std::string input_fname,
     segment_t& seg = h_segments[s];
     seg.n_vectors = static_cast<index_t>(seg_count);
 
-    // Allocate per-segment device buffers
-    cudaMalloc(&seg.edges,       vector_per_segment * sizeof(edge_list_t));
-    cudaMalloc(&seg.edge_counts, vector_per_segment * sizeof(uint8_t));
-    cudaMemsetAsync(seg.edge_counts, 0, vector_per_segment * sizeof(uint8_t), stream);
+    // Allocate edges / edge_counts on host or device to match on_host
+    if (on_host) {
+      cudaMallocHost(&seg.edges,       vector_per_segment * sizeof(edge_list_t));
+      cudaMallocHost(&seg.edge_counts, vector_per_segment * sizeof(uint8_t));
+      std::memset(seg.edge_counts, 0,  vector_per_segment * sizeof(uint8_t));
+    } else {
+      cudaMalloc(&seg.edges,       vector_per_segment * sizeof(edge_list_t));
+      cudaMalloc(&seg.edge_counts, vector_per_segment * sizeof(uint8_t));
+      cudaMemsetAsync(seg.edge_counts, 0,
+                      vector_per_segment * sizeof(uint8_t), stream);
+    }
 
-    seg.vectors = vector_view_t::allocate(dim, vector_per_segment, /*on_device=*/true);
+    seg.vectors = vector_view_t::allocate(dim, vector_per_segment, on_host);
 
-    // Copy this segment's slice
+    // Copy this segment's slice (kind picked above)
     cudaMemcpyAsync(seg.edge_counts,
                     &h_edge_counts[seg_begin],
                     seg_count * sizeof(uint8_t),
-                    cudaMemcpyHostToDevice, stream);
+                    copy_kind, stream);
 
     cudaMemcpyAsync(seg.edges,
                     &h_edges[seg_begin],
                     seg_count * sizeof(edge_list_t),
-                    cudaMemcpyHostToDevice, stream);
+                    copy_kind, stream);
 
     cudaMemcpyAsync(seg.vectors.data,
                     &h_vectors[seg_begin * padded_dim],
                     seg_count * padded_dim * sizeof(data_t),
-                    cudaMemcpyHostToDevice, stream);
+                    copy_kind, stream);
   }
 
   cudaStreamSynchronize(stream);
@@ -489,6 +498,7 @@ __host__ graph<graph_cfg> load_graph_from_file(std::string input_fname,
   g.n_segments = n_segments;
   g.medoid     = static_cast<index_t>(medoid_as_uint64);
   g.segments   = thrust::device_vector<segment_t>(h_segments.begin(), h_segments.end());
+  g.on_host    = on_host;
 
   cudaDeviceSynchronize();
   return g;
@@ -496,8 +506,7 @@ __host__ graph<graph_cfg> load_graph_from_file(std::string input_fname,
 
 template <typename graph_cfg>
 __host__ void save_graph_to_file(const graph<graph_cfg>& g,
-                                 std::string output_fname,
-                                 bool on_host = false) {
+                                 std::string output_fname) {
   using data_t         = typename graph_cfg::data_t;
   using edge_list_t    = typename graph_cfg::edge_list_t;
   using segment_t      = graph_segment<graph_cfg>;
@@ -525,44 +534,62 @@ __host__ void save_graph_to_file(const graph<graph_cfg>& g,
   outFile.write(reinterpret_cast<const char*>(&medoid_as_uint64), sizeof(uint64_t));
   outFile.write(reinterpret_cast<const char*>(&bytes_per_node),   sizeof(uint64_t));
 
-  // copy all segments back to host
+  // Copy segment structs (pointers + n_vectors) back to host
   std::vector<segment_t> h_segments(g.segments.begin(), g.segments.end());
 
-  // copy one segment at a time
-  uint8_t*     h_edge_counts;
-  edge_list_t* h_edges;
-  data_t*      h_vectors;
+  if (g.on_host) {
+    // Buffers already on host — write straight from the segment pointers.
+    for (uint32_t s = 0; s < g.n_segments; s++) {
+      const segment_t& seg = h_segments[s];
+      uint32_t seg_count   = static_cast<uint32_t>(seg.n_vectors);
 
-  cudaMallocHost(&h_edge_counts, sizeof(uint8_t)    * vectors_per_segment);
-  cudaMallocHost(&h_edges,       sizeof(edge_list_t) * vectors_per_segment);
-  cudaMallocHost(&h_vectors,     sizeof(data_t)      * vectors_per_segment * padded_dim);
-
-  for (uint32_t s = 0; s < g.n_segments; s++) {
-    const segment_t& seg = h_segments[s];
-    uint32_t seg_count   = static_cast<uint32_t>(seg.n_vectors);
-
-    cudaMemcpy(h_edge_counts, seg.edge_counts,
-               seg_count * sizeof(uint8_t),    cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_edges,       seg.edges,
-               seg_count * sizeof(edge_list_t), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_vectors,     seg.vectors.data,
-               seg_count * padded_dim * sizeof(data_t), cudaMemcpyDeviceToHost);
-    cudaDeviceSynchronize();
-
-    for (uint32_t i = 0; i < seg_count; i++) {
-      outFile.write(reinterpret_cast<const char*>(&h_vectors[i * padded_dim]),
-                    sizeof(data_t) * dim);
-      outFile.write(reinterpret_cast<const char*>(&h_edge_counts[i]),
-                    sizeof(uint8_t));
-      outFile.write(reinterpret_cast<const char*>(&h_edges[i]),
-                    sizeof(edge_list_t));
+      for (uint32_t i = 0; i < seg_count; i++) {
+        outFile.write(reinterpret_cast<const char*>(seg.vectors.data + i * padded_dim),
+                      sizeof(data_t) * dim);
+        outFile.write(reinterpret_cast<const char*>(&seg.edge_counts[i]),
+                      sizeof(uint8_t));
+        outFile.write(reinterpret_cast<const char*>(&seg.edges[i]),
+                      sizeof(edge_list_t));
+      }
     }
+  } else {
+    // Buffers on device — stage one segment at a time through pinned host memory.
+    uint8_t*     h_edge_counts;
+    edge_list_t* h_edges;
+    data_t*      h_vectors;
+
+    cudaMallocHost(&h_edge_counts, sizeof(uint8_t)     * vectors_per_segment);
+    cudaMallocHost(&h_edges,       sizeof(edge_list_t) * vectors_per_segment);
+    cudaMallocHost(&h_vectors,     sizeof(data_t)      * vectors_per_segment * padded_dim);
+
+    for (uint32_t s = 0; s < g.n_segments; s++) {
+      const segment_t& seg = h_segments[s];
+      uint32_t seg_count   = static_cast<uint32_t>(seg.n_vectors);
+
+      cudaMemcpy(h_edge_counts, seg.edge_counts,
+                 seg_count * sizeof(uint8_t),     cudaMemcpyDeviceToHost);
+      cudaMemcpy(h_edges,       seg.edges,
+                 seg_count * sizeof(edge_list_t), cudaMemcpyDeviceToHost);
+      cudaMemcpy(h_vectors,     seg.vectors.data,
+                 seg_count * padded_dim * sizeof(data_t), cudaMemcpyDeviceToHost);
+      cudaDeviceSynchronize();
+
+      for (uint32_t i = 0; i < seg_count; i++) {
+        outFile.write(reinterpret_cast<const char*>(&h_vectors[i * padded_dim]),
+                      sizeof(data_t) * dim);
+        outFile.write(reinterpret_cast<const char*>(&h_edge_counts[i]),
+                      sizeof(uint8_t));
+        outFile.write(reinterpret_cast<const char*>(&h_edges[i]),
+                      sizeof(edge_list_t));
+      }
+    }
+
+    cudaFreeHost(h_edge_counts);
+    cudaFreeHost(h_edges);
+    cudaFreeHost(h_vectors);
   }
 
   outFile.close();
-  cudaFreeHost(h_edge_counts);
-  cudaFreeHost(h_edges);
-  cudaFreeHost(h_vectors);
 
   std::cout << "Saved graph to " << output_fname << "\n"
             << "  n_vectors       : " << big_n_vectors   << "\n"

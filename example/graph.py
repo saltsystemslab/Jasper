@@ -57,6 +57,7 @@ def main():
 
     if args.out_index != "":
         print(f"Storing graph to {args.out_index}")
+        g.save(args.out_index)
         
     # warmup
     g.search(queries, k=args.k, beam_width=max(args.beam_widths), print_throughput=True)
