@@ -186,16 +186,18 @@ class Graph:
         distance: DistanceFunc | str = DistanceFunc.L2,
         alpha: float = 1.2,
         workspace_budget: str = "10GB",
+        on_host: bool = False
     ) -> "Graph":
         """
         Construct a graph index from vectors on GPU.
 
         Args:
-            vectors:        CUDA tensor of shape [n_vectors, dim].
-            n_neighbors:    Max neighbors per node (R).
-            distance:       Distance function: "l2" or "ip".
-            alpha:          Pruning factor (1.0 = strict, >1.0 = long hops).
-            max_batch_size: Max vectors processed per batch during construction.
+            vectors:          CUDA tensor of shape [n_vectors, dim].
+            n_neighbors:      Max neighbors per node (R).
+            distance:         Distance function: "l2" or "ip".
+            alpha:            Pruning factor (1.0 = strict, >1.0 = long hops).
+            workspace_budget: GPU memory budget (default to 10GB).
+            on_host:          Construct the graph on host memory.
 
         Returns:
             A Graph ready for search.
@@ -205,8 +207,8 @@ class Graph:
 
         workspace_budget_bytes = parse_storage_size(workspace_budget)
 
-        if not vectors.is_cuda:
-            raise ValueError("vectors must be a CUDA tensor")
+        # if not vectors.is_cuda:
+        #     raise ValueError("vectors must be a CUDA tensor")
         if vectors.ndim != 2:
             raise ValueError(f"vectors must be 2D, got {vectors.ndim}D")
 
@@ -226,7 +228,7 @@ class Graph:
 
         config_id = _resolve_config(data_type, n_neighbors, distance)
         _, construct_fn, _, _, _ = _get_fns(config_id)
-        handle = construct_fn(vectors, dim, alpha, workspace_budget_bytes)
+        handle = construct_fn(vectors, dim, alpha, workspace_budget_bytes, on_host)
 
         return cls(handle, config_id, data_type, distance, n_neighbors, dim)
 
@@ -357,7 +359,9 @@ def read_bin(path: str, dtype: str = "f32", max_vectors: int = 0) -> torch.Tenso
         nbytes = n_vectors * dim * np.dtype(np_dtype).itemsize
         data = np.frombuffer(f.read(nbytes), dtype=np_dtype).reshape(n_vectors, dim).copy()
 
-    return torch.from_numpy(data).to(device="cuda", dtype=torch_dtype)
+    # the returned data is on page-locked host memory.
+    # return torch.from_numpy(data).to(device="cuda", dtype=torch_dtype)
+    return torch.from_numpy(data).pin_memory()
 
 def read_groundtruth(path: str, k: int = 10) -> tuple[torch.Tensor, torch.Tensor]:
     """

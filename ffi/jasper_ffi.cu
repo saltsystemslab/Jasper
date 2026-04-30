@@ -92,12 +92,13 @@ void SaveGraph_##id(int64_t handle, ffi::String path) {                        \
 int64_t ConstructGraph_##id(ffi::TensorView vectors,                           \
                             int64_t dim,                                       \
                             double alpha,                                      \
-                            int64_t workspace_budget_bytes) {                  \
+                            int64_t workspace_budget_bytes,                    \
+                            bool on_host) {                                    \
   uint32_t n_vectors = static_cast<uint32_t>(vectors.size(0));                 \
   uint32_t d = static_cast<uint32_t>(dim);                                     \
                                                                                \
   jasper::vector_view<DAT> vecs(                                               \
-      static_cast<DAT*>(vectors.data_ptr()), d, n_vectors);                    \
+      static_cast<DAT*>(vectors.data_ptr()), d, n_vectors, false);             \
                                                                                \
   jasper::graph_construct_params<construct_cfg_##id> params;                   \
   jasper::graph_construct_workspace<construct_cfg_##id> ws;                    \
@@ -109,7 +110,7 @@ int64_t ConstructGraph_##id(ffi::TensorView vectors,                           \
   params.data_vectors   = vecs;                                                \
   params.alpha          = static_cast<float>(alpha);                           \
   params.max_batch_size = max_batch_size;                                      \
-  params.on_host        = false;                                               \
+  params.on_host        = on_host;                                             \
                                                                                \
   auto g = jasper::construct_graph<construct_cfg_##id>(params);                \
                                                                                \
@@ -168,7 +169,7 @@ void Search_##id(int64_t handle,                                               \
   uint32_t dim_ = g.dim;                                                       \
                                                                                \
   jasper::vector_view<DAT> d_queries(                                          \
-      static_cast<DAT*>(queries.data_ptr()), dim_, n_queries);                 \
+      static_cast<DAT*>(queries.data_ptr()), dim_, n_queries, false);          \
                                                                                \
   jasper::search_params params{                                                \
       .k          = static_cast<uint32_t>(k),                                  \
