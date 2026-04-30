@@ -1,11 +1,5 @@
-# g = jasper.Graph(
-#   "/projects/SaltSystemsLab/ann_index/deep10M.index", 
-#   dim=96, n_neighbors=64, data_type="f32", distance="l2")
-
 import argparse
-import torch
 import jasper
-import time
 
 
 def parse_args():
