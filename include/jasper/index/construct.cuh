@@ -72,7 +72,7 @@ struct graph_construct_params {
   // 2. batch size needs to be fit inside device memory.
   uint32_t max_batch_size = 10000;
 
-  // Is the construction on host
+  // Is the final graph on host
   bool on_host = false;
 };
 
@@ -951,10 +951,6 @@ __host__ graph<typename CONSTRUCT_GRAPH_CONFIG::graph_cfg_t> construct_graph(
   uint32_t vector_dim = params.data_vectors.dim;
   uint32_t n_vectors = params.data_vectors.n_vectors;
 
-  if (params.on_host) {
-    throw std::runtime_error("on_host index construction is not supported.");
-  }
-
   auto check_cuda = [](cudaError_t err, const char* name) {
     if (err != cudaSuccess) {
       const char* err_str = cudaGetErrorString(err);
@@ -965,7 +961,7 @@ __host__ graph<typename CONSTRUCT_GRAPH_CONFIG::graph_cfg_t> construct_graph(
   };
 
   // allocate a graph with only vector populated.
-  graph_t g = graph_t::allocate_and_load(params.data_vectors);
+  graph_t g = graph_t::allocate_and_load(params.data_vectors, params.on_host);
 
   // workspace
   auto ws = graph_construct_workspace<CONSTRUCT_GRAPH_CONFIG>::allocate(params.max_batch_size);

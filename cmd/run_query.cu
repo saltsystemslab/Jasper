@@ -136,7 +136,7 @@ void run_search_round(jasper::graph<GraphCfg>& graph,
                       const GroundTruth* gt,
                       bool print_throughput) {
 
-  jasper::vector_view<DataT> query_view(d_queries, dim, n_queries);
+  jasper::vector_view<DataT> query_view(d_queries, dim, n_queries, false);
 
   jasper::search_params params{
     .k          = k,

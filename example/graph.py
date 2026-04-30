@@ -18,6 +18,7 @@ def parse_args():
     p.add_argument("--distance", default="l2", choices=["l2", "ip"], help="Distance metric (default: l2)")
     p.add_argument("--alpha", type=float, default=1.2, help="Pruning alpha (default: 1.2)")
     p.add_argument("--workspace-budget", default="10GB", help="Workspace memory budget (default: 10GB)")
+    p.add_argument("--on_host", action="store_true", help="Construct the graph on host memory")
 
     # store graph?
     p.add_argument("--out_index", default="", help="Output index path")
@@ -45,12 +46,13 @@ def main():
         distance=args.distance,
         alpha=args.alpha,
         workspace_budget=args.workspace_budget,
+        on_host=args.on_host,
     )
     elapsed = time.perf_counter() - start
     print(g)
     print(f"Graph construction complete, time: {elapsed:.4f} seconds.")
 
-    queries = jasper.read_bin(args.queries, args.dtype)
+    queries = jasper.read_bin(args.queries, args.dtype).to(device="cuda")
     gt_indices, gt_distances = jasper.read_groundtruth(args.groundtruth, args.k)
 
     if args.out_index != "":
@@ -62,7 +64,6 @@ def main():
 
     # sweep beam widths
     for bw in args.beam_widths:
-        limit = max(args.limit, 2 * bw)
         indices, distances = g.search(queries, k=args.k, beam_width=bw,  print_throughput=True)
         jasper.get_recall(gt_indices, indices, args.k, len(queries))
 

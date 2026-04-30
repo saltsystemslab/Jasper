@@ -373,7 +373,7 @@ __host__ rabitq_data_store<float> rabitq_quantize(
       original_vectors.data, d_float, dim, n_vectors);
   cudaDeviceSynchronize();
 
-  vector_view<float> float_view(d_float, dim, n_vectors);
+  vector_view<float> float_view(d_float, dim, n_vectors, false /*on_host*/);
   auto result = rabitq_quantize<SIZE_PER_DIM>(
       float_view, d_rotation_matrix, d_centroid, metric_type);
 

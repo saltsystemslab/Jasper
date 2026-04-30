@@ -59,7 +59,7 @@ void construct_and_save(const std::string& filename,
   cudaMemcpy(d_data, h_data, data_bytes, cudaMemcpyHostToDevice);
   delete[] h_data;
 
-  jasper::vector_view<DataT> vecs(d_data, dim, n_vectors);
+  jasper::vector_view<DataT> vecs(d_data, dim, n_vectors, false /*on_host*/);
 
   // Set up construction params
   jasper::graph_construct_params<ConstructCfg> params;

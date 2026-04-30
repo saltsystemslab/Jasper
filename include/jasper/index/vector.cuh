@@ -10,6 +10,7 @@ struct __align__(16) vector_view {
   uint32_t dim;
   uint32_t padded_dim;     // padded dim, guarantees 16-byte aligned rows
   uint32_t n_vectors;
+  bool on_host=false;
 
   static constexpr uint32_t alignment = 16 / sizeof(DATA_T);
 
@@ -17,38 +18,39 @@ struct __align__(16) vector_view {
     return (d + alignment - 1) / alignment * alignment;
   }
 
-  __host__ __device__ vector_view() : data(nullptr), dim(0), padded_dim(0), n_vectors(0) {}
+  __host__ __device__ vector_view() : data(nullptr), dim(0), padded_dim(0), n_vectors(0), on_host(false) {}
 
-  __host__ __device__ vector_view(DATA_T* data, uint32_t dim, uint32_t n_vectors)
-      : data(data), dim(dim), padded_dim(pad(dim)), n_vectors(n_vectors) {}
+  __host__ __device__ vector_view(DATA_T* data, uint32_t dim, uint32_t n_vectors, bool on_host)
+      : data(data), dim(dim), padded_dim(pad(dim)), n_vectors(n_vectors), on_host(on_host) {}
 
   // allocating an empty vector view with dim + n_vectors
-  static vector_view allocate(uint32_t dim, uint32_t n_vectors, bool on_device=true){
+  static vector_view allocate(uint32_t dim, uint32_t n_vectors, bool on_host=false){
     vector_view view;
     view.dim = dim;
     view.padded_dim = pad(dim);
     view.n_vectors = n_vectors;
+    view.on_host = on_host;
     size_t bytes = view.size_bytes();
-    if (on_device) {
-      cudaMalloc(&view.data, bytes);
-    } else {
+    if (on_host) {
       cudaMallocHost(&view.data, bytes);
+    } else {
+      cudaMalloc(&view.data, bytes);
     }
     return view;
   }
 
   // deallocate
-  void deallocate(bool on_device=true) {
-    if (on_device) {
-      cudaFree(data);
-    } else {
+  void deallocate() {
+    if (on_host) {
       cudaFreeHost(data);
+    } else {
+      cudaFree(data);
     }
   }
 
   // Private ctor that preserves an existing padded_dim (used by subview)
-  __host__ __device__ vector_view(DATA_T* data, uint32_t dim, uint32_t padded_dim, uint32_t n_vectors)
-      : data(data), dim(dim), padded_dim(padded_dim), n_vectors(n_vectors) {}
+  __host__ __device__ vector_view(DATA_T* data, uint32_t dim, uint32_t padded_dim, uint32_t n_vectors, bool on_host)
+      : data(data), dim(dim), padded_dim(padded_dim), n_vectors(n_vectors), on_host(on_host) {}
 
   __host__ size_t size_bytes() const {
     return sizeof(DATA_T) * static_cast<size_t>(n_vectors) * padded_dim;
@@ -83,7 +85,7 @@ struct __align__(16) vector_view {
         std::string("vector_view::to_device cudaMemcpy failed: ") + err_str);
     }
 
-    return {d_data, dim, padded_dim, n_vectors};
+    return {d_data, dim, padded_dim, n_vectors, false};
   }
 
   // Copy this view's data to pinned host memory, return a new view.
@@ -92,7 +94,7 @@ struct __align__(16) vector_view {
     DATA_T* h_data = nullptr;
     cudaMallocHost(&h_data, size_bytes());
     cudaMemcpy(h_data, data, size_bytes(), cudaMemcpyDeviceToHost);
-    return {h_data, dim, padded_dim, n_vectors};
+    return {h_data, dim, padded_dim, n_vectors, true};
   }
 
   // Access vector i as a pointer: &data[i * padded_dim]
@@ -108,7 +110,7 @@ struct __align__(16) vector_view {
   // Starts at vector index `offset`, spanning `count` vectors.
   __host__ __device__ vector_view<DATA_T> subview(uint32_t offset, uint32_t count) const {
     assert(offset + count <= n_vectors);
-    return {data + static_cast<size_t>(offset) * padded_dim, dim, padded_dim, count};
+    return {data + static_cast<size_t>(offset) * padded_dim, dim, padded_dim, count, on_host};
   }
 };
 
@@ -119,7 +121,7 @@ __host__ vector_view<DATA_T> load_vectors_from_file(std::string filename) {
   std::ifstream file(filename, std::ios::in | std::ios::binary);
   if (!file.is_open()) {
     std::cerr << "Error opening file: " << filename << std::endl;
-    return {nullptr, 0, 0};
+    return {nullptr, 0, 0, false};
   }
 
   file.seekg(0, std::ios::end);
@@ -142,7 +144,7 @@ __host__ vector_view<DATA_T> load_vectors_from_file(std::string filename) {
   if (expected != data_size) {
     std::cerr << "Size mismatch: expected " << expected
               << " bytes but file has " << data_size << " bytes\n";
-    return {nullptr, 0, 0};
+    return {nullptr, 0, 0, false};
   }
 
   uint32_t dim = static_cast<uint32_t>(n_dimensions);
@@ -159,7 +161,7 @@ __host__ vector_view<DATA_T> load_vectors_from_file(std::string filename) {
     if (!file.read(reinterpret_cast<char*>(host_data), data_size)) {
       std::cerr << "Error reading file\n";
       cudaFreeHost(host_data);
-      return {nullptr, 0, 0};
+      return {nullptr, 0, 0, false};
     }
   } else {
     // Read each vector into its padded row
@@ -168,7 +170,7 @@ __host__ vector_view<DATA_T> load_vectors_from_file(std::string filename) {
       if (!file.read(reinterpret_cast<char*>(host_data + static_cast<size_t>(i) * padded_dim), row_bytes)) {
         std::cerr << "Error reading vector " << i << "\n";
         cudaFreeHost(host_data);
-        return {nullptr, 0, 0};
+        return {nullptr, 0, 0, false};
       }
     }
   }
@@ -178,7 +180,7 @@ __host__ vector_view<DATA_T> load_vectors_from_file(std::string filename) {
             << ", padded_dim=" << padded_dim
             << ") from " << filename << "\n";
 
-  return {host_data, dim, n_data_points};
+  return {host_data, dim, n_data_points, true};
 }
 
 }

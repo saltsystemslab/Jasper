@@ -62,22 +62,37 @@ struct graph_segment {
   uint8_t *edge_counts;
   vector_view_t vectors;
 
-  static graph_segment allocate(uint32_t dim) {
+  // if on_host is true, the data is allocated on cpu pinned memory
+  bool on_host = false;
+
+  static graph_segment allocate(uint32_t dim, bool on_host=false) {
     graph_segment seg{};
     seg.n_vectors = 0;
+    seg.on_host = on_host;
 
-    cudaMalloc(&seg.edges, max_vectors * sizeof(edge_list_t));
-    cudaMalloc(&seg.edge_counts, max_vectors * sizeof(uint8_t));
-    cudaMemset(seg.edge_counts, 0, max_vectors * sizeof(uint8_t));
+    if (on_host) {
+        cudaMallocHost(&seg.edges, max_vectors * sizeof(edge_list_t));
+        cudaMallocHost(&seg.edge_counts, max_vectors * sizeof(uint8_t));
+        std::memset(seg.edge_counts, 0, max_vectors * sizeof(uint8_t));
+    } else {
+        cudaMalloc(&seg.edges, max_vectors * sizeof(edge_list_t));
+        cudaMalloc(&seg.edge_counts, max_vectors * sizeof(uint8_t));
+        cudaMemset(seg.edge_counts, 0, max_vectors * sizeof(uint8_t));
+    }
 
-    seg.vectors = vector_view_t::allocate(dim, max_vectors);
+    seg.vectors = vector_view_t::allocate(dim, max_vectors, on_host);
 
     return seg;
   }
 
   void deallocate() {
-    cudaFree(edges);
-    cudaFree(edge_counts);
+    if (on_host) {
+        cudaFreeHost(edges);
+        cudaFreeHost(edge_counts);
+    } else {
+        cudaFree(edges);
+        cudaFree(edge_counts);
+    }
     vectors.deallocate();
     edges = nullptr;
     edge_counts = nullptr;
@@ -157,36 +172,45 @@ struct graph {
   index_t n_vectors;
   uint32_t n_segments;
   index_t medoid;
+  bool on_host;
 
   thrust::device_vector<segment_t> segments;
 
-  static graph allocate(uint32_t dim, index_t n_vector_slots) {
+  static graph allocate(uint32_t dim, index_t n_vector_slots, bool on_host) {
     graph g{};
     g.dim = dim;
     g.n_vectors = 0;
     g.medoid = 0;
     g.n_segments = (n_vector_slots+vectors_per_segment-1)/vectors_per_segment;
+    g.on_host = on_host;
 
     std::vector<segment_t> h_segments(g.n_segments);
     for (uint32_t i = 0; i < g.n_segments; i++) {
-      h_segments[i] = segment_t::allocate(dim);
+      h_segments[i] = segment_t::allocate(dim, on_host);
     }
     g.segments = thrust::device_vector<segment_t>(h_segments.begin(), h_segments.end());
 
     return g;
   }
 
-  static graph allocate_and_load(vector_view_t data) {
+  static graph allocate_and_load(vector_view_t data, bool on_host) {
     uint32_t dim       = data.dim;
     uint32_t padded_dim = vector_view_t::pad(dim);
     index_t  n_vectors = static_cast<index_t>(data.n_vectors);
 
     // Allocate the graph with enough segment slots for all vectors
-    graph g = allocate(dim, n_vectors);
+    graph g = allocate(dim, n_vectors, on_host);
     g.n_vectors = n_vectors;
 
     // Copy segments back to host so we can set per-segment metadata and issue memcpys
     std::vector<segment_t> h_segments(g.segments.begin(), g.segments.end());
+
+    const cudaMemcpyKind copy_kind = [&]{
+      if (data.on_host && on_host)   return cudaMemcpyHostToHost;
+      if (data.on_host && !on_host)  return cudaMemcpyHostToDevice;
+      if (!data.on_host && on_host)  return cudaMemcpyDeviceToHost;
+      return cudaMemcpyDeviceToDevice;
+    }();
 
     cudaStream_t stream;
     cudaStreamCreate(&stream);
@@ -202,8 +226,8 @@ struct graph {
       // Copy vector data for this segment (edge counts are already zeroed by allocate)
       cudaMemcpyAsync(h_segments[s].vectors.data,
                       data.data + seg_begin * padded_dim,
-                      seg_count * padded_dim * sizeof(data_t),
-                      cudaMemcpyDeviceToDevice, stream);
+                      static_cast<size_t>(seg_count) * padded_dim * sizeof(data_t),
+                      copy_kind, stream);
     }
 
     cudaStreamSynchronize(stream);
