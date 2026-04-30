@@ -67,11 +67,11 @@ __global__ void unpack_results_kernel(
 
 // ── Per-config load/search/construct implementations ───────────
 
-#define DEFINE_OPS(id, IDX, R, DAT, DIST, FUNC)                               \
+#define DEFINE_OPS(id, IDX, R, DAT, DIST, FUNC)                                \
                                                                                \
-int64_t LoadGraph_##id(ffi::String path, int64_t dim) {                        \
+int64_t LoadGraph_##id(ffi::String path, int64_t dim, bool on_host) {          \
   auto g = jasper::load_graph_from_file<cfg_##id>(                             \
-      std::string(path), static_cast<uint32_t>(dim));                          \
+      std::string(path), static_cast<uint32_t>(dim), on_host);                 \
   std::lock_guard<std::mutex> lock(g_mutex);                                   \
   int64_t handle = g_next_handle++;                                            \
   g_graphs[handle] = std::move(g);                                             \
@@ -86,7 +86,7 @@ void SaveGraph_##id(int64_t handle, ffi::String path) {                        \
     TVM_FFI_ICHECK(it != g_graphs.end()) << "Invalid handle: " << handle;      \
     gp = &std::get<jasper::graph<cfg_##id>>(it->second);                       \
   }                                                                            \
-  jasper::save_graph_to_file<cfg_##id>(*gp, std::string(path), /*on_host=*/false); \
+  jasper::save_graph_to_file<cfg_##id>(*gp, std::string(path));                \
 }                                                                              \
                                                                                \
 int64_t ConstructGraph_##id(ffi::TensorView vectors,                           \

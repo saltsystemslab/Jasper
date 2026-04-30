@@ -142,6 +142,7 @@ class Graph:
         n_neighbors: int = 32,
         data_type: DataType | str = DataType.FLOAT32,
         distance: DistanceFunc | str = DistanceFunc.L2,
+        on_host: bool = False,
     ) -> "Graph":
         """
         Load a graph from a binary file into GPU memory.
@@ -152,6 +153,7 @@ class Graph:
             n_neighbors:  Max neighbors per node (must match file).
             data_type:    Vector data type: "f32" or "u8".
             distance:     Distance function: "l2" or "ip".
+            on_host:      Load the graph on host memory.
         """
         if isinstance(data_type, str):
             data_type = DataType(data_type)
@@ -160,7 +162,7 @@ class Graph:
 
         config_id = _resolve_config(data_type, n_neighbors, distance)
         load_fn, _, _, _, _ = _get_fns(config_id)
-        handle = load_fn(path, dim)
+        handle = load_fn(path, dim, on_host)
 
         return cls(handle, config_id, data_type, distance, n_neighbors, dim)
     
