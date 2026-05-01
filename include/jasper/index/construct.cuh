@@ -848,25 +848,6 @@ __host__ void process_batch(
     num_unique_sources
   );
 
-  // std::cout << "batch_size=" << static_cast<uint32_t>(batch_size) 
-  //   << " n_reverse_edges="<< static_cast<uint32_t>(n_edges) 
-  //   << " num_unique_sources=" << static_cast<uint32_t>(num_unique_sources) 
-  //   << std::endl;
-
-  // std::cout << "reverse_edges=[";
-  // for (uint i=0; i<20 && i < n_edges; i++) {
-  //   edge_pair<index_t> n = ws.reverse_edges[i];
-  //   std::cout << "(" << n.source << "," << n.sink << "), ";
-  // }
-  // std::cout << "]" << std::endl;
-
-  // std::cout << "reverse_offsets=[";
-  // for (uint i=0; i<20 && i < num_unique_sources; i++) {
-  //   index_t n = ws.reverse_offsets[i];
-  //   std::cout << n << ",";
-  // }
-  // std::cout << "]" << std::endl;
-
   cudaEventRecord(e5);
 
   // add edges + robust prune
@@ -911,7 +892,7 @@ __host__ void construction_round(
   uint32_t count = 0;
   uint32_t batch_size = 1;
 
-  std::printf("[construct] round alpha=%.2f, n_vectors=%u\n", alpha, graph.n_vectors);
+  std::printf("[construct] round alpha=%.2f, n_vectors=%u, max_batch_size=%u\n", alpha, graph.n_vectors, max_batch_size);
 
   while (count < graph.n_vectors) {
     batch_size = std::min(batch_size, graph.n_vectors - count);
@@ -931,7 +912,8 @@ __host__ void construction_round(
     }
   }
 
-  std::printf("\n[construct] round complete\n");
+  std::printf("\n");
+  // std::printf("\n[construct] round complete\n");
 }
 
 template <typename CONSTRUCT_GRAPH_CONFIG>
@@ -965,7 +947,7 @@ __host__ graph<typename CONSTRUCT_GRAPH_CONFIG::graph_cfg_t> construct_graph(
 
   // workspace
   auto ws = graph_construct_workspace<CONSTRUCT_GRAPH_CONFIG>::allocate(params.max_batch_size);
-  ws.print_space_usage();
+  // ws.print_space_usage();
 
   constexpr uint32_t beam_search_tile_size = 4;
   constexpr uint32_t beam_search_block_size = 64;
@@ -989,7 +971,7 @@ __host__ graph<typename CONSTRUCT_GRAPH_CONFIG::graph_cfg_t> construct_graph(
   construction_round<CONSTRUCT_GRAPH_CONFIG, beam_search_cfg>(
     g, ws, alpha, params.max_batch_size, second_round_timer
   );
-  second_round_timer.print();
+  // second_round_timer.print();
 
   ws.free();
   return g;

@@ -133,6 +133,10 @@ __host__ vector_view<DATA_T> load_vectors_from_file(std::string filename) {
   file.read(reinterpret_cast<char*>(&n_data_points), sizeof(int32_t));
   file.read(reinterpret_cast<char*>(&n_dimensions), sizeof(int32_t));
 
+  if (n_dimensions < 0 || n_data_points < 0) {
+    throw std::runtime_error("negative dimension or count read from file");
+  }
+
   std::streamsize data_size = file_size - 2 * sizeof(int32_t);
 
   std::cout << "Read " << data_size << " bytes of data\n";
@@ -180,7 +184,12 @@ __host__ vector_view<DATA_T> load_vectors_from_file(std::string filename) {
             << ", padded_dim=" << padded_dim
             << ") from " << filename << "\n";
 
-  return {host_data, dim, n_data_points, true};
+  return {
+    host_data, 
+    static_cast<uint32_t>(dim), 
+    static_cast<uint32_t>(n_data_points), 
+    true
+  };
 }
 
 }
