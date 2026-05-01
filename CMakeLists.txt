@@ -84,13 +84,24 @@ if(JASPER_BUILD_CMD)
     CUDA_SEPARABLE_COMPILATION ON
   )
 
+  add_executable(create_scale_index cmd/create_scale_index.cu)
+  target_link_libraries(create_scale_index PRIVATE jasper)
+  set_target_properties(create_scale_index PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+  )
+  set_target_properties(create_scale_index PROPERTIES
+    CUDA_ARCHITECTURES "80;86;89;90;120"
+    CUDA_SEPARABLE_COMPILATION ON
+  )
+
   add_executable(run_query cmd/run_query.cu)
   target_link_libraries(run_query PRIVATE jasper)
   set_target_properties(run_query PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
   )
-  set_target_properties(create_index PROPERTIES
+  set_target_properties(run_query PROPERTIES
     CUDA_ARCHITECTURES "80;86;89;90;120"
     CUDA_SEPARABLE_COMPILATION ON
   )

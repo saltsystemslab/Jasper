@@ -99,6 +99,65 @@ struct graph_segment {
     n_vectors = 0;
   }
 
+  // Migrate this segment's storage between host pinned memory and device memory.
+  // No-op if already on the target side.
+  void move_to(bool target_on_host, cudaStream_t stream = 0) {
+    if (on_host == target_on_host) return;
+
+    using data_t = typename graph_cfg::data_t;
+
+    const cudaMemcpyKind copy_kind =
+        on_host ? cudaMemcpyHostToDevice : cudaMemcpyDeviceToHost;
+    const uint32_t padded_dim = vector_view_t::pad(vectors.dim);
+
+    // Allocate new buffers on the target side (same capacity as allocate()).
+    edge_list_t* new_edges       = nullptr;
+    uint8_t*     new_edge_counts = nullptr;
+
+    if (target_on_host) {
+      cudaMallocHost(&new_edges,       max_vectors * sizeof(edge_list_t));
+      cudaMallocHost(&new_edge_counts, max_vectors * sizeof(uint8_t));
+      std::memset(new_edge_counts, 0,  max_vectors * sizeof(uint8_t));
+    } else {
+      cudaMalloc(&new_edges,       max_vectors * sizeof(edge_list_t));
+      cudaMalloc(&new_edge_counts, max_vectors * sizeof(uint8_t));
+      cudaMemsetAsync(new_edge_counts, 0,
+                      max_vectors * sizeof(uint8_t), stream);
+    }
+    vector_view_t new_vectors =
+        vector_view_t::allocate(vectors.dim, max_vectors, target_on_host);
+
+    // Copy only the valid prefix.
+    if (n_vectors > 0) {
+      cudaMemcpyAsync(new_edges, edges,
+                      static_cast<size_t>(n_vectors) * sizeof(edge_list_t),
+                      copy_kind, stream);
+      cudaMemcpyAsync(new_edge_counts, edge_counts,
+                      static_cast<size_t>(n_vectors) * sizeof(uint8_t),
+                      copy_kind, stream);
+      cudaMemcpyAsync(new_vectors.data, vectors.data,
+                      static_cast<size_t>(n_vectors) * padded_dim * sizeof(data_t),
+                      copy_kind, stream);
+    }
+    cudaStreamSynchronize(stream);  // must complete before freeing old buffers
+
+    // Free the old buffers using the *previous* on_host flag.
+    if (on_host) {
+      cudaFreeHost(edges);
+      cudaFreeHost(edge_counts);
+    } else {
+      cudaFree(edges);
+      cudaFree(edge_counts);
+    }
+    vectors.deallocate();
+
+    // Install new buffers.
+    edges       = new_edges;
+    edge_counts = new_edge_counts;
+    vectors     = new_vectors;
+    on_host     = target_on_host;
+  }
+
   // Device side read.
   // Note: not concurrent safe.
   //       our construction algorithm handles accesses externally.
@@ -301,6 +360,28 @@ struct graph {
     return vector_view<data_t>::pad(dim);
   }
 
+  // Migrate the entire graph (all segments + medoid metadata) between
+  // host pinned memory and device memory. No-op if already on the target side.
+  void move_to(bool target_on_host) {
+    if (on_host == target_on_host) return;
+
+    // Pull segment structs back so we can mutate their pointers.
+    std::vector<segment_t> h_segments(segments.begin(), segments.end());
+
+    cudaStream_t stream;
+    cudaStreamCreate(&stream);
+    for (auto& seg : h_segments) {
+      seg.move_to(target_on_host, stream);
+    }
+    cudaStreamDestroy(stream);
+
+    // Re-upload segments with their new pointers.
+    segments = thrust::device_vector<segment_t>(h_segments.begin(), h_segments.end());
+    on_host  = target_on_host;
+
+    cudaDeviceSynchronize();
+  }
+
   struct device_view {
     segment_t *segments;
     uint32_t   dim;
@@ -466,6 +547,7 @@ __host__ graph<graph_cfg> load_graph_from_file(std::string input_fname,
     }
 
     seg.vectors = vector_view_t::allocate(dim, vector_per_segment, on_host);
+    seg.on_host = on_host;
 
     // Copy this segment's slice (kind picked above)
     cudaMemcpyAsync(seg.edge_counts,

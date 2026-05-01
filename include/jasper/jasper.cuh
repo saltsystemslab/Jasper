@@ -9,6 +9,7 @@
 #include "jasper/index/graph.cuh"
 #include "jasper/index/vector.cuh"
 #include "jasper/index/construct.cuh"
+#include "jasper/index/construct_scale.cuh"
 
 #include "jasper/rabitq/distance.cuh"
 #include "jasper/rabitq/layout.cuh"
