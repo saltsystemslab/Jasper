@@ -488,11 +488,10 @@ __host__ uint32_t get_smem_size(const uint32_t beam_width,
 
 template <typename Cfg>
 __host__ beam_search_result<typename Cfg::graph_cfg_t>
-beam_search(const beam_search_params<Cfg>& p) {
+beam_search(const beam_search_params<Cfg>& p, cudaStream_t stream = 0) {
 
   using entry_t = typename Cfg::entry_t;
 
-  uint32_t n_data_vectors = p.graph.n_vectors;
   uint32_t n_query_vectors;
   if (p.use_range) {
     n_query_vectors = p.query_end - p.query_start;
@@ -517,11 +516,6 @@ beam_search(const beam_search_params<Cfg>& p) {
                sizeof(uint32_t) * n_query_vectors);
   }
 
-  cudaError_t err = cudaDeviceSynchronize();
-  if (err != cudaSuccess) {
-    std::cerr << "Beam search malloc memory failed: " << cudaGetErrorString(err) << std::endl;
-  }
-
   auto graph_device_view = p.graph.view();
 
   // Launch
@@ -530,21 +524,21 @@ beam_search(const beam_search_params<Cfg>& p) {
       Cfg::block_size, Cfg::dist_func,
       Cfg::max_search_width, Cfg::get_visited,
       Cfg::tile_size, Cfg::max_result_size>
-    <<<blocks, threads, smem>>>(
+    <<<blocks, threads, smem, stream>>>(
         graph_device_view,
-        result.frontier, 
-        result.visited, 
+        result.frontier,
+        result.visited,
         result.visited_counts,
         p.query_vectors,
         p.use_range,
         p.query_start,
         p.query_end,
-        p.medoid, 
-        p.k, 
-        p.beam_width, 
+        p.medoid,
+        p.k,
+        p.beam_width,
         p.limit);
 
-  err = cudaDeviceSynchronize();
+  cudaError_t err = cudaStreamSynchronize(stream);
   if (err != cudaSuccess) {
     std::cerr << "Beam search kernel launch failed: " << cudaGetErrorString(err) << std::endl;
   }
@@ -556,7 +550,8 @@ beam_search(const beam_search_params<Cfg>& p) {
 template <typename Cfg>
 __host__ void beam_search(
   const beam_search_params<Cfg>& p,
-  beam_search_result<typename Cfg::graph_cfg_t> result // pre-allocated.
+  beam_search_result<typename Cfg::graph_cfg_t> result, // pre-allocated.
+  cudaStream_t stream = 0
 ) {
 
   using entry_t = typename Cfg::entry_t;
@@ -581,21 +576,21 @@ __host__ void beam_search(
       Cfg::block_size, Cfg::dist_func,
       Cfg::max_search_width, Cfg::get_visited,
       Cfg::tile_size, Cfg::max_result_size>
-    <<<blocks, threads, smem>>>(
+    <<<blocks, threads, smem, stream>>>(
         graph_device_view,
-        result.frontier, 
-        result.visited, 
+        result.frontier,
+        result.visited,
         result.visited_counts,
         p.query_vectors,
         p.use_range,
         p.query_start,
         p.query_end,
-        p.medoid, 
-        p.k, 
-        p.beam_width, 
+        p.medoid,
+        p.k,
+        p.beam_width,
         p.limit);
 
-  cudaError_t err = cudaDeviceSynchronize();
+  cudaError_t err = cudaStreamSynchronize(stream);
   if (err != cudaSuccess) {
     std::cerr << "Beam search kernel launch failed: " << cudaGetErrorString(err) << std::endl;
   }

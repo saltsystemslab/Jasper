@@ -4,6 +4,8 @@
 #include <cstdint>
 #include <iostream>
 #include <vector>
+#include <thread>
+#include <exception>
 
 #include "jasper/index/construct.cuh"
 

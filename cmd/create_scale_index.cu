@@ -58,7 +58,7 @@ void construct(
   jasper::graph_construct_params<ConstructCfg> params;
   params.data_vectors   = vecs;
   params.alpha          = alpha;
-  params.max_batch_size = static_cast<uint32_t>(part_size / 50);
+  params.max_batch_size = static_cast<uint32_t>(part_size / 20);
   params.on_host        = false;
 
   auto t0 = std::chrono::steady_clock::now();

@@ -12,6 +12,7 @@
 #include <thrust/binary_search.h>
 #include <thrust/adjacent_difference.h>
 #include <thrust/iterator/counting_iterator.h>
+#include <thrust/execution_policy.h>
 
 #include "jasper/index/graph.cuh"
 #include "jasper/index/vector.cuh"
@@ -504,14 +505,17 @@ void get_unique_source_offsets(
   typename CONSTRUCT_GRAPH_CONFIG::index_t n_reversed_edges,
   thrust::device_vector<typename CONSTRUCT_GRAPH_CONFIG::index_t>& reverse_offsets_flags,
   thrust::device_vector<typename CONSTRUCT_GRAPH_CONFIG::index_t>& reverse_offsets,
-  typename CONSTRUCT_GRAPH_CONFIG::index_t& num_unique_sources
+  typename CONSTRUCT_GRAPH_CONFIG::index_t& num_unique_sources,
+  cudaStream_t stream = 0
 ){
   using index_t = typename CONSTRUCT_GRAPH_CONFIG::index_t;
 
   if (n_reversed_edges == 0) {
-    num_unique_sources = 0; 
+    num_unique_sources = 0;
     return;
   }
+
+  auto policy = thrust::cuda::par.on(stream);
 
   auto src_begin = thrust::make_transform_iterator(
     reversed_edges.begin(), extract_source_from_edge_pair<index_t>());
@@ -520,23 +524,26 @@ void get_unique_source_offsets(
 
   // mark where a new source group begins:
   // flags[i] = 1 if i == 0 or source[i] != source[i-1]
-  thrust::adjacent_difference(src_begin, src_end, reverse_offsets_flags.begin());
+  thrust::adjacent_difference(policy, src_begin, src_end, reverse_offsets_flags.begin());
 
   // adjacent_difference copies the first element as-is; force it to 1
   reverse_offsets_flags[0] = 1;
 
   // For the remaining elements, we just need != 0 → 1
-  thrust::transform(reverse_offsets_flags.begin() + 1, reverse_offsets_flags.end(),
+  thrust::transform(policy,
+                    reverse_offsets_flags.begin() + 1, reverse_offsets_flags.end(),
                     reverse_offsets_flags.begin() + 1,
                     [] __device__ (int v) { return v != 0 ? 1 : 0; });
 
   // count unique sources
   num_unique_sources = thrust::reduce(
-    reverse_offsets_flags.begin(), 
+    policy,
+    reverse_offsets_flags.begin(),
     reverse_offsets_flags.begin()+n_reversed_edges);
 
   // collect the indices where flags == 1
   thrust::copy_if(
+    policy,
     thrust::counting_iterator<int>(0),
     thrust::counting_iterator<int>(n_reversed_edges),
     reverse_offsets_flags.begin(),
@@ -726,12 +733,13 @@ __global__ void process_reverse_edges_kernel(
 template <typename CONSTRUCT_GRAPH_CONFIG,
           typename BEAM_SEARCH_CONFIG>
 __host__ void process_batch(
-  typename CONSTRUCT_GRAPH_CONFIG::graph_t& graph, 
+  typename CONSTRUCT_GRAPH_CONFIG::graph_t& graph,
   graph_construct_workspace<CONSTRUCT_GRAPH_CONFIG>& ws,
   uint32_t batch_offset,
-  uint32_t batch_size, 
+  uint32_t batch_size,
   float alpha,
-  construct_timer& timer
+  construct_timer& timer,
+  cudaStream_t stream = 0
 ) {
   using data_t      = typename CONSTRUCT_GRAPH_CONFIG::data_t;
   using entry_t     = typename CONSTRUCT_GRAPH_CONFIG::entry_t;
@@ -753,8 +761,10 @@ __host__ void process_batch(
   cudaEventCreate(&e3); cudaEventCreate(&e4); cudaEventCreate(&e5);
   cudaEventCreate(&e6);
 
+  auto thrust_policy = thrust::cuda::par.on(stream);
+
   // beam search
-  cudaEventRecord(e0);
+  cudaEventRecord(e0, stream);
   beam_search_params<BEAM_SEARCH_CONFIG> bp {
     .graph          = graph,
     .use_range      = true,
@@ -769,71 +779,73 @@ __host__ void process_batch(
   bs_result.frontier       = ws.frontier;
   bs_result.visited        = ws.visited;
   bs_result.visited_counts = ws.visited_counts;
-  beam_search<BEAM_SEARCH_CONFIG>(bp, bs_result);
-  cudaEventRecord(e1);
+  beam_search<BEAM_SEARCH_CONFIG>(bp, bs_result, stream);
+  cudaEventRecord(e1, stream);
 
   // add the edges to the points in batch
-  merge_candidates_kernel<CONSTRUCT_GRAPH_CONFIG, TILE_SIZE, BLOCK_SIZE><<<batch_size, BLOCK_SIZE>>>(
-      ws.visited, 
+  merge_candidates_kernel<CONSTRUCT_GRAPH_CONFIG, TILE_SIZE, BLOCK_SIZE><<<batch_size, BLOCK_SIZE, 0, stream>>>(
+      ws.visited,
       ws.visited_counts,
       device_graph_view,
-      dim, 
-      batch_offset, 
+      dim,
+      batch_offset,
       batch_size,
-      max_result, 
+      max_result,
       max_candidates,
-      ws.prune_candidates, 
+      ws.prune_candidates,
       ws.prune_counts);
-  cudaError_t err = cudaDeviceSynchronize();
+  cudaError_t err = cudaStreamSynchronize(stream);
   if (err != cudaSuccess) {
     std::cerr << "merge_candidates_kernel failed: " << cudaGetErrorString(err) << std::endl;
   }
-  cudaEventRecord(e2);
-  
+  cudaEventRecord(e2, stream);
+
   // robust prune
-  robust_prune_kernel<CONSTRUCT_GRAPH_CONFIG, TILE_SIZE><<<batch_size, BLOCK_SIZE>>>(
-      ws.prune_candidates, 
+  robust_prune_kernel<CONSTRUCT_GRAPH_CONFIG, TILE_SIZE><<<batch_size, BLOCK_SIZE, 0, stream>>>(
+      ws.prune_candidates,
       ws.prune_counts,
-      device_graph_view, 
+      device_graph_view,
       dim,
-      batch_offset, 
+      batch_offset,
       batch_size,
-      max_candidates, 
+      max_candidates,
       alpha);
-  err = cudaDeviceSynchronize();
+  err = cudaStreamSynchronize(stream);
   if (err != cudaSuccess) {
     std::cerr << "robust_prune_kernel failed: " << cudaGetErrorString(err) << std::endl;
   }
-  cudaEventRecord(e3);
-  
+  cudaEventRecord(e3, stream);
+
   // reverse edges
   uint32_t total_slots = batch_size * R;
   dim3 grid((total_slots + BLOCK_SIZE - 1) / BLOCK_SIZE);
-  fill_reverse_edges<CONSTRUCT_GRAPH_CONFIG><<<grid, BLOCK_SIZE>>>(
+  fill_reverse_edges<CONSTRUCT_GRAPH_CONFIG><<<grid, BLOCK_SIZE, 0, stream>>>(
     device_graph_view,
     ws.reverse_edges_ptr,
-    batch_size, 
-    batch_offset, 
+    batch_size,
+    batch_offset,
     R);
-  err = cudaDeviceSynchronize();
+  err = cudaStreamSynchronize(stream);
   if (err != cudaSuccess) {
     std::cerr << "reverse edges failed: " << cudaGetErrorString(err) << std::endl;
   }
-  cudaEventRecord(e4);
+  cudaEventRecord(e4, stream);
 
   // semisort using thrust
-  // after this step, the reversed edges will be stored 
+  // after this step, the reversed edges will be stored
   // in `ws.reverse_edges` and `ws.reverse_offsets`
   edge_pair<index_t> sentinel = edge_pair<index_t>::sentinel();
   thrust::sort(
-    ws.reverse_edges.begin(), 
-    ws.reverse_edges.begin() + total_slots, 
+    thrust_policy,
+    ws.reverse_edges.begin(),
+    ws.reverse_edges.begin() + total_slots,
     semi_sort_compare_edge_pair<index_t>{});
 
   auto it = thrust::lower_bound(
-    ws.reverse_edges.begin(), 
+    thrust_policy,
+    ws.reverse_edges.begin(),
     ws.reverse_edges.begin() + total_slots,
-    sentinel, 
+    sentinel,
     semi_sort_compare_edge_pair<index_t>{});
   index_t n_edges = static_cast<index_t>(it - ws.reverse_edges.begin());
 
@@ -841,30 +853,31 @@ __host__ void process_batch(
 
   index_t num_unique_sources = 0;
   get_unique_source_offsets<CONSTRUCT_GRAPH_CONFIG>(
-    ws.reverse_edges, 
+    ws.reverse_edges,
     n_edges,
     ws.reverse_offsets_flags,
     ws.reverse_offsets,
-    num_unique_sources
+    num_unique_sources,
+    stream
   );
 
-  cudaEventRecord(e5);
+  cudaEventRecord(e5, stream);
 
   // add edges + robust prune
   constexpr uint64_t process_reverse_edges_kernel_grid_size = 1024; // fix size
   process_reverse_edges_kernel<CONSTRUCT_GRAPH_CONFIG, TILE_SIZE>
-       <<<process_reverse_edges_kernel_grid_size, BLOCK_SIZE>>>( //<<<num_vertices, BLOCK_SIZE>>>(
+       <<<process_reverse_edges_kernel_grid_size, BLOCK_SIZE, 0, stream>>>(
           ws.reverse_edges_ptr,
           ws.reverse_offsets_ptr,
           device_graph_view,
           dim,
           num_unique_sources,
           alpha);
-  err = cudaDeviceSynchronize();
+  err = cudaStreamSynchronize(stream);
   if (err != cudaSuccess) {
     std::cerr << "process_reverse_edges_kernel failed: " << cudaGetErrorString(err) << std::endl;
   }
-  cudaEventRecord(e6);
+  cudaEventRecord(e6, stream);
 
   cudaEventSynchronize(e6);
   timer.beam_search_ms   += elapsed_ms(e0, e1);
@@ -883,11 +896,12 @@ __host__ void process_batch(
 template <typename CONSTRUCT_GRAPH_CONFIG,
           typename BEAM_SEARCH_CONFIG>
 __host__ void construction_round(
-  typename CONSTRUCT_GRAPH_CONFIG::graph_t &graph, 
+  typename CONSTRUCT_GRAPH_CONFIG::graph_t &graph,
   graph_construct_workspace<CONSTRUCT_GRAPH_CONFIG> &ws,
-  float alpha, 
+  float alpha,
   uint32_t max_batch_size,
-  construct_timer& timer
+  construct_timer& timer,
+  cudaStream_t stream = 0
 ){
   uint32_t count = 0;
   uint32_t batch_size = 1;
@@ -899,7 +913,7 @@ __host__ void construction_round(
     batch_size = std::min(batch_size, max_batch_size);
 
     process_batch<CONSTRUCT_GRAPH_CONFIG, BEAM_SEARCH_CONFIG>(
-        graph, ws, count, batch_size, alpha, timer);
+        graph, ws, count, batch_size, alpha, timer, stream);
 
     count += batch_size;
 
@@ -918,7 +932,8 @@ __host__ void construction_round(
 
 template <typename CONSTRUCT_GRAPH_CONFIG>
 __host__ graph<typename CONSTRUCT_GRAPH_CONFIG::graph_cfg_t> construct_graph(
-  graph_construct_params<CONSTRUCT_GRAPH_CONFIG> params
+  graph_construct_params<CONSTRUCT_GRAPH_CONFIG> params,
+  cudaStream_t stream = 0
 ){
   using graph_cfg_t = typename CONSTRUCT_GRAPH_CONFIG::graph_cfg_t;
   using graph_t = typename CONSTRUCT_GRAPH_CONFIG::graph_t;
@@ -969,7 +984,7 @@ __host__ graph<typename CONSTRUCT_GRAPH_CONFIG::graph_cfg_t> construct_graph(
   // second round add long hop edges
   construct_timer second_round_timer;
   construction_round<CONSTRUCT_GRAPH_CONFIG, beam_search_cfg>(
-    g, ws, alpha, params.max_batch_size, second_round_timer
+    g, ws, alpha, params.max_batch_size, second_round_timer, stream
   );
   // second_round_timer.print();
 
