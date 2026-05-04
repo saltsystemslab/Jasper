@@ -7,8 +7,10 @@
 #include <thread>
 #include <exception>
 #include <numeric>
+#include <algorithm>
 
 #include "jasper/index/construct.cuh"
+#include "jasper/index/construct_scale_kernels.cuh"
 
 namespace jasper {
 
@@ -59,7 +61,7 @@ __host__ size_t estimate_partition_size_for_budget(size_t budget_bytes, uint32_t
 
 // Intermediate graph holding one independently-built index per partition.
 // Partitions are merged into a larger graph after construction.
-template <typename GRAPH_CFG>
+template <typename GRAPH_CFG, typename GRAPH_CONSTRUCT_CONFIG>
 struct intermediate_graph {
   using partition_graph_t = graph<GRAPH_CFG>;
 
@@ -67,15 +69,14 @@ struct intermediate_graph {
   size_t n_partitions;
   size_t partition_size;
   size_t workspace_budget_per_partition;
+  float alpha;
 
   // Allocate and fully construct one graph per partition with explicit sizing.
   // n_parts, part_size, and workspace_budget are provided directly by the caller.
   // GRAPH_CONSTRUCT_CONFIG::graph_cfg_t must equal GRAPH_CFG.
-  template <typename GRAPH_CONSTRUCT_CONFIG>
   static intermediate_graph allocate_and_construct(
     graph_construct_params<GRAPH_CONSTRUCT_CONFIG> params,
     size_t n_parts,
-    size_t part_size,
     size_t workspace_budget
   ) {
     static_assert(
@@ -83,6 +84,9 @@ struct intermediate_graph {
         "GRAPH_CONSTRUCT_CONFIG::graph_cfg_t must match GRAPH_CFG");
 
     size_t n_vectors = params.data_vectors.n_vectors;
+
+    assert(n_parts > 0 && n_vectors > 0);
+    size_t part_size = (n_vectors + n_parts - 1) / n_parts;
 
     uint32_t batch_size =
         graph_construct_workspace<GRAPH_CONSTRUCT_CONFIG>::max_batch_size_for_budget(
@@ -93,6 +97,7 @@ struct intermediate_graph {
     ig.partition_size                 = part_size;
     ig.workspace_budget_per_partition = workspace_budget;
     ig.n_partitions                   = n_parts;
+    ig.alpha                          = params.alpha;
     ig.partitions.resize(n_parts);
 
     for (size_t p = 0; p < n_parts; p++) {
@@ -122,7 +127,6 @@ struct intermediate_graph {
   // Allocate and fully construct one graph per partition.
   // Derives n_parts, part_size, and workspace_budget from budget_bytes automatically.
   // GRAPH_CONSTRUCT_CONFIG::graph_cfg_t must equal GRAPH_CFG.
-  template <typename GRAPH_CONSTRUCT_CONFIG>
   static intermediate_graph allocate_and_construct_for_budget(
     graph_construct_params<GRAPH_CONSTRUCT_CONFIG> params,
     size_t budget_bytes
@@ -139,14 +143,165 @@ struct intermediate_graph {
     size_t workspace_budget = budget_bytes / 2;
     size_t n_parts = (n_vectors + part_size - 1) / part_size;
 
-    return allocate_and_construct<GRAPH_CONSTRUCT_CONFIG>(
-        params, n_parts, part_size, workspace_budget);
+    return allocate_and_construct(
+        params, n_parts, workspace_budget);
+  }
+
+  __host__ void merge_partition_batch(
+    size_t B1,
+    size_t B2,
+    uint32_t count,
+    uint32_t batch_size,
+    graph_construct_workspace<GRAPH_CONSTRUCT_CONFIG>& ws
+  ) {
+    using entry_t     = typename GRAPH_CONSTRUCT_CONFIG::entry_t;
+    using index_t     = typename GRAPH_CONSTRUCT_CONFIG::index_t;
+    using graph_cfg_t = typename GRAPH_CONSTRUCT_CONFIG::graph_cfg_t;
+    constexpr uint32_t L          = GRAPH_CONSTRUCT_CONFIG::L;
+    constexpr uint32_t R          = GRAPH_CONSTRUCT_CONFIG::R;
+    constexpr uint32_t max_result = GRAPH_CONSTRUCT_CONFIG::beam_search_max_result_size;
+    uint32_t max_candidates = max_result + R;
+    uint32_t dim = partitions[B1].dim;
+
+    constexpr uint32_t BLOCK_SIZE = GRAPH_CONSTRUCT_CONFIG::block_size;
+    constexpr uint32_t TILE_SIZE  = GRAPH_CONSTRUCT_CONFIG::tile_size;
+
+    constexpr uint32_t beam_search_tile_size  = 4;
+    constexpr uint32_t beam_search_block_size = 64;
+    using beam_search_cfg = beam_search_config<
+      graph_cfg_t, graph_cfg_t::dist_func,
+      beam_search_block_size,
+      true,
+      GRAPH_CONSTRUCT_CONFIG::beam_search_max_search_width,
+      beam_search_tile_size,
+      GRAPH_CONSTRUCT_CONFIG::beam_search_max_result_size>;
+
+    // Beam search: B1 batch queries → B2 graph.
+    // The batch lies within one segment because partition_size <= vectors_per_segment.
+    using segment_t = graph_segment<graph_cfg_t>;
+    std::vector<segment_t> h_segs_b1(partitions[B1].segments.begin(),
+                                     partitions[B1].segments.end());
+    const uint32_t b1_seg   = graph<graph_cfg_t>::segment_of(count);
+    const uint32_t b1_local = graph<graph_cfg_t>::local_of(count);
+    auto query_view = h_segs_b1[b1_seg].vectors.subview(b1_local, batch_size);
+
+    beam_search_params<beam_search_cfg> bp {
+      .graph         = partitions[B2],
+      .query_vectors = query_view,
+      .medoid        = partitions[B2].medoid,
+      .k             = L,
+      .beam_width    = L,
+      .limit         = GRAPH_CONSTRUCT_CONFIG::BEAM_SEARCH_LIMIT,
+    };
+    beam_search_result<graph_cfg_t> bs_result;
+    bs_result.frontier       = ws.frontier;
+    bs_result.visited        = ws.visited;
+    bs_result.visited_counts = ws.visited_counts;
+    beam_search<beam_search_cfg>(bp, bs_result);
+
+    uint32_t b1_batch_offset = static_cast<uint32_t>(partitions[B1].global_offset) + count;
+    auto b1_view = partitions[B1].view();
+    auto b2_view = partitions[B2].view();
+
+    // Merge beam-search results into B1's candidate list.
+    merge_candidates_kernel<GRAPH_CONSTRUCT_CONFIG, TILE_SIZE, BLOCK_SIZE>
+        <<<batch_size, beam_search_block_size>>>(
+            ws.visited,
+            ws.visited_counts,
+            b1_view,
+            dim,
+            b1_batch_offset,
+            batch_size,
+            max_result,
+            max_candidates,
+            ws.prune_candidates,
+            ws.prune_counts);
+
+    // Robust prune for B1 (resolves vectors from either partition).
+    robust_prune_kernel_scale<GRAPH_CONSTRUCT_CONFIG, TILE_SIZE>
+        <<<batch_size, beam_search_block_size>>>(
+            ws.prune_candidates,
+            ws.prune_counts,
+            b1_view,
+            b2_view,
+            dim,
+            b1_batch_offset,
+            batch_size,
+            max_candidates,
+            alpha);
+
+    // Collect reverse edges from B1's updated neighbor lists.
+    uint32_t total_slots = batch_size * R;
+    dim3 grid((total_slots + BLOCK_SIZE - 1) / BLOCK_SIZE);
+    fill_reverse_edges<GRAPH_CONSTRUCT_CONFIG><<<grid, BLOCK_SIZE>>>(
+        b1_view,
+        ws.reverse_edges_ptr,
+        batch_size,
+        b1_batch_offset,
+        R);
+
+    // Sort all reverse edges by source global id.
+    thrust::sort(
+        thrust::device,
+        ws.reverse_edges.begin(),
+        ws.reverse_edges.begin() + total_slots,
+        semi_sort_compare_edge_pair<index_t>{});
+
+    // Trim sentinel entries (invalid neighbors sort to the end).
+    edge_pair<index_t> sentinel = edge_pair<index_t>::sentinel();
+    auto it = thrust::lower_bound(
+        thrust::device,
+        ws.reverse_edges.begin(),
+        ws.reverse_edges.begin() + total_slots,
+        sentinel,
+        semi_sort_compare_edge_pair<index_t>{});
+    index_t n_rev_edges = static_cast<index_t>(it - ws.reverse_edges.begin());
+
+    if (n_rev_edges == 0) return;
+
+    // Compute per-source offsets over the sorted edge array.
+    index_t num_unique_sources = 0;
+    get_unique_source_offsets<GRAPH_CONSTRUCT_CONFIG>(
+        ws.reverse_edges,
+        n_rev_edges,
+        ws.reverse_offsets_flags,
+        ws.reverse_offsets,
+        num_unique_sources);
+
+    if (num_unique_sources == 0) return;
+
+    // Merge reverse edges into B2's neighbor lists.
+    // Entries whose source is not in B2's range are skipped by the kernel.
+    constexpr uint64_t process_kernel_grid_size = 1024;
+    process_reverse_edges_kernel_scale<GRAPH_CONSTRUCT_CONFIG, TILE_SIZE>
+        <<<process_kernel_grid_size, BLOCK_SIZE>>>(
+            ws.reverse_edges_ptr,
+            ws.reverse_offsets_ptr,
+            b1_view,
+            b2_view,
+            dim,
+            num_unique_sources,
+            alpha);
+
+    cudaDeviceSynchronize();
   }
 
   // Merge two partitions together with our special sauce beam search + prune
   // Here we assume that both partitions are already loaded onto device memory.
-  __host__ void merge_partition(size_t B1, size_t B2) {
-    
+  __host__ void merge_partition(
+    size_t B1,
+    size_t B2,
+    uint32_t batch_size,
+    graph_construct_workspace<GRAPH_CONSTRUCT_CONFIG>& ws
+  ) {
+    uint32_t count = 0;
+    size_t n_vectors = partitions[B1].n_vectors;
+
+    while (count < n_vectors) {
+      size_t cur_batch_size = std::min((size_t)batch_size, n_vectors - count);
+      merge_partition_batch(B1, B2, count, cur_batch_size, ws);
+      count += cur_batch_size;
+    }
   }
 
   // Produce a merge order sequence and call merge_partition for each pair.
@@ -157,6 +312,13 @@ struct intermediate_graph {
   // resident across calls.
   __host__ void merge() {
     if (n_partitions <= 1) return;
+
+    // Allocate merge workspace
+    uint32_t batch_size =
+        graph_construct_workspace<GRAPH_CONSTRUCT_CONFIG>::max_batch_size_for_budget(
+            workspace_budget_per_partition);
+    batch_size = batch_size * 2; // we can fit two
+    auto ws = graph_construct_workspace<GRAPH_CONSTRUCT_CONFIG>::allocate(batch_size);
 
     const size_t P = n_partitions;
     const size_t total_pairs = P * (P - 1) / 2;
@@ -186,7 +348,7 @@ struct intermediate_graph {
           partitions[B2].move_to(false);
           std::printf("[merge] %zu / %zu: partitions %zu, %zu (itv=%zu)\n",
                       ++merge_count, total_pairs, B1, B2, itv);
-          merge_partition(B1, B2);
+          merge_partition(B1, B2, batch_size, ws);
           partitions[B1].move_to(true);
           B1 = B2;
         }

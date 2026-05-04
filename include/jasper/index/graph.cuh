@@ -431,12 +431,19 @@ struct graph {
     index_t    n_vectors;
     uint32_t   n_segments;
     index_t    medoid;
+    index_t    global_offset;
+
+    __device__ __forceinline__
+    index_t to_local(index_t global_idx) const {
+      return global_idx - global_offset;
+    }
 
     __device__ __forceinline__
     bool is_valid(index_t global_idx) const {
-      if (global_idx >= n_vectors) return false;
-      uint32_t seg_id = graph::segment_of(global_idx);
-      uint32_t loc    = graph::local_of(global_idx);
+      if (global_idx < global_offset || global_idx >= global_offset + n_vectors) return false;
+      index_t local_idx = to_local(global_idx);
+      uint32_t seg_id = graph::segment_of(local_idx);
+      uint32_t loc    = graph::local_of(local_idx);
       return seg_id < n_segments && segments[seg_id].is_valid_local_idx(loc);
     }
 
@@ -447,60 +454,60 @@ struct graph {
 
     __device__ __forceinline__
     uint8_t get_edge_count(index_t global_idx) const {
-      assert(global_idx < n_vectors && "global_idx out of bounds");
-      return segments[segment_of(global_idx)]
-                .get_edge_count(local_of(global_idx));
+      index_t local_idx = to_local(global_idx);
+      assert(local_idx < n_vectors && "global_idx out of bounds");
+      return segments[segment_of(local_idx)].get_edge_count(local_of(local_idx));
     }
 
     // returns a mutable neighbor reference
     __device__ __forceinline__
     auto& get_neighbor_list(index_t global_idx) {
-      assert(global_idx < n_vectors && "global_idx out of bounds");
-      return segments[segment_of(global_idx)]
-                .get_neighbor_list(local_of(global_idx));
+      index_t local_idx = to_local(global_idx);
+      assert(local_idx < n_vectors && "global_idx out of bounds");
+      return segments[segment_of(local_idx)].get_neighbor_list(local_of(local_idx));
     }
 
     __device__ __forceinline__
     index_t get_neighbor(index_t global_idx, uint8_t neighbor_idx) const {
-      assert(global_idx < n_vectors && "global_idx out of bounds");
-      return segments[segment_of(global_idx)]
-                .get_neighbor(local_of(global_idx), neighbor_idx);
+      index_t local_idx = to_local(global_idx);
+      assert(local_idx < n_vectors && "global_idx out of bounds");
+      return segments[segment_of(local_idx)].get_neighbor(local_of(local_idx), neighbor_idx);
     }
 
     __device__ __forceinline__
     float get_neighbor_dist(index_t global_idx, uint8_t neighbor_idx) const {
-      assert(global_idx < n_vectors && "global_idx out of bounds");
-      return segments[segment_of(global_idx)]
-                .get_neighbor_dist(local_of(global_idx), neighbor_idx);
+      index_t local_idx = to_local(global_idx);
+      assert(local_idx < n_vectors && "global_idx out of bounds");
+      return segments[segment_of(local_idx)].get_neighbor_dist(local_of(local_idx), neighbor_idx);
     }
 
     // returns a mutable vector reference
     __device__ __forceinline__
     auto get_vector(index_t global_idx) {
-      assert(global_idx < n_vectors && "global_idx out of bounds");
-      return segments[segment_of(global_idx)]
-                .get_vector(local_of(global_idx));
+      index_t local_idx = to_local(global_idx);
+      assert(local_idx < n_vectors && "global_idx out of bounds");
+      return segments[segment_of(local_idx)].get_vector(local_of(local_idx));
     }
 
     __device__ __forceinline__
     void set_edge_count(index_t global_idx, uint8_t count) {
-      assert(global_idx < n_vectors && "global_idx out of bounds");
-      segments[segment_of(global_idx)]
-          .set_edge_count(local_of(global_idx), count);
+      index_t local_idx = to_local(global_idx);
+      assert(local_idx < n_vectors && "global_idx out of bounds");
+      segments[segment_of(local_idx)].set_edge_count(local_of(local_idx), count);
     }
 
     __device__ __forceinline__
     void set_neighbor(index_t global_idx, uint8_t neighbor_idx, index_t neighbor) {
-      assert(global_idx < n_vectors && "global_idx out of bounds");
-      segments[segment_of(global_idx)]
-          .set_neighbor(local_of(global_idx), neighbor_idx, neighbor);
+      index_t local_idx = to_local(global_idx);
+      assert(local_idx < n_vectors && "global_idx out of bounds");
+      segments[segment_of(local_idx)].set_neighbor(local_of(local_idx), neighbor_idx, neighbor);
     }
 
     __device__ __forceinline__
     void set_neighbor_dist(index_t global_idx, uint8_t neighbor_idx, float dist_val) {
-      assert(global_idx < n_vectors && "global_idx out of bounds");
-      segments[segment_of(global_idx)]
-          .set_neighbor_dist(local_of(global_idx), neighbor_idx, dist_val);
+      index_t local_idx = to_local(global_idx);
+      assert(local_idx < n_vectors && "global_idx out of bounds");
+      segments[segment_of(local_idx)].set_neighbor_dist(local_of(local_idx), neighbor_idx, dist_val);
     }
   };
 
@@ -511,7 +518,8 @@ struct graph {
       dim,
       n_vectors,
       n_segments,
-      medoid
+      medoid,
+      global_offset
     };
   }
 };
