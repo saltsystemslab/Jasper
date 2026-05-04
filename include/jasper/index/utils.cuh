@@ -2,6 +2,11 @@
 
 namespace jasper {
 
+enum class object_location : uint8_t {
+  HOST,
+  DEVICE
+};
+
 struct construct_timer {
   float beam_search_ms   = 0;
   float merge_cands_ms   = 0;

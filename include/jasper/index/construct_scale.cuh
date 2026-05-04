@@ -6,6 +6,7 @@
 #include <vector>
 #include <thread>
 #include <exception>
+#include <numeric>
 
 #include "jasper/index/construct.cuh"
 
@@ -141,6 +142,59 @@ struct intermediate_graph {
     return allocate_and_construct<GRAPH_CONSTRUCT_CONFIG>(
         params, n_parts, part_size, workspace_budget);
   }
+
+  // Merge two partitions together with our special sauce beam search + prune
+  // Here we assume that both partitions are already loaded onto device memory.
+  __host__ void merge_partition(size_t B1, size_t B2) {
+    
+  }
+
+  // Produce a merge order sequence and call merge_partition for each pair.
+  //
+  // Enumerates all unordered pairs (i, j) with i < j < n_partitions in an
+  // order that preserves memory locality: within a cycle, consecutive
+  // merge calls share one partition, so the resident partition can stay
+  // resident across calls.
+  __host__ void merge() {
+    if (n_partitions <= 1) return;
+
+    const size_t P = n_partitions;
+    const size_t total_pairs = P * (P - 1) / 2;
+    size_t B1 = 0;
+    size_t merge_count = 0;
+
+    partitions[B1].move_to(false); // move to device 
+
+    for (size_t itv = 1; itv <= P / 2; ++itv) {
+      const size_t g = std::gcd(itv, P);
+      const size_t cycle_len = P / g;
+
+      const size_t calls_per_cycle = (cycle_len == 2) ? 1 : cycle_len;
+
+      for (size_t cycle_idx = 0; cycle_idx < g; ++cycle_idx) {
+        if (cycle_idx > 0) {
+          // move old B1 to host
+          partitions[B1].move_to(true);
+          // Switch residue class. (old_B1, new_B1) was already merged
+          // at itv=1, so no merge call here -- just slide B1.
+          B1 = (B1 + 1) % P;
+          // move new B1 to device
+          partitions[B1].move_to(false);
+        }
+        for (size_t step = 0; step < calls_per_cycle; ++step) {
+          const size_t B2 = (B1 + itv) % P;
+          partitions[B2].move_to(false);
+          std::printf("[merge] %zu / %zu: partitions %zu, %zu (itv=%zu)\n",
+                      ++merge_count, total_pairs, B1, B2, itv);
+          merge_partition(B1, B2);
+          partitions[B1].move_to(true);
+          B1 = B2;
+        }
+      }
+    }
+    partitions[B1].move_to(true);  // offload the last resident partition
+  }
+
 };
 
 }

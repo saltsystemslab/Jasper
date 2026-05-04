@@ -69,6 +69,13 @@ void construct(
   std::cout << "  allocate_and_construct: " << std::fixed << std::setprecision(3)
             << elapsed_s << " s" << std::endl;
 
+  t0 = std::chrono::steady_clock::now();
+  ig.merge();
+  t1 = std::chrono::steady_clock::now();
+  elapsed_s = std::chrono::duration<double>(t1 - t0).count();
+  std::cout << "  merge: " << std::fixed << std::setprecision(3)
+            << elapsed_s << " s" << std::endl;
+
   cudaFreeHost(vecs.data);
   for (auto& g : ig.partitions) g.deallocate();
 }
