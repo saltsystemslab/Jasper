@@ -15,6 +15,7 @@ namespace jasper {
 template <typename INDEX_T, uint32_t N_NEIGHBORS>
 struct edge_list {
   INDEX_T edges[N_NEIGHBORS];
+  float dist[N_NEIGHBORS];
 
   __host__ __device__ INDEX_T& operator[](uint32_t i) { return edges[i]; }
   __host__ __device__ const INDEX_T& operator[](uint32_t i) const { return edges[i]; }
@@ -187,8 +188,14 @@ struct graph_segment {
   index_t get_neighbor(uint32_t local_idx, uint8_t neighbor_idx) const {
     assert(local_idx < static_cast<uint32_t>(n_vectors));
     assert(neighbor_idx < edge_counts[local_idx]);
-
     return edges[local_idx][neighbor_idx];
+  }
+
+  __device__ __forceinline__
+  float get_neighbor_dist(uint32_t local_idx, uint8_t neighbor_idx) const {
+    assert(local_idx < static_cast<uint32_t>(n_vectors));
+    assert(neighbor_idx < edge_counts[local_idx]);
+    return edges[local_idx].dist[neighbor_idx];
   }
 
   // mutable reference
@@ -215,6 +222,13 @@ struct graph_segment {
     assert(neighbor_idx < n_neighbors);
     edges[local_idx][neighbor_idx] = neighbor;
   }
+
+  __device__ __forceinline__
+  void set_neighbor_dist(uint32_t local_idx, uint8_t neighbor_idx, float dist_val) {
+    assert(local_idx < static_cast<uint32_t>(n_vectors));
+    assert(neighbor_idx < n_neighbors);
+    edges[local_idx].dist[neighbor_idx] = dist_val;
+  }
 };
 
 template <typename graph_cfg>
@@ -231,6 +245,7 @@ struct graph {
   index_t n_vectors;
   uint32_t n_segments;
   index_t medoid;
+  index_t global_offset = 0;
   bool on_host;
 
   thrust::device_vector<segment_t> segments;
@@ -382,6 +397,34 @@ struct graph {
     cudaDeviceSynchronize();
   }
 
+  // Rewrite every stored neighbor index from partition-local to global
+  // (global = local + offset), then record global_offset on this graph.
+  // Must be called after move_to(true) since it walks host-side edge arrays.
+  __host__ void apply_global_offset(index_t offset) {
+    global_offset = offset;
+    if (offset == 0) return;
+
+    if (!on_host) {
+      throw std::runtime_error(
+          "apply_global_offset requires graph on host — call move_to(true) first");
+    }
+
+    constexpr index_t INVALID = std::numeric_limits<index_t>::max();
+
+    std::vector<segment_t> h_segs(segments.begin(), segments.end());
+    for (auto& seg : h_segs) {
+      for (uint32_t i = 0; i < static_cast<uint32_t>(seg.n_vectors); i++) {
+        uint8_t cnt = seg.edge_counts[i];
+        for (uint8_t j = 0; j < cnt; j++) {
+          index_t& nb = seg.edges[i][j];
+          if (nb != INVALID) nb += offset;
+        }
+      }
+    }
+
+    medoid += offset;
+  }
+
   struct device_view {
     segment_t *segments;
     uint32_t   dim;
@@ -424,6 +467,13 @@ struct graph {
                 .get_neighbor(local_of(global_idx), neighbor_idx);
     }
 
+    __device__ __forceinline__
+    float get_neighbor_dist(index_t global_idx, uint8_t neighbor_idx) const {
+      assert(global_idx < n_vectors && "global_idx out of bounds");
+      return segments[segment_of(global_idx)]
+                .get_neighbor_dist(local_of(global_idx), neighbor_idx);
+    }
+
     // returns a mutable vector reference
     __device__ __forceinline__
     auto get_vector(index_t global_idx) {
@@ -444,6 +494,13 @@ struct graph {
       assert(global_idx < n_vectors && "global_idx out of bounds");
       segments[segment_of(global_idx)]
           .set_neighbor(local_of(global_idx), neighbor_idx, neighbor);
+    }
+
+    __device__ __forceinline__
+    void set_neighbor_dist(index_t global_idx, uint8_t neighbor_idx, float dist_val) {
+      assert(global_idx < n_vectors && "global_idx out of bounds");
+      segments[segment_of(global_idx)]
+          .set_neighbor_dist(local_of(global_idx), neighbor_idx, dist_val);
     }
   };
 
