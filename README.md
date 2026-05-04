@@ -25,8 +25,6 @@ pip install apache-tvm-ffi
 cmake -B build -DJASPER_BUILD_FFI=ON -DJASPER_BUILD_CMD=ON
 cmake --build build -j
 cmake --install build
-
-# Install the Python package
 pip install -e python/
 ```
 
