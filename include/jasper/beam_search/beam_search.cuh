@@ -37,7 +37,8 @@ __device__ void populate_distances(
   cg::thread_block_tile<TILE_SIZE> my_tile =
       cg::tiled_partition<TILE_SIZE>(thread_block);
   uint64_t tid = my_tile.meta_group_rank();
-  constexpr INDEX_T INVALID_INDEX = std::numeric_limits<INDEX_T>::max();
+  // 0x7FFFFFFF matches the index stored by empty_entry() (31-bit max after masking)
+  constexpr INDEX_T INVALID_INDEX = static_cast<INDEX_T>(0x7FFFFFFFu);
   uint32_t padded_dim = graph.get_padded_dim();
 
   uint32_t count = result_buffer_count[0];
@@ -109,11 +110,20 @@ __device__ void add_frontier_out(
 
   const uint4* l_ptr = reinterpret_cast<const uint4*>(&graph.get_neighbor_list(frontier).edges);
 
+  const INDEX_T range_lo = graph.global_offset;
+  const INDEX_T range_hi = graph.global_offset + graph.n_vectors;
+
   for (uint i = threadIdx.x*4; i < n_edges; i += blockDim.x*4){
     uint4 loaded_edges = l_ptr[i/4];
     const uint32_t * loaded_edges_ptr = (uint32_t *) &loaded_edges;
     for (uint j = 0; j < 4; j++){
-      result_buffer[offset+i+j] = set_index(empty_entry(), loaded_edges_ptr[j]);
+      INDEX_T nb = static_cast<INDEX_T>(loaded_edges_ptr[j]);
+      if (nb >= range_lo && nb < range_hi) {
+        result_buffer[offset+i+j] = set_index(empty_entry(), nb);
+      } else {
+        // Out-of-range: mark visited so it is never selected as a frontier
+        result_buffer[offset+i+j] = set_visited(empty_entry());
+      }
     }
   }
 
