@@ -302,24 +302,14 @@ __global__ void merge_candidates_kernel(
   constexpr index_t INVALID_INDEX = std::numeric_limits<index_t>::max();
   constexpr entry_t SENTINEL = {INVALID_INDEX, std::numeric_limits<distance_t>::max()};
 
-  // add existing neighbors (compute distance to query)
+  // add existing neighbors using stored distances (avoids recomputing d(node, neighbor))
   uint8_t n_edges = graph.get_edge_count(global_id);
-  data_t* query_vec = graph.get_vector(batch_offset + bid);
-  for (uint32_t i = tid; i < n_edges; i+=n_tiles) {
+  for (uint32_t i = threadIdx.x; i < n_edges; i += blockDim.x) {
     index_t neighbor = graph.get_neighbor(global_id, i);
     if (neighbor == INVALID_INDEX) continue;
-
-    const data_t* neighbor_vec = graph.get_vector(neighbor);
-
-    distance_t d = compute_distance<CONSTRUCT_GRAPH_CONFIG::graph_cfg_t::dist_func, data_t, distance_t, TILE_SIZE>(
-      query_vec, neighbor_vec, dim, my_tile);
-
-    if (my_tile.thread_rank() == 0) {
-      uint32_t slot = atomicAdd(&s_count, 1u);
-      if (slot < max_candidates)  {
-        my_out[slot] = {neighbor, d};
-      }
-    }
+    distance_t d = static_cast<distance_t>(graph.get_neighbor_dist(global_id, i));
+    uint32_t slot = atomicAdd(&s_count, 1u);
+    if (slot < max_candidates) my_out[slot] = {neighbor, d};
   }
   __syncthreads();
 
@@ -408,6 +398,7 @@ __global__ void robust_prune_kernel(
 
   // Shared state: all tiles in this block cooperate on one vector
   __shared__ index_t    s_selected[R];
+  __shared__ distance_t s_selected_dist[R];
   __shared__ uint32_t   s_n_selected;
   __shared__ bool       s_pruned;
 
@@ -452,6 +443,7 @@ __global__ void robust_prune_kernel(
         uint32_t slot = s_n_selected;
         if (slot < R) {
           s_selected[slot] = cand_id;
+          s_selected_dist[slot] = cand_dist;
           s_n_selected = slot + 1;
         }
       }
@@ -462,6 +454,7 @@ __global__ void robust_prune_kernel(
   uint32_t final_count = s_n_selected;
   for (uint32_t i = threadIdx.x; i < final_count; i += blockDim.x) {
     graph.set_neighbor(global_id, i, s_selected[i]);
+    graph.set_neighbor_dist(global_id, i, s_selected_dist[i]);
   }
   if (threadIdx.x == 0) {
     graph.set_edge_count(global_id, final_count);
@@ -479,7 +472,7 @@ __global__ void fill_reverse_edges(
   using index_t = typename CONSTRUCT_GRAPH_CONFIG::index_t;
 
   // one thread per slot in [batch_size * max_edges_per_node]
-  uint64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+  uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (tid >= (uint64_t)batch_size * max_edges_per_node) return;
 
   uint32_t local_id = tid / max_edges_per_node;
@@ -592,10 +585,11 @@ __global__ void process_reverse_edges_kernel(
   entry_t* s_candidates = reinterpret_cast<entry_t*>(shared_buf);
   auto& sort_storage = reinterpret_cast<typename BlockMergeSortT::TempStorage&>(shared_buf);
 
-  __shared__ uint32_t s_count;
-  __shared__ index_t  s_selected[R];
-  __shared__ uint32_t s_n_selected;
-  __shared__ bool     s_pruned;
+  __shared__ uint32_t   s_count;
+  __shared__ index_t    s_selected[R];
+  __shared__ distance_t s_selected_dist[R];
+  __shared__ uint32_t   s_n_selected;
+  __shared__ bool       s_pruned;
 
   // block merge sort state
   entry_t items[ITEMS_PER_THREAD];
@@ -619,20 +613,23 @@ __global__ void process_reverse_edges_kernel(
     if (threadIdx.x == 0) s_count = 0;
     __syncthreads();
 
-    // grab existing edges
+    // grab existing edges using stored distances (avoids recomputing d(vertex, neighbor))
     uint8_t n_edges = graph.get_edge_count(actual_vertex);
-    for (uint32_t i=tile_id; i<n_edges; i+=n_tiles) {
+    for (uint32_t i=threadIdx.x; i<n_edges; i+=blockDim.x) {
       index_t neighbor = graph.get_neighbor(actual_vertex, i);
       if (neighbor == INVALID_INDEX) continue;
 
-      data_t* neighbor_vec = graph.get_vector(neighbor);
-      distance_t d = compute_distance<CONSTRUCT_GRAPH_CONFIG::graph_cfg_t::dist_func,
-        data_t, distance_t, TILE_SIZE>(src_vec, neighbor_vec, dim, my_tile);
+      // data_t* neighbor_vec = graph.get_vector(neighbor);
+      // distance_t d = compute_distance<CONSTRUCT_GRAPH_CONFIG::graph_cfg_t::dist_func,
+      //   data_t, distance_t, TILE_SIZE>(src_vec, neighbor_vec, dim, my_tile);
 
-      if (my_tile.thread_rank() == 0) {
-        uint32_t slot = atomicAdd(&s_count, 1u);
-        if (slot < MAX_CANDS) s_candidates[slot] = {neighbor, d};
-      }
+      // if (my_tile.thread_rank() == 0) {
+      //   uint32_t slot = atomicAdd(&s_count, 1u);
+      //   if (slot < MAX_CANDS) s_candidates[slot] = {neighbor, d};
+      // }
+      distance_t d = static_cast<distance_t>(graph.get_neighbor_dist(actual_vertex, i));
+      uint32_t slot = atomicAdd(&s_count, 1u);
+      if (slot < MAX_CANDS) s_candidates[slot] = {neighbor, d};
     }
 
     // grab reversed edge sinks
@@ -708,11 +705,12 @@ __global__ void process_reverse_edges_kernel(
           uint32_t slot = s_n_selected;
           if (slot < R) {
             s_selected[slot] = cand_id;
+            s_selected_dist[slot] = cand_dist;
             s_n_selected = slot + 1;
           }
         }
       }
-      
+
       __syncthreads();
     }
 
@@ -720,6 +718,7 @@ __global__ void process_reverse_edges_kernel(
     uint32_t final_count = s_n_selected;
     for (uint32_t i=threadIdx.x; i<final_count; i+=blockDim.x) {
       graph.set_neighbor(actual_vertex, i, s_selected[i]);
+      graph.set_neighbor_dist(actual_vertex, i, s_selected_dist[i]);
     }
     if (threadIdx.x == 0) {
       graph.set_edge_count(actual_vertex, static_cast<uint8_t>(final_count));
@@ -849,7 +848,12 @@ __host__ void process_batch(
     semi_sort_compare_edge_pair<index_t>{});
   index_t n_edges = static_cast<index_t>(it - ws.reverse_edges.begin());
 
-  if (n_edges == 0) return;
+  if (n_edges == 0) {
+    cudaEventDestroy(e0); cudaEventDestroy(e1); cudaEventDestroy(e2);
+    cudaEventDestroy(e3); cudaEventDestroy(e4); cudaEventDestroy(e5);
+    cudaEventDestroy(e6);
+    return;
+  }
 
   index_t num_unique_sources = 0;
   get_unique_source_offsets<CONSTRUCT_GRAPH_CONFIG>(

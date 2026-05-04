@@ -32,9 +32,10 @@ __host__ size_t estimate_partition_size_for_budget(size_t budget_bytes, uint32_t
 
   uint32_t padded_dim = vector_view<data_t>::pad(dim);
 
-  // Graph index storage per vector: edges + edge count + vector data
+  // Graph index storage per vector: edges + neighbor distance + edge count + vector data
   size_t index_size_per_vec =
       sizeof(edge_list_t) +
+      sizeof(float) +
       sizeof(uint8_t) +
       static_cast<size_t>(padded_dim) * sizeof(data_t);
 
@@ -57,10 +58,6 @@ __host__ size_t estimate_partition_size_for_budget(size_t budget_bytes, uint32_t
 
 // Intermediate graph holding one independently-built index per partition.
 // Partitions are merged into a larger graph after construction.
-//
-// Note: partitions is std::vector, not thrust::device_vector, because
-// graph<GRAPH_CFG> owns a thrust::device_vector<segment_t> and is not
-// trivially copyable into device memory.
 template <typename GRAPH_CFG>
 struct intermediate_graph {
   using partition_graph_t = graph<GRAPH_CFG>;
@@ -115,6 +112,7 @@ struct intermediate_graph {
 
       ig.partitions[p] = construct_graph<GRAPH_CONSTRUCT_CONFIG>(part_params);
       ig.partitions[p].move_to(true);  // move to host pinned memory after construction
+      ig.partitions[p].apply_global_offset(static_cast<typename GRAPH_CFG::index_t>(start));
     }
 
     return ig;
