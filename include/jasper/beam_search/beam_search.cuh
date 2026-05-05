@@ -319,8 +319,17 @@ __global__ void beam_search_single_kernel(
   // Load query vector to shared memory (including zero padding for aligned loads)
   DATA_T *query_vec;
   if (use_range) {
+    if (threadIdx.x == 0 && (query_start + query_id) >= graph.n_vectors) {
+      printf("[OOB] block=%u query_start=%u query_id=%u index=%u n_vectors=%u query_end=%u\n",
+             blockIdx.x, query_start, query_id,
+             query_start + query_id, (uint32_t)graph.n_vectors, query_end);
+    }
     query_vec = graph.get_vector(query_start + query_id);
   } else {
+    if (threadIdx.x == 0 && query_id >= query_vectors.n_vectors) {
+      printf("[OOB] block=%u query_id=%u query_vectors.n_vectors=%u\n",
+             blockIdx.x, query_id, query_vectors.n_vectors);
+    }
     query_vec = query_vectors[query_id];
   }
   for (uint i = threadIdx.x; i < graph.get_padded_dim(); i += blockDim.x) {
