@@ -12,6 +12,10 @@
 #include "jasper/index/construct.cuh"
 #include "jasper/index/construct_scale_kernels.cuh"
 
+#ifndef JASPER_DEBUG_SCALE_CONSTRUCT
+#define JASPER_DEBUG_SCALE_CONSTRUCT 0
+#endif
+
 namespace jasper {
 
 // Calculate the partition size that fits two partitions within the given memory budget.
@@ -199,6 +203,32 @@ struct intermediate_graph {
     bs_result.visited_counts = ws.visited_counts;
     beam_search<beam_search_cfg>(bp, bs_result);
 
+#if JASPER_DEBUG_SCALE_CONSTRUCT
+    // Debug: print first few beam search results
+    {
+      constexpr uint32_t dbg_limit = 5;
+      uint32_t n_print = std::min(batch_size, dbg_limit);
+      uint32_t dbg_b1_offset = static_cast<uint32_t>(partitions[B1].global_offset) + count;
+      std::vector<entry_t> h_vis(static_cast<size_t>(n_print) * max_result);
+      std::vector<uint32_t> h_vcounts(n_print);
+      cudaMemcpy(h_vis.data(), bs_result.visited,
+                 static_cast<size_t>(n_print) * max_result * sizeof(entry_t),
+                 cudaMemcpyDeviceToHost);
+      cudaMemcpy(h_vcounts.data(), bs_result.visited_counts,
+                 n_print * sizeof(uint32_t), cudaMemcpyDeviceToHost);
+      std::printf("[bs_result] b1_offset=%u count=%u\n", dbg_b1_offset, count);
+      for (uint32_t i = 0; i < n_print; i++) {
+        uint32_t nc = std::min(h_vcounts[i], 8u);
+        std::printf("  q%u (%u results):", dbg_b1_offset + i, h_vcounts[i]);
+        for (uint32_t j = 0; j < nc; j++) {
+          const auto& e = h_vis[static_cast<size_t>(i) * max_result + j];
+          std::printf(" (%u,%.3f)", e.first, e.second);
+        }
+        std::printf("\n");
+      }
+    }
+#endif
+
     uint32_t b1_batch_offset = static_cast<uint32_t>(partitions[B1].global_offset) + count;
     auto b1_view = partitions[B1].view();
     auto b2_view = partitions[B2].view();
@@ -229,6 +259,28 @@ struct intermediate_graph {
             batch_size,
             max_candidates,
             alpha);
+
+#if JASPER_DEBUG_SCALE_CONSTRUCT
+    // Debug: print first few B1 neighbor lists after robust prune
+    {
+      using edge_list_t = typename graph_cfg_t::edge_list_t;
+      constexpr uint32_t dbg_limit = 5;
+      uint32_t n_print = std::min(batch_size, dbg_limit);
+      std::vector<edge_list_t> h_edges(n_print);
+      std::vector<uint8_t> h_ecounts(n_print);
+      cudaMemcpy(h_edges.data(), h_segs_b1[b1_seg].edges + b1_local,
+                 n_print * sizeof(edge_list_t), cudaMemcpyDeviceToHost);
+      cudaMemcpy(h_ecounts.data(), h_segs_b1[b1_seg].edge_counts + b1_local,
+                 n_print * sizeof(uint8_t), cudaMemcpyDeviceToHost);
+      std::printf("[B1 post-prune] b1_offset=%u\n", b1_batch_offset);
+      for (uint32_t i = 0; i < n_print; i++) {
+        std::printf("  vec %u (%u neighbors):", b1_batch_offset + i, (uint32_t)h_ecounts[i]);
+        for (uint32_t j = 0; j < h_ecounts[i]; j++)
+          std::printf(" (%u,%.3f)", h_edges[i].edges[j], h_edges[i].dist[j]);
+        std::printf("\n");
+      }
+    }
+#endif
 
     // Collect reverse edges from B1's updated neighbor lists.
     uint32_t total_slots = batch_size * R;
@@ -284,6 +336,33 @@ struct intermediate_graph {
             alpha);
 
     cudaDeviceSynchronize();
+
+#if JASPER_DEBUG_SCALE_CONSTRUCT
+    // Debug: print first few B2 neighbor lists after reverse edge insertion
+    {
+      using edge_list_t = typename graph_cfg_t::edge_list_t;
+      constexpr uint32_t dbg_limit = 5;
+      uint32_t b2_n_print = std::min((uint32_t)partitions[B2].n_vectors, dbg_limit);
+      if (b2_n_print > 0) {
+        std::vector<segment_t> h_segs_b2(partitions[B2].segments.begin(),
+                                         partitions[B2].segments.end());
+        std::vector<edge_list_t> h_edges(b2_n_print);
+        std::vector<uint8_t> h_ecounts(b2_n_print);
+        cudaMemcpy(h_edges.data(), h_segs_b2[0].edges,
+                   b2_n_print * sizeof(edge_list_t), cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_ecounts.data(), h_segs_b2[0].edge_counts,
+                   b2_n_print * sizeof(uint8_t), cudaMemcpyDeviceToHost);
+        uint32_t b2_offset = static_cast<uint32_t>(partitions[B2].global_offset);
+        std::printf("[B2 post-reverse] b2_offset=%u\n", b2_offset);
+        for (uint32_t i = 0; i < b2_n_print; i++) {
+          std::printf("  vec %u (%u neighbors):", b2_offset + i, (uint32_t)h_ecounts[i]);
+          for (uint32_t j = 0; j < h_ecounts[i]; j++)
+            std::printf(" (%u,%.3f)", h_edges[i].edges[j], h_edges[i].dist[j]);
+          std::printf("\n");
+        }
+      }
+    }
+#endif
   }
 
   // Merge two partitions together with our special sauce beam search + prune
@@ -355,6 +434,71 @@ struct intermediate_graph {
       }
     }
     partitions[B1].move_to(true);  // offload the last resident partition
+  }
+
+  __host__ graph<GRAPH_CFG> concat() {
+    using segment_t   = graph_segment<GRAPH_CFG>;
+    using data_t      = typename GRAPH_CFG::data_t;
+    using edge_list_t = typename GRAPH_CFG::edge_list_t;
+    using index_t     = typename GRAPH_CFG::index_t;
+    constexpr uint32_t VPS = graph<GRAPH_CFG>::vectors_per_segment;
+
+    index_t total_vectors = 0;
+    for (auto& p : partitions)
+      total_vectors += static_cast<index_t>(p.n_vectors);
+
+    uint32_t dim        = partitions[0].dim;
+    uint32_t padded_dim = vector_view<data_t>::pad(dim);
+
+    graph<GRAPH_CFG> result = graph<GRAPH_CFG>::allocate(dim, total_vectors, true);
+    result.n_vectors = total_vectors;
+    result.medoid    = partitions[0].medoid;  // partition 0 global_offset==0, already global
+
+    std::vector<segment_t> r_segs(result.segments.begin(), result.segments.end());
+
+    for (uint32_t s = 0; s < result.n_segments; s++) {
+      index_t seg_start    = static_cast<index_t>(s) * VPS;
+      r_segs[s].n_vectors  = std::min(static_cast<index_t>(VPS), total_vectors - seg_start);
+    }
+
+    for (auto& p : partitions) {
+      std::vector<segment_t> p_segs(p.segments.begin(), p.segments.end());
+
+      for (uint32_t ps = 0; ps < p.n_segments; ps++) {
+        segment_t& pseg = p_segs[ps];
+        if (pseg.n_vectors == 0) continue;
+
+        index_t first_g = p.global_offset + static_cast<index_t>(ps) * VPS;
+        index_t last_g  = first_g + pseg.n_vectors - 1;
+
+        uint32_t rs_first = graph<GRAPH_CFG>::segment_of(first_g);
+        uint32_t rs_last  = graph<GRAPH_CFG>::segment_of(last_g);
+
+        for (uint32_t rs = rs_first; rs <= rs_last; rs++) {
+          index_t r_seg_start_g = static_cast<index_t>(rs) * VPS;
+
+          index_t  copy_start_g = std::max(first_g, r_seg_start_g);
+          index_t  copy_end_g   = std::min(last_g + 1, r_seg_start_g + static_cast<index_t>(VPS));
+          uint32_t count        = static_cast<uint32_t>(copy_end_g - copy_start_g);
+
+          uint32_t src_off = static_cast<uint32_t>(copy_start_g - first_g);
+          uint32_t dst_off = static_cast<uint32_t>(copy_start_g - r_seg_start_g);
+
+          std::memcpy(r_segs[rs].edges       + dst_off,
+                      pseg.edges             + src_off,
+                      count * sizeof(edge_list_t));
+          std::memcpy(r_segs[rs].edge_counts + dst_off,
+                      pseg.edge_counts       + src_off,
+                      count * sizeof(uint8_t));
+          std::memcpy(r_segs[rs].vectors.data + static_cast<size_t>(dst_off) * padded_dim,
+                      pseg.vectors.data       + static_cast<size_t>(src_off) * padded_dim,
+                      static_cast<size_t>(count) * padded_dim * sizeof(data_t));
+        }
+      }
+    }
+
+    result.segments = thrust::device_vector<segment_t>(r_segs.begin(), r_segs.end());
+    return result;
   }
 
 };
