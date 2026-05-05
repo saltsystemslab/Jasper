@@ -511,6 +511,64 @@ struct graph {
     }
   };
 
+  __host__ double avg_degree() const {
+    if (n_vectors == 0) return 0.0;
+
+    std::vector<segment_t> h_segs(segments.begin(), segments.end());
+    uint64_t total = 0;
+
+    if (on_host) {
+      for (const auto& seg : h_segs) {
+        for (uint32_t i = 0; i < static_cast<uint32_t>(seg.n_vectors); i++)
+          total += seg.edge_counts[i];
+      }
+    } else {
+      for (const auto& seg : h_segs) {
+        uint32_t count = static_cast<uint32_t>(seg.n_vectors);
+        std::vector<uint8_t> h_counts(count);
+        cudaMemcpy(h_counts.data(), seg.edge_counts,
+                   count * sizeof(uint8_t), cudaMemcpyDeviceToHost);
+        for (uint8_t c : h_counts) total += c;
+      }
+    }
+
+    return static_cast<double>(total) / static_cast<double>(n_vectors);
+  }
+
+  // Dump neighbor lists to out. Iterates local indices [start, start+count).
+  // count=0 means all vectors. Prints global index = local + global_offset.
+  __host__ void dump_neighborhood(index_t start = 0, index_t count = 10,
+                                  std::ostream& out = std::cout) const {
+    index_t end = (count == 0) ? n_vectors
+                               : std::min(start + count, n_vectors);
+
+    std::vector<segment_t> h_segs(segments.begin(), segments.end());
+
+    for (index_t idx = start; idx < end; idx++) {
+      uint32_t    seg_id = segment_of(idx);
+      uint32_t    loc    = local_of(idx);
+      uint8_t     cnt;
+      edge_list_t el;
+
+      if (on_host) {
+        cnt = h_segs[seg_id].edge_counts[loc];
+        el  = h_segs[seg_id].edges[loc];
+      } else {
+        cudaMemcpy(&cnt, h_segs[seg_id].edge_counts + loc,
+                   sizeof(uint8_t), cudaMemcpyDeviceToHost);
+        cudaMemcpy(&el,  h_segs[seg_id].edges + loc,
+                   sizeof(edge_list_t), cudaMemcpyDeviceToHost);
+      }
+
+      out << "[" << (idx + global_offset) << "] ("
+          << static_cast<int>(cnt) << " neighbors):";
+      for (uint8_t j = 0; j < cnt; j++) {
+        out << "  " << el.edges[j];
+      }
+      out << "\n";
+    }
+  }
+
   // return a view that can be pass to kernel
   device_view view() const {
     return device_view{
