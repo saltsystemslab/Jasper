@@ -89,6 +89,10 @@ void construct(
   std::cout << "  concat: " << std::fixed << std::setprecision(3)
             << elapsed_s << " s" << std::endl;
 
+  std::cout << "  Average degree: " << g.avg_degree() << "\n";
+
+  //g.dump_neighborhood(0, 100);
+
   std::cout << "  Saving index to: " << index_out << std::endl;
   jasper::save_graph_to_file(g, index_out);
 

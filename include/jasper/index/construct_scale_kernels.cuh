@@ -70,7 +70,19 @@ __global__ void robust_prune_kernel_scale(
     data_t* cand_vec = nullptr;
     if      (b1_graph.is_valid(cand_id)) cand_vec = b1_graph.get_vector(cand_id);
     else if (b2_graph.is_valid(cand_id)) cand_vec = b2_graph.get_vector(cand_id);
-    else continue;
+    else {
+      // we cant prune this, but we need to keep it
+      if (threadIdx.x == 0) {
+        uint32_t slot = s_n_selected;
+        if (slot < R) {
+          s_selected[slot]      = cand_id;
+          s_selected_dist[slot] = cand_dist;
+          s_n_selected          = slot + 1;
+        }
+      }
+      __syncthreads();
+      continue;
+    };
 
     if (threadIdx.x == 0) s_pruned = false;
     __syncthreads();
@@ -255,7 +267,19 @@ __global__ void process_reverse_edges_kernel_scale(
       data_t* cand_vec = nullptr;
       if      (b1_graph.is_valid(cand_id)) cand_vec = b1_graph.get_vector(cand_id);
       else if (b2_graph.is_valid(cand_id)) cand_vec = b2_graph.get_vector(cand_id);
-      if (cand_vec == nullptr) continue;
+      if (cand_vec == nullptr) {
+        // we cant prune this, but we need to keep it
+        if (threadIdx.x == 0) {
+          uint32_t slot = s_n_selected;
+          if (slot < R) {
+            s_selected[slot]      = cand_id;
+            s_selected_dist[slot] = cand_dist;
+            s_n_selected          = slot + 1;
+          }
+        }
+        __syncthreads();
+        continue;
+      };
 
       if (threadIdx.x == 0) s_pruned = false;
       __syncthreads();

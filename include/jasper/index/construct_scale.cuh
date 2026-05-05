@@ -382,7 +382,11 @@ struct intermediate_graph {
       size_t cur_batch_size = std::min({(size_t)batch_size, n_vectors - count, (size_t)seg_remaining});
       merge_partition_batch(B1, B2, count, cur_batch_size, ws);
       count += cur_batch_size;
+      std::printf("\r[merge_partition] %u / %u (%.1f%%)", count, static_cast<unsigned int>(n_vectors),
+                100.0f * count / n_vectors);
+      std::fflush(stdout);
     }
+    std::printf("\n");
   }
 
   // Produce a merge order sequence and call merge_partition for each pair.
@@ -435,6 +439,13 @@ struct intermediate_graph {
         }
       }
     }
+
+    // for (size_t B2 = 1; B2 < P; B2++) {
+    //   partitions[B2].move_to(false);
+    //   merge_partition(B1, B2, batch_size, ws);
+    //   partitions[B2].move_to(true);
+    // }
+
     partitions[B1].move_to(true);  // offload the last resident partition
   }
 
