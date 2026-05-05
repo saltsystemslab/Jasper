@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include <chrono>
+#include <fstream>
 
 #include "jasper/jasper.cuh"
 
@@ -46,7 +47,8 @@ void construct(
     float              alpha,
     size_t             n_parts,
     size_t             workspace_budget,
-    size_t             n_vector_limit)
+    size_t             n_vector_limit,
+    const std::string& index_out)
 {
   // Load vectors into pinned host memory (padded rows)
   auto vecs = jasper::load_vectors_from_file<DataT>(filename);
@@ -87,8 +89,12 @@ void construct(
   std::cout << "  concat: " << std::fixed << std::setprecision(3)
             << elapsed_s << " s" << std::endl;
 
+  std::cout << "  Saving index to: " << index_out << std::endl;
+  jasper::save_graph_to_file(g, index_out);
+
   cudaFreeHost(vecs.data);
   for (auto& g : ig.partitions) g.deallocate();
+  g.deallocate();
 }
 
 template <typename DataT, jasper::distance_func Func>
@@ -107,13 +113,15 @@ void dispatch(
     float              alpha,
     size_t             n_parts,
     size_t             workspace_budget,
-    size_t             n_vector_limit)
+    size_t             n_vector_limit,
+    const std::string& index_out)
 {
   #define TRY_DISPATCH(id, IDX, R, DAT, DIST, FUNC)                           \
     if (config_matches<DAT, FUNC>(datatype, n_neighbors, distance, R)) {      \
       std::cout << "  Config: " #id << std::endl;                             \
-      construct<cfg_##id, construct_cfg_##id, DAT>(                  \
-          filename, alpha, n_parts, workspace_budget, n_vector_limit);  \
+      construct<cfg_##id, construct_cfg_##id, DAT>(                           \
+          filename, alpha, n_parts, workspace_budget, n_vector_limit,         \
+          index_out);                                                          \
       return;                                                                  \
     }
 
@@ -168,6 +176,10 @@ int main(int argc, char** argv) {
     .scan<'u', size_t>()
     .help("Limit the number of vectors read from file (0 = no limit).");
 
+  program.add_argument("--index_out", "-i")
+    .required()
+    .help("Output index filename.");
+
   try {
     program.parse_args(argc, argv);
   } catch (const std::exception& err) {
@@ -184,6 +196,7 @@ int main(int argc, char** argv) {
   auto n_parts          = program.get<size_t>("--n_parts");
   auto workspace_budget = program.get<size_t>("--workspace_budget");
   auto n_vector_limit   = program.get<size_t>("--n_vector");
+  auto index_out        = program.get<std::string>("--index_out");
 
   std::cout << "=== create_scale_index ===" << std::endl;
   std::cout << "  filename:         " << filename << std::endl;
@@ -196,10 +209,12 @@ int main(int argc, char** argv) {
             << (workspace_budget / (1024.0 * 1024.0 * 1024.0)) << " GB" << std::endl;
   if (n_vector_limit > 0)
     std::cout << "  n_vector:         " << n_vector_limit << " (limit)" << std::endl;
+  std::cout << "  index_out:        " << index_out << std::endl;
 
   try {
     dispatch(datatype, n_neighbors, distance,
-             filename, alpha, n_parts, workspace_budget, n_vector_limit);
+             filename, alpha, n_parts, workspace_budget, n_vector_limit,
+             index_out);
     std::cout << "  Done." << std::endl;
   } catch (const std::exception& err) {
     std::cerr << "Error: " << err.what() << std::endl;

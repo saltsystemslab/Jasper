@@ -377,7 +377,9 @@ struct intermediate_graph {
     size_t n_vectors = partitions[B1].n_vectors;
 
     while (count < n_vectors) {
-      size_t cur_batch_size = std::min((size_t)batch_size, n_vectors - count);
+      const uint32_t b1_local = graph<partition_graph_t>::local_of(count);
+      const uint32_t seg_remaining = graph<partition_graph_t>::vectors_per_segment - b1_local;
+      size_t cur_batch_size = std::min({(size_t)batch_size, n_vectors - count, (size_t)seg_remaining});
       merge_partition_batch(B1, B2, count, cur_batch_size, ws);
       count += cur_batch_size;
     }
