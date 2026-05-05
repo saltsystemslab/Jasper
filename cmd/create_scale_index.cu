@@ -45,11 +45,16 @@ void construct(
     const std::string& filename,
     float              alpha,
     size_t             n_parts,
-    size_t             workspace_budget)
+    size_t             workspace_budget,
+    size_t             n_vector_limit)
 {
   // Load vectors into pinned host memory (padded rows)
   auto vecs = jasper::load_vectors_from_file<DataT>(filename);
   if (!vecs.data) throw std::runtime_error("Failed to load vectors from: " + filename);
+
+  if (n_vector_limit > 0 && n_vector_limit < vecs.n_vectors) {
+    vecs.n_vectors = static_cast<uint32_t>(n_vector_limit);
+  }
 
   std::cout << "  Loaded " << vecs.n_vectors
             << " vectors, dim=" << vecs.dim << std::endl;
@@ -75,6 +80,13 @@ void construct(
   std::cout << "  merge: " << std::fixed << std::setprecision(3)
             << elapsed_s << " s" << std::endl;
 
+  t0 = std::chrono::steady_clock::now();
+  auto g = ig.concat();
+  t1 = std::chrono::steady_clock::now();
+  elapsed_s = std::chrono::duration<double>(t1 - t0).count();
+  std::cout << "  concat: " << std::fixed << std::setprecision(3)
+            << elapsed_s << " s" << std::endl;
+
   cudaFreeHost(vecs.data);
   for (auto& g : ig.partitions) g.deallocate();
 }
@@ -94,13 +106,14 @@ void dispatch(
     const std::string& filename,
     float              alpha,
     size_t             n_parts,
-    size_t             workspace_budget)
+    size_t             workspace_budget,
+    size_t             n_vector_limit)
 {
   #define TRY_DISPATCH(id, IDX, R, DAT, DIST, FUNC)                           \
     if (config_matches<DAT, FUNC>(datatype, n_neighbors, distance, R)) {      \
       std::cout << "  Config: " #id << std::endl;                             \
       construct<cfg_##id, construct_cfg_##id, DAT>(                  \
-          filename, alpha, n_parts, workspace_budget);  \
+          filename, alpha, n_parts, workspace_budget, n_vector_limit);  \
       return;                                                                  \
     }
 
@@ -150,6 +163,11 @@ int main(int argc, char** argv) {
     .help("Device memory budget for the construction workspace (e.g. 5GB, 200MB).")
     .action(parse_size);
 
+  program.add_argument("--n_vector")
+    .default_value(size_t{0})
+    .scan<'u', size_t>()
+    .help("Limit the number of vectors read from file (0 = no limit).");
+
   try {
     program.parse_args(argc, argv);
   } catch (const std::exception& err) {
@@ -165,6 +183,7 @@ int main(int argc, char** argv) {
   auto alpha            = program.get<float>("--alpha");
   auto n_parts          = program.get<size_t>("--n_parts");
   auto workspace_budget = program.get<size_t>("--workspace_budget");
+  auto n_vector_limit   = program.get<size_t>("--n_vector");
 
   std::cout << "=== create_scale_index ===" << std::endl;
   std::cout << "  filename:         " << filename << std::endl;
@@ -175,10 +194,12 @@ int main(int argc, char** argv) {
   std::cout << "  n_parts:          " << n_parts << std::endl;
   std::cout << "  workspace_budget: "
             << (workspace_budget / (1024.0 * 1024.0 * 1024.0)) << " GB" << std::endl;
+  if (n_vector_limit > 0)
+    std::cout << "  n_vector:         " << n_vector_limit << " (limit)" << std::endl;
 
   try {
     dispatch(datatype, n_neighbors, distance,
-             filename, alpha, n_parts, workspace_budget);
+             filename, alpha, n_parts, workspace_budget, n_vector_limit);
     std::cout << "  Done." << std::endl;
   } catch (const std::exception& err) {
     std::cerr << "Error: " << err.what() << std::endl;
