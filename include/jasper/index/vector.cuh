@@ -1,6 +1,7 @@
 #pragma once
 
 #include <fstream>
+#include <sstream>
 
 namespace jasper {
 
@@ -31,11 +32,14 @@ struct __align__(16) vector_view {
     view.n_vectors = n_vectors;
     view.on_host = on_host;
     size_t bytes = view.size_bytes();
+    cudaError_t err;
     if (on_host) {
-      cudaMallocHost(&view.data, bytes);
+      err = cudaMallocHost(&view.data, bytes);
     } else {
-      cudaMalloc(&view.data, bytes);
+      err = cudaMalloc(&view.data, bytes);
     }
+    if (err != cudaSuccess)
+      throw std::runtime_error(std::string("vector_view::allocate failed: ") + cudaGetErrorString(err));
     return view;
   }
 
@@ -86,6 +90,27 @@ struct __align__(16) vector_view {
     }
 
     return {d_data, dim, padded_dim, n_vectors, false};
+  }
+
+  // Copy this view's data into an already-allocated target view.
+  // Target must have matching dim/padded_dim and capacity >= n_vectors.
+  // Memcpy direction is inferred from each side's on_host flag.
+  __host__ void copy_to(vector_view<DATA_T>& target, cudaStream_t stream = 0) const {
+    if (target.dim != dim || target.padded_dim != padded_dim) {
+      throw std::runtime_error("vector_view::copy_to: dim/padded_dim mismatch");
+    }
+    if (target.n_vectors < n_vectors) {
+      throw std::runtime_error("vector_view::copy_to: target capacity too small");
+    }
+
+    cudaMemcpyKind kind;
+    if      ( on_host &&  target.on_host) kind = cudaMemcpyHostToHost;
+    else if ( on_host && !target.on_host) kind = cudaMemcpyHostToDevice;
+    else if (!on_host &&  target.on_host) kind = cudaMemcpyDeviceToHost;
+    else                                  kind = cudaMemcpyDeviceToDevice;
+
+    size_t bytes = sizeof(DATA_T) * static_cast<size_t>(n_vectors) * padded_dim;
+    cudaMemcpyAsync(target.data, data, bytes, kind, stream);
   }
 
   // Copy this view's data to pinned host memory, return a new view.

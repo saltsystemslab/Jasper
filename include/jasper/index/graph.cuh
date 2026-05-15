@@ -71,14 +71,19 @@ struct graph_segment {
     seg.n_vectors = 0;
     seg.on_host = on_host;
 
+    auto check = [](cudaError_t err, const char* name) {
+      if (err != cudaSuccess)
+        throw std::runtime_error(std::string(name) + " failed: " + cudaGetErrorString(err));
+    };
+
     if (on_host) {
-        cudaMallocHost(&seg.edges, max_vectors * sizeof(edge_list_t));
-        cudaMallocHost(&seg.edge_counts, max_vectors * sizeof(uint8_t));
+        check(cudaMallocHost(&seg.edges, max_vectors * sizeof(edge_list_t)), "cudaMallocHost(edges)");
+        check(cudaMallocHost(&seg.edge_counts, max_vectors * sizeof(uint8_t)), "cudaMallocHost(edge_counts)");
         std::memset(seg.edge_counts, 0, max_vectors * sizeof(uint8_t));
     } else {
-        cudaMalloc(&seg.edges, max_vectors * sizeof(edge_list_t));
-        cudaMalloc(&seg.edge_counts, max_vectors * sizeof(uint8_t));
-        cudaMemset(seg.edge_counts, 0, max_vectors * sizeof(uint8_t));
+        check(cudaMalloc(&seg.edges, max_vectors * sizeof(edge_list_t)), "cudaMalloc(edges)");
+        check(cudaMalloc(&seg.edge_counts, max_vectors * sizeof(uint8_t)), "cudaMalloc(edge_counts)");
+        check(cudaMemset(seg.edge_counts, 0, max_vectors * sizeof(uint8_t)), "cudaMemset(edge_counts)");
     }
 
     seg.vectors = vector_view_t::allocate(dim, max_vectors, on_host);
@@ -159,11 +164,45 @@ struct graph_segment {
     on_host     = target_on_host;
   }
 
+  // Copy this segment's live data (edges, edge_counts, vectors) into an
+  // already-allocated target segment. Memcpy direction is inferred from
+  // each side's on_host flag. Only the valid [0, n_vectors) prefix is copied.
+  // Caller is responsible for synchronizing the stream before reading target.
+  void copy_to(graph_segment& target, cudaStream_t stream = 0) const {
+    using data_t = typename graph_cfg::data_t;
+
+    if (target.vectors.dim != vectors.dim) {
+      throw std::runtime_error("graph_segment::copy_to: dim mismatch");
+    }
+
+    const cudaMemcpyKind kind = [&]{
+      if      ( on_host &&  target.on_host) return cudaMemcpyHostToHost;
+      else if ( on_host && !target.on_host) return cudaMemcpyHostToDevice;
+      else if (!on_host &&  target.on_host) return cudaMemcpyDeviceToHost;
+      else                                  return cudaMemcpyDeviceToDevice;
+    }();
+
+    target.n_vectors = n_vectors;
+
+    if (n_vectors > 0) {
+      const uint32_t padded_dim = vector_view_t::pad(vectors.dim);
+      cudaMemcpyAsync(target.edges, edges,
+                      static_cast<size_t>(n_vectors) * sizeof(edge_list_t),
+                      kind, stream);
+      cudaMemcpyAsync(target.edge_counts, edge_counts,
+                      static_cast<size_t>(n_vectors) * sizeof(uint8_t),
+                      kind, stream);
+      cudaMemcpyAsync(target.vectors.data, vectors.data,
+                      static_cast<size_t>(n_vectors) * padded_dim * sizeof(data_t),
+                      kind, stream);
+    }
+  }
+
   // Device side read.
   // Note: not concurrent safe.
   //       our construction algorithm handles accesses externally.
 
-  // TODO: Currently, to write the neighbor list and vectors, we need to get their 
+  // TODO: Currently, to write the neighbor list and vectors, we need to get their
   //       mutable references. I don't really like that. --Zikun
 
   __device__ __forceinline__
@@ -257,6 +296,18 @@ struct graph {
     g.medoid = 0;
     g.n_segments = (n_vector_slots+vectors_per_segment-1)/vectors_per_segment;
     g.on_host = on_host;
+
+    const size_t padded_dim = vector_view_t::pad(dim);
+    const size_t bytes_per_segment =
+        static_cast<size_t>(vectors_per_segment) * sizeof(edge_list_t)
+      + static_cast<size_t>(vectors_per_segment) * sizeof(uint8_t)
+      + static_cast<size_t>(vectors_per_segment) * padded_dim * sizeof(data_t);
+    const size_t total_bytes = bytes_per_segment * g.n_segments;
+    std::cout << "[graph::allocate]: " << g.n_segments << " segments x "
+              << (bytes_per_segment / (1ull << 20)) << " MB = "
+              << (total_bytes / (1ull << 20)) << " MB ("
+              << (total_bytes / (1ull << 30)) << " GB) on "
+              << (on_host ? "host" : "device") << "\n";
 
     std::vector<segment_t> h_segments(g.n_segments);
     for (uint32_t i = 0; i < g.n_segments; i++) {
@@ -393,6 +444,39 @@ struct graph {
     // Re-upload segments with their new pointers.
     segments = thrust::device_vector<segment_t>(h_segments.begin(), h_segments.end());
     on_host  = target_on_host;
+
+    cudaDeviceSynchronize();
+  }
+
+  // Copy this graph's contents (segments + medoid metadata) into an
+  // already-allocated target graph. The target may live on host or device,
+  // independent of this graph. Target must have matching dim and at least
+  // n_segments segment slots.
+  void copy_to(graph& target) const {
+    if (target.dim != dim) {
+      throw std::runtime_error("graph::copy_to: dim mismatch");
+    }
+    if (target.n_segments < n_segments) {
+      throw std::runtime_error("graph::copy_to: target has too few segments");
+    }
+
+    std::vector<segment_t> h_src(segments.begin(), segments.end());
+    std::vector<segment_t> h_tgt(target.segments.begin(), target.segments.end());
+
+    cudaStream_t stream;
+    cudaStreamCreate(&stream);
+    for (uint32_t i = 0; i < n_segments; i++) {
+      h_src[i].copy_to(h_tgt[i], stream);
+    }
+    cudaStreamSynchronize(stream);
+    cudaStreamDestroy(stream);
+
+    target.n_vectors     = n_vectors;
+    target.medoid        = medoid;
+    target.global_offset = global_offset;
+
+    // Re-upload target segments so device-side structs see the updated n_vectors.
+    target.segments = thrust::device_vector<segment_t>(h_tgt.begin(), h_tgt.end());
 
     cudaDeviceSynchronize();
   }
