@@ -26,6 +26,17 @@
 JASPER_FOR_EACH_CONFIG(DECLARE_CONFIGS)
 #undef DECLARE_CONFIGS
 
+void print_available_memory() {
+  size_t free_byte, total_byte;
+  cudaMemGetInfo(&free_byte, &total_byte);
+  
+  double free_db = (double)free_byte / (1024 * 1024);
+  double total_db = (double)total_byte / (1024 * 1024);
+  
+  printf("GPU memory usage: used = %f MB, free = %f MB, total = %f MB\n", 
+          total_db - free_db, free_db, total_db);
+}
+
 // Parse human-readable sizes: "5GB", "200MB", etc.
 size_t parse_size(const std::string& value) {
   size_t pos = 0;
@@ -75,12 +86,16 @@ void construct(
   std::cout << "  allocate_and_construct: " << std::fixed << std::setprecision(3)
             << elapsed_s << " s" << std::endl;
 
+  print_available_memory();
+
   t0 = std::chrono::steady_clock::now();
   ig.merge();
   t1 = std::chrono::steady_clock::now();
   elapsed_s = std::chrono::duration<double>(t1 - t0).count();
   std::cout << "  merge: " << std::fixed << std::setprecision(3)
             << elapsed_s << " s" << std::endl;
+
+  print_available_memory();
 
   t0 = std::chrono::steady_clock::now();
   auto g = ig.concat();

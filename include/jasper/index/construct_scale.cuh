@@ -21,8 +21,7 @@ namespace jasper {
 // Calculate the partition size that fits two partitions within the given memory budget.
 // Formula: partition_size * (index_size_per_vec + workspace_size_per_vec) * 2 < budget_bytes
 // index_size_per_vec  = edge storage + vector data per node
-// workspace_size_per_vec = per-element construction workspace cost (same accounting as
-//                          graph_construct_workspace::max_batch_size_for_budget)
+// workspace_size_per_vec = per-element construction workspace cost 
 template <typename GRAPH_CONSTRUCT_CONFIG>
 __host__ size_t estimate_partition_size_for_budget(size_t budget_bytes, uint32_t dim) {
   using graph_cfg_t = typename GRAPH_CONSTRUCT_CONFIG::graph_cfg_t;
@@ -152,8 +151,8 @@ struct intermediate_graph {
   }
 
   __host__ void merge_partition_batch(
-    size_t B1,
-    size_t B2,
+    partition_graph_t &B1_graph,
+    partition_graph_t &B2_graph,
     uint32_t count,
     uint32_t batch_size,
     graph_construct_workspace<GRAPH_CONSTRUCT_CONFIG>& ws
@@ -165,7 +164,7 @@ struct intermediate_graph {
     constexpr uint32_t R          = GRAPH_CONSTRUCT_CONFIG::R;
     constexpr uint32_t max_result = GRAPH_CONSTRUCT_CONFIG::beam_search_max_result_size;
     uint32_t max_candidates = max_result + R;
-    uint32_t dim = partitions[B1].dim;
+    uint32_t dim = B1_graph.dim;
 
     constexpr uint32_t BLOCK_SIZE = GRAPH_CONSTRUCT_CONFIG::block_size;
     constexpr uint32_t TILE_SIZE  = GRAPH_CONSTRUCT_CONFIG::tile_size;
@@ -183,16 +182,16 @@ struct intermediate_graph {
     // Beam search: B1 batch queries → B2 graph.
     // The batch lies within one segment because partition_size <= vectors_per_segment.
     using segment_t = graph_segment<graph_cfg_t>;
-    std::vector<segment_t> h_segs_b1(partitions[B1].segments.begin(),
-                                     partitions[B1].segments.end());
+    std::vector<segment_t> h_segs_b1(B1_graph.segments.begin(),
+                                     B1_graph.segments.end());
     const uint32_t b1_seg   = graph<graph_cfg_t>::segment_of(count);
     const uint32_t b1_local = graph<graph_cfg_t>::local_of(count);
     auto query_view = h_segs_b1[b1_seg].vectors.subview(b1_local, batch_size);
 
     beam_search_params<beam_search_cfg> bp {
-      .graph         = partitions[B2],
+      .graph         = B2_graph,
       .query_vectors = query_view,
-      .medoid        = partitions[B2].medoid,
+      .medoid        = B2_graph.medoid,
       .k             = L,
       .beam_width    = L,
       .limit         = GRAPH_CONSTRUCT_CONFIG::BEAM_SEARCH_LIMIT,
@@ -229,9 +228,9 @@ struct intermediate_graph {
     }
 #endif
 
-    uint32_t b1_batch_offset = static_cast<uint32_t>(partitions[B1].global_offset) + count;
-    auto b1_view = partitions[B1].view();
-    auto b2_view = partitions[B2].view();
+    uint32_t b1_batch_offset = static_cast<uint32_t>(B1_graph.global_offset) + count;
+    auto b1_view = B1_graph.view();
+    auto b2_view = B2_graph.view();
 
     // Merge beam-search results into B1's candidate list.
     merge_candidates_kernel<GRAPH_CONSTRUCT_CONFIG, TILE_SIZE, BLOCK_SIZE>
@@ -368,19 +367,19 @@ struct intermediate_graph {
   // Merge two partitions together with our special sauce beam search + prune
   // Here we assume that both partitions are already loaded onto device memory.
   __host__ void merge_partition(
-    size_t B1,
-    size_t B2,
+    partition_graph_t &B1_graph,
+    partition_graph_t &B2_graph,
     uint32_t batch_size,
     graph_construct_workspace<GRAPH_CONSTRUCT_CONFIG>& ws
   ) {
     uint32_t count = 0;
-    size_t n_vectors = partitions[B1].n_vectors;
+    size_t n_vectors = B1_graph.n_vectors;
 
     while (count < n_vectors) {
       const uint32_t b1_local = graph<partition_graph_t>::local_of(count);
       const uint32_t seg_remaining = graph<partition_graph_t>::vectors_per_segment - b1_local;
       size_t cur_batch_size = std::min({(size_t)batch_size, n_vectors - count, (size_t)seg_remaining});
-      merge_partition_batch(B1, B2, count, cur_batch_size, ws);
+      merge_partition_batch(B1_graph, B2_graph, count, cur_batch_size, ws);
       count += cur_batch_size;
       std::printf("\r[merge_partition] %u / %u (%.1f%%)", count, static_cast<unsigned int>(n_vectors),
                 100.0f * count / n_vectors);
@@ -402,15 +401,26 @@ struct intermediate_graph {
     uint32_t batch_size =
         graph_construct_workspace<GRAPH_CONSTRUCT_CONFIG>::max_batch_size_for_budget(
             workspace_budget_per_partition);
-    batch_size = batch_size * 2; // we can fit two
+    std::cout << "[merge] allocating workspace." << std::endl;
     auto ws = graph_construct_workspace<GRAPH_CONSTRUCT_CONFIG>::allocate(batch_size);
+    std::cout << "[merge] Finished allocating workspace." << std::endl;
 
     const size_t P = n_partitions;
     const size_t total_pairs = P * (P - 1) / 2;
     size_t B1 = 0;
     size_t merge_count = 0;
 
-    partitions[B1].move_to(false); // move to device 
+    std::cout << "[merge] allocating device memory graphs." << std::endl;
+    partition_graph_t B1_graph = partition_graph_t::allocate(
+      partitions[B1].dim, partitions[B1].n_vectors, false);
+    partition_graph_t B2_graph = partition_graph_t::allocate(
+      partitions[B1].dim, partitions[B1].n_vectors, false);
+    std::cout << "[merge] Finished allocating device memory graphs." << std::endl;
+
+    partition_graph_t* resident = &B1_graph;
+    partition_graph_t* incoming = &B2_graph;
+
+    partitions[B1].copy_to(*resident);
 
     for (size_t itv = 1; itv <= P / 2; ++itv) {
       const size_t g = std::gcd(itv, P);
@@ -421,32 +431,29 @@ struct intermediate_graph {
       for (size_t cycle_idx = 0; cycle_idx < g; ++cycle_idx) {
         if (cycle_idx > 0) {
           // move old B1 to host
-          partitions[B1].move_to(true);
+          resident->copy_to(partitions[B1]);
           // Switch residue class. (old_B1, new_B1) was already merged
           // at itv=1, so no merge call here -- just slide B1.
           B1 = (B1 + 1) % P;
           // move new B1 to device
-          partitions[B1].move_to(false);
+          partitions[B1].copy_to(*resident);
         }
         for (size_t step = 0; step < calls_per_cycle; ++step) {
           const size_t B2 = (B1 + itv) % P;
-          partitions[B2].move_to(false);
+          partitions[B2].copy_to(*incoming);
           std::printf("[merge] %zu / %zu: partitions %zu, %zu (itv=%zu)\n",
                       ++merge_count, total_pairs, B1, B2, itv);
-          merge_partition(B1, B2, batch_size, ws);
-          partitions[B1].move_to(true);
+          merge_partition(*resident, *incoming, batch_size, ws);
+          resident->copy_to(partitions[B1]);
+
+          using std::swap;
           B1 = B2;
+          swap(resident, incoming); 
         }
       }
     }
 
-    // for (size_t B2 = 1; B2 < P; B2++) {
-    //   partitions[B2].move_to(false);
-    //   merge_partition(B1, B2, batch_size, ws);
-    //   partitions[B2].move_to(true);
-    // }
-
-    partitions[B1].move_to(true);  // offload the last resident partition
+    resident->copy_to(partitions[B1]); // offload the last resident partition
   }
 
   __host__ graph<GRAPH_CFG> concat() {
