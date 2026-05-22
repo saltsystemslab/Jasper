@@ -14,4 +14,5 @@
 #include "jasper/rabitq/distance.cuh"
 #include "jasper/rabitq/layout.cuh"
 #include "jasper/rabitq/quantize.cuh"
-#include "jasper/rabitq/rotation.cuh"
+
+#include "jasper/rotation/rotation.cuh"
