@@ -3,6 +3,8 @@
 #include <cstdlib>
 #include <cstdint>
 #include <iostream>
+#include <type_traits>
+#include <vector>
 
 #include <cooperative_groups.h>
 
@@ -18,6 +20,7 @@
 #include "jasper/index/vector.cuh"
 #include "jasper/beam_search/beam_search.cuh"
 #include "jasper/index/utils.cuh"
+#include "jasper/rotation/rotation.cuh"
 
 namespace cg = cooperative_groups;
 
@@ -75,6 +78,12 @@ struct graph_construct_params {
 
   // Is the final graph on host
   bool on_host = false;
+
+  // Prerotate the dataset
+  bool prerotate = false;
+
+  // Prerotate seed
+  uint32_t prerotate_seed = 440;
 };
 
 template <typename INDEX_T>
@@ -960,6 +969,94 @@ __host__ graph<typename CONSTRUCT_GRAPH_CONFIG::graph_cfg_t> construct_graph(
         std::string("CUDA error in construct_graph at ") + name + ": " + err_str);
     }
   };
+
+  // Replace each row v of params.data_vectors with v * P, where P is a
+  // random orthogonal matrix seeded by params.prerotate_seed.
+  if (params.prerotate) {
+    using data_t = typename graph_cfg_t::data_t;
+    static_assert(std::is_same<data_t, __half>::value,
+                  "prerotate requires __half (f16) data_t");
+
+    uint32_t padded_dim = params.data_vectors.padded_dim;
+
+    // Build rotation matrix as float (QR needs float), then cast to __half.
+    std::vector<float> h_P_f(static_cast<size_t>(vector_dim) * vector_dim);
+    std::vector<float> h_Pt_f(static_cast<size_t>(vector_dim) * vector_dim);
+    set_rotation_matrix(vector_dim, h_P_f.data(), h_Pt_f.data(),
+                        params.prerotate_seed);
+
+    std::vector<__half> h_P(h_P_f.size());
+    for (size_t i = 0; i < h_P.size(); ++i) {
+      h_P[i] = static_cast<__half>(h_P_f[i]);
+    }
+
+    size_t P_bytes = sizeof(__half) * vector_dim * vector_dim;
+    __half* d_P = nullptr;
+    check_cuda(cudaMalloc(&d_P, P_bytes), "cudaMalloc d_P (prerotate)");
+    check_cuda(cudaMemcpy(d_P, h_P.data(), P_bytes, cudaMemcpyHostToDevice),
+               "cudaMemcpy d_P (prerotate)");
+
+    size_t data_bytes =
+        sizeof(__half) * static_cast<size_t>(n_vectors) * padded_dim;
+    const bool input_on_host = params.data_vectors.on_host;
+    __half* d_in = nullptr;
+    if (input_on_host) {
+      check_cuda(cudaMalloc(&d_in, data_bytes),
+                 "cudaMalloc d_in (prerotate)");
+      check_cuda(cudaMemcpy(d_in, params.data_vectors.data, data_bytes,
+                            cudaMemcpyHostToDevice),
+                 "cudaMemcpy data to device (prerotate)");
+    } else {
+      d_in = params.data_vectors.data;
+    }
+
+    // Zero d_out so the row pad lanes stay zero: cublas only writes the
+    // first vector_dim rows of each column when ldc = padded_dim.
+    __half* d_out = nullptr;
+    check_cuda(cudaMalloc(&d_out, data_bytes),
+               "cudaMalloc d_out (prerotate)");
+    check_cuda(cudaMemsetAsync(d_out, 0, data_bytes, stream),
+               "cudaMemset d_out (prerotate)");
+
+    // Same orientation trick as rotate_data_vec in rotation.cuh, but with
+    // stride = padded_dim to skip row pad lanes. Uses __half I/O with FP32
+    // accumulation for accuracy.
+    cublasHandle_t handle;
+    cublasCreate(&handle);
+    cublasSetStream(handle, stream);
+    const float one = 1.0f, zero = 0.0f;
+    cublasStatus_t stat = cublasGemmEx(
+        handle,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        vector_dim,
+        n_vectors,
+        vector_dim,
+        &one,
+        d_P,  CUDA_R_16F, vector_dim,
+        d_in, CUDA_R_16F, padded_dim,
+        &zero,
+        d_out, CUDA_R_16F, padded_dim,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT);
+    cublasDestroy(handle);
+    if (stat != CUBLAS_STATUS_SUCCESS) {
+      cudaFree(d_out);
+      cudaFree(d_P);
+      if (input_on_host) cudaFree(d_in);
+      throw std::runtime_error(
+          "cublasGemmEx failed during prerotate: status=" +
+          std::to_string(stat));
+    }
+
+    cudaMemcpyKind kind =
+        input_on_host ? cudaMemcpyDeviceToHost : cudaMemcpyDeviceToDevice;
+    check_cuda(cudaMemcpy(params.data_vectors.data, d_out, data_bytes, kind),
+               "cudaMemcpy rotated data back (prerotate)");
+
+    cudaFree(d_out);
+    cudaFree(d_P);
+    if (input_on_host) cudaFree(d_in);
+  }
 
   // allocate a graph with only vector populated.
   graph_t g = graph_t::allocate_and_load(params.data_vectors, params.on_host);
