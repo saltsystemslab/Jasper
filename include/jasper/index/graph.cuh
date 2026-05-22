@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <vector>
 
+#include <cuda_bf16.h>
 #include <thrust/device_vector.h>
 
 #include "jasper/distance/distance.cuh"
@@ -15,7 +16,7 @@ namespace jasper {
 template <typename INDEX_T, uint32_t N_NEIGHBORS>
 struct edge_list {
   INDEX_T edges[N_NEIGHBORS];
-  float dist[N_NEIGHBORS];
+  __nv_bfloat16 dist[N_NEIGHBORS];
 
   __host__ __device__ INDEX_T& operator[](uint32_t i) { return edges[i]; }
   __host__ __device__ const INDEX_T& operator[](uint32_t i) const { return edges[i]; }
@@ -234,7 +235,7 @@ struct graph_segment {
   float get_neighbor_dist(uint32_t local_idx, uint8_t neighbor_idx) const {
     assert(local_idx < static_cast<uint32_t>(n_vectors));
     assert(neighbor_idx < edge_counts[local_idx]);
-    return edges[local_idx].dist[neighbor_idx];
+    return __bfloat162float(edges[local_idx].dist[neighbor_idx]);
   }
 
   // mutable reference
@@ -266,7 +267,7 @@ struct graph_segment {
   void set_neighbor_dist(uint32_t local_idx, uint8_t neighbor_idx, float dist_val) {
     assert(local_idx < static_cast<uint32_t>(n_vectors));
     assert(neighbor_idx < n_neighbors);
-    edges[local_idx].dist[neighbor_idx] = dist_val;
+    edges[local_idx].dist[neighbor_idx] = (__nv_bfloat16)dist_val;
   }
 };
 
