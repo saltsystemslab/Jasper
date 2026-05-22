@@ -21,24 +21,20 @@ class DistanceFunc(str, Enum):
 
 
 class DataType(str, Enum):
-    FLOAT32 = "f32"
-    UINT8 = "u8"
+    FLOAT16 = "f16"
 
 
 # ── Config registry (must match JASPER_FOR_EACH_CONFIG in C++) ──
+# Index storage is __half; callers must pass torch.float16 tensors.
 _CONFIGS: dict[tuple[DataType, int, DistanceFunc], str] = {
-    (DataType.FLOAT32, 32,  DistanceFunc.L2):             "f32_r32_l2",
-    (DataType.FLOAT32, 64,  DistanceFunc.L2):             "f32_r64_l2",
-    (DataType.FLOAT32, 128, DistanceFunc.L2):             "f32_r128_l2",
-    (DataType.FLOAT32, 32,  DistanceFunc.INNER_PRODUCT):  "f32_r32_ip",
-    (DataType.FLOAT32, 64,  DistanceFunc.INNER_PRODUCT):  "f32_r64_ip",
-    (DataType.UINT8,   32,  DistanceFunc.L2):             "u8_r32_l2",
-    (DataType.UINT8,   64,  DistanceFunc.L2):             "u8_r64_l2",
+    (DataType.FLOAT16, 32,  DistanceFunc.L2):             "f16_r32_l2",
+    (DataType.FLOAT16, 64,  DistanceFunc.L2):             "f16_r64_l2",
+    (DataType.FLOAT16, 32,  DistanceFunc.INNER_PRODUCT):  "f16_r32_ip",
+    (DataType.FLOAT16, 64,  DistanceFunc.INNER_PRODUCT):  "f16_r64_ip",
 }
 
 _DTYPE_MAP = {
-    DataType.FLOAT32: torch.float32,
-    DataType.UINT8: torch.uint8,
+    DataType.FLOAT16: torch.float16,
 }
 
 
@@ -140,7 +136,7 @@ class Graph:
         path: str,
         dim: int,
         n_neighbors: int = 32,
-        data_type: DataType | str = DataType.FLOAT32,
+        data_type: DataType | str = DataType.FLOAT16,
         distance: DistanceFunc | str = DistanceFunc.L2,
         on_host: bool = False,
     ) -> "Graph":
@@ -151,7 +147,7 @@ class Graph:
             path:         Path to the graph binary file.
             dim:          Dimensionality of the vectors.
             n_neighbors:  Max neighbors per node (must match file).
-            data_type:    Vector data type: "f32" or "u8".
+            data_type:    Vector data type: "f16".
             distance:     Distance function: "l2" or "ip".
             on_host:      Load the graph on host memory.
         """
@@ -218,14 +214,12 @@ class Graph:
         dim = vectors.size(1)
 
         # Infer data type from tensor dtype
-        if vectors.dtype == torch.float32:
-            data_type = DataType.FLOAT32
-        elif vectors.dtype == torch.uint8:
-            data_type = DataType.UINT8
+        if vectors.dtype == torch.float16:
+            data_type = DataType.FLOAT16
         else:
             raise ValueError(
                 f"Unsupported tensor dtype: {vectors.dtype}. "
-                f"Use torch.float32 or torch.uint8."
+                f"Use torch.float16."
             )
 
         config_id = _resolve_config(data_type, n_neighbors, distance)
@@ -351,8 +345,14 @@ class Graph:
 # ── Utils ───────────────────────────────────────────────────────
 
 def read_bin(path: str, dtype: str = "f32", max_vectors: int = 0) -> torch.Tensor:
-    np_dtype = np.float32 if dtype == "f32" else np.uint8
-    torch_dtype = torch.float32 if dtype == "f32" else torch.uint8
+    """Read a [n, dim] binary file (f32 or u8 on disk) and return a
+    pinned torch.float16 tensor."""
+    if dtype == "f32":
+        np_dtype = np.float32
+    elif dtype == "u8":
+        np_dtype = np.uint8
+    else:
+        raise ValueError(f"Unsupported dtype: {dtype!r}. Expected 'f32' or 'u8'.")
 
     with open(path, "rb") as f:
         n_vectors, dim = struct.unpack("II", f.read(8))
@@ -361,9 +361,7 @@ def read_bin(path: str, dtype: str = "f32", max_vectors: int = 0) -> torch.Tenso
         nbytes = n_vectors * dim * np.dtype(np_dtype).itemsize
         data = np.frombuffer(f.read(nbytes), dtype=np_dtype).reshape(n_vectors, dim).copy()
 
-    # the returned data is on page-locked host memory.
-    # return torch.from_numpy(data).to(device="cuda", dtype=torch_dtype)
-    return torch.from_numpy(data).pin_memory()
+    return torch.from_numpy(data).to(torch.float16).pin_memory()
 
 def read_groundtruth(path: str, k: int = 10) -> tuple[torch.Tensor, torch.Tensor]:
     """

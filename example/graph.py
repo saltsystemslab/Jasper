@@ -36,7 +36,7 @@ def main():
 
     print("Loading vectors")
     vectors = jasper.read_bin(args.vectors, args.dtype)
-    print(f"Loaded {len(vectors)} vectors.")
+    print(f"Loaded {len(vectors)} vectors. (type={type(vectors)})")
 
     print("Start build graph")
     start = time.perf_counter()
