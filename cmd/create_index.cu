@@ -1,23 +1,20 @@
 #include <argparse/argparse.hpp>
 #include <iostream>
 #include <iomanip>
-#include <fstream>
 #include <string>
 #include <vector>
 #include <cstdint>
 #include <stdexcept>
+#include <cuda_fp16.h>
 
 #include "jasper/jasper.cuh"
 
 // (CONFIG_ID, INDEX_T, N_NEIGHBORS, DATA_T, DISTANCE_T, DIST_FUNC)
 #define JASPER_FOR_EACH_CONFIG(X)                                              \
-  X(f32_r32_l2,   uint32_t, 32,  float,   float, jasper::distance_func::L2)             \
-  X(f32_r64_l2,   uint32_t, 64,  float,   float, jasper::distance_func::L2)             \
-  X(f32_r128_l2,  uint32_t, 128, float,   float, jasper::distance_func::L2)             \
-  X(f32_r32_ip,   uint32_t, 32,  float,   float, jasper::distance_func::INNER_PRODUCT)  \
-  X(f32_r64_ip,   uint32_t, 64,  float,   float, jasper::distance_func::INNER_PRODUCT)  \
-  X(u8_r32_l2,    uint32_t, 32,  uint8_t, float, jasper::distance_func::L2)             \
-  X(u8_r64_l2,    uint32_t, 64,  uint8_t, float, jasper::distance_func::L2)
+  X(f16_r32_l2,   uint32_t, 32,  __half,   float, jasper::distance_func::L2)             \
+  X(f16_r64_l2,   uint32_t, 64,  __half,   float, jasper::distance_func::L2)             \
+  X(f16_r32_ip,   uint32_t, 32,  __half,   float, jasper::distance_func::INNER_PRODUCT)  \
+  X(f16_r64_ip,   uint32_t, 64,  __half,   float, jasper::distance_func::INNER_PRODUCT)
 
 // Graph + construct config types
 #define DECLARE_CONFIGS(id, IDX, R, DAT, DIST, FUNC)                           \
@@ -29,47 +26,44 @@ JASPER_FOR_EACH_CONFIG(DECLARE_CONFIGS)
 
 template <typename GraphCfg, typename ConstructCfg, typename DataT>
 void construct_and_save(const std::string& filename,
+                        const std::string& src_dtype,
                         uint32_t dim,
                         float alpha,
                         size_t workspace_budget_bytes,
                         const std::string& index_out) {
-  // Read vectors from file (format: [n_vectors: u32][dim: u32][data])
-  std::ifstream fin(filename, std::ios::binary);
-  if (!fin) throw std::runtime_error("Cannot open file: " + filename);
+  // Load vectors from file as the user-specified source dtype and cast to
+  // DataT (__half) on host.
+  jasper::vector_view<DataT> h_vecs;
+  if (src_dtype == "float") {
+    h_vecs = jasper::load_vectors_from_file_cast<DataT, float>(filename);
+  } else if (src_dtype == "uint8") {
+    h_vecs = jasper::load_vectors_from_file_cast<DataT, uint8_t>(filename);
+  } else {
+    throw std::runtime_error("Unsupported source dtype: " + src_dtype);
+  }
+  if (!h_vecs.data)
+    throw std::runtime_error("Failed to load vectors from: " + filename);
 
-  uint32_t n_vectors, file_dim;
-  fin.read(reinterpret_cast<char*>(&n_vectors), sizeof(n_vectors));
-  fin.read(reinterpret_cast<char*>(&file_dim), sizeof(file_dim));
-
-  if (file_dim != dim)
+  if (h_vecs.dim != dim)
     throw std::runtime_error(
-      "File dim=" + std::to_string(file_dim) +
+      "File dim=" + std::to_string(h_vecs.dim) +
       " does not match --dim=" + std::to_string(dim));
 
-  size_t data_bytes = static_cast<size_t>(n_vectors) * dim * sizeof(DataT);
-  DataT* h_data = new DataT[static_cast<size_t>(n_vectors) * dim];
-  fin.read(reinterpret_cast<char*>(h_data), data_bytes);
-  fin.close();
+  std::cout << "  Loaded " << h_vecs.n_vectors << " vectors, dim=" << dim << std::endl;
 
-  std::cout << "  Loaded " << n_vectors << " vectors, dim=" << dim << std::endl;
-
-  // Upload to device
-  DataT* d_data = nullptr;
-  cudaMalloc(&d_data, data_bytes);
-  cudaMemcpy(d_data, h_data, data_bytes, cudaMemcpyHostToDevice);
-  delete[] h_data;
-
-  jasper::vector_view<DataT> vecs(d_data, dim, n_vectors, false /*on_host*/);
+  // Upload padded buffer to device
+  auto d_vecs = h_vecs.to_device();
+  cudaFreeHost(h_vecs.data);
 
   // Set up construction params
   jasper::graph_construct_params<ConstructCfg> params;
   jasper::graph_construct_workspace<ConstructCfg> ws;
   uint32_t max_batch_size = min(
     ws.max_batch_size_for_budget(workspace_budget_bytes),
-    n_vectors / 50
+    d_vecs.n_vectors / 50
   );
 
-  params.data_vectors   = vecs;
+  params.data_vectors   = d_vecs;
   params.alpha          = alpha;
   params.max_batch_size = max_batch_size;
   params.on_host        = false;
@@ -83,17 +77,19 @@ void construct_and_save(const std::string& filename,
   jasper::save_graph_to_file(graph, index_out);
 
   // Cleanup
-  cudaFree(d_data);
+  cudaFree(d_vecs.data);
   graph.deallocate();
 }
 
 // ── Dispatch: (datatype, n_neighbors, distance) → config ───────
-template <typename DataT, jasper::distance_func Func>
+// All configs use __half for storage. Source dtype (float / uint8) is
+// applied at load time; it doesn't affect the chosen config.
+template <jasper::distance_func Func>
 bool config_matches(const std::string& datatype, uint64_t n_neighbors,
                     const std::string& distance, uint64_t R) {
-  std::string expected_dtype = std::is_same_v<DataT, float> ? "float" : "uint8";
-  std::string expected_dist  = (Func == jasper::distance_func::L2) ? "l2" : "ip";
-  return datatype == expected_dtype && n_neighbors == R && distance == expected_dist;
+  std::string expected_dist = (Func == jasper::distance_func::L2) ? "l2" : "ip";
+  bool dtype_ok = (datatype == "float" || datatype == "uint8");
+  return dtype_ok && n_neighbors == R && distance == expected_dist;
 }
 
 void dispatch(const std::string& datatype,
@@ -106,10 +102,10 @@ void dispatch(const std::string& datatype,
               const std::string& index_out) {
 
   #define TRY_DISPATCH(id, IDX, R, DAT, DIST, FUNC)                           \
-    if (config_matches<DAT, FUNC>(datatype, n_neighbors, distance, R)) {      \
+    if (config_matches<FUNC>(datatype, n_neighbors, distance, R)) {           \
       std::cout << "  Config: " #id << std::endl;                             \
       construct_and_save<cfg_##id, construct_cfg_##id, DAT>(                  \
-          filename, dim, alpha, workspace_budget_bytes, index_out);            \
+          filename, datatype, dim, alpha, workspace_budget_bytes, index_out); \
       return;                                                                  \
     }
 
@@ -133,7 +129,7 @@ int main(int argc, char** argv) {
   program.add_argument("--datatype", "-t")
     .required()
     .choices("uint8", "float")
-    .help("Vector datatype [\"uint8\", \"float\"]");
+    .help("Vector datatype [\"uint8\", \"float\"] (cast to __half internally)");
 
   program.add_argument("--distance", "-d")
     .default_value(std::string{"l2"})

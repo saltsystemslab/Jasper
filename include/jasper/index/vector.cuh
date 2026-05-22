@@ -210,9 +210,80 @@ __host__ vector_view<DATA_T> load_vectors_from_file(std::string filename) {
             << ") from " << filename << "\n";
 
   return {
-    host_data, 
-    static_cast<uint32_t>(dim), 
-    static_cast<uint32_t>(n_data_points), 
+    host_data,
+    static_cast<uint32_t>(dim),
+    static_cast<uint32_t>(n_data_points),
+    true
+  };
+}
+
+// Read SrcT-encoded vectors from file and cast each element to DATA_T.
+// Output lives in pinned host memory with DATA_T-aligned padded rows.
+// Caller is responsible for freeing the returned view's data via cudaFreeHost.
+template <typename DATA_T, typename SrcT>
+__host__ vector_view<DATA_T> load_vectors_from_file_cast(std::string filename) {
+  std::ifstream file(filename, std::ios::in | std::ios::binary);
+  if (!file.is_open()) {
+    std::cerr << "Error opening file: " << filename << std::endl;
+    return {nullptr, 0, 0, false};
+  }
+
+  file.seekg(0, std::ios::end);
+  std::streamsize file_size = file.tellg();
+  file.seekg(0, std::ios::beg);
+
+  int32_t n_data_points;
+  int32_t n_dimensions;
+  file.read(reinterpret_cast<char*>(&n_data_points), sizeof(int32_t));
+  file.read(reinterpret_cast<char*>(&n_dimensions), sizeof(int32_t));
+
+  if (n_dimensions < 0 || n_data_points < 0) {
+    throw std::runtime_error("negative dimension or count read from file");
+  }
+
+  std::streamsize data_size = file_size - 2 * sizeof(int32_t);
+  std::streamsize expected = static_cast<std::streamsize>(sizeof(SrcT))
+                           * n_data_points * n_dimensions;
+  if (expected != data_size) {
+    std::cerr << "Size mismatch: expected " << expected
+              << " bytes but file has " << data_size << " bytes\n";
+    return {nullptr, 0, 0, false};
+  }
+
+  uint32_t dim = static_cast<uint32_t>(n_dimensions);
+  uint32_t padded_dim = vector_view<DATA_T>::pad(dim);
+
+  size_t padded_bytes = sizeof(DATA_T) * static_cast<size_t>(n_data_points) * padded_dim;
+  DATA_T* host_data;
+  cudaMallocHost(&host_data, padded_bytes);
+  memset(host_data, 0, padded_bytes);
+
+  std::vector<SrcT> row(dim);
+  for (int32_t i = 0; i < n_data_points; i++) {
+    if (!file.read(reinterpret_cast<char*>(row.data()), sizeof(SrcT) * dim)) {
+      std::cerr << "Error reading vector " << i << "\n";
+      cudaFreeHost(host_data);
+      return {nullptr, 0, 0, false};
+    }
+    DATA_T* dst = host_data + static_cast<size_t>(i) * padded_dim;
+    for (uint32_t j = 0; j < dim; j++) {
+      // Go through float as intermediate so e.g. uint8_t -> __half works
+      // without relying on direct conversion constructors.
+      dst[j] = static_cast<DATA_T>(static_cast<float>(row[j]));
+    }
+  }
+
+  std::cout << "Loaded " << n_data_points
+            << " vectors (dim=" << dim
+            << ", padded_dim=" << padded_dim
+            << ", src=" << sizeof(SrcT) << "B"
+            << ", dst=" << sizeof(DATA_T) << "B)"
+            << " from " << filename << "\n";
+
+  return {
+    host_data,
+    static_cast<uint32_t>(dim),
+    static_cast<uint32_t>(n_data_points),
     true
   };
 }

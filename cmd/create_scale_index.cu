@@ -6,18 +6,16 @@
 #include <stdexcept>
 #include <chrono>
 #include <fstream>
+#include <cuda_fp16.h>
 
 #include "jasper/jasper.cuh"
 
 // (CONFIG_ID, INDEX_T, N_NEIGHBORS, DATA_T, DISTANCE_T, DIST_FUNC)
 #define JASPER_FOR_EACH_CONFIG(X)                                              \
-  X(f32_r32_l2,  uint32_t, 32,  float,   float, jasper::distance_func::L2)             \
-  X(f32_r64_l2,  uint32_t, 64,  float,   float, jasper::distance_func::L2)             \
-  X(f32_r128_l2, uint32_t, 128, float,   float, jasper::distance_func::L2)             \
-  X(f32_r32_ip,  uint32_t, 32,  float,   float, jasper::distance_func::INNER_PRODUCT)  \
-  X(f32_r64_ip,  uint32_t, 64,  float,   float, jasper::distance_func::INNER_PRODUCT)  \
-  X(u8_r32_l2,   uint32_t, 32,  uint8_t, float, jasper::distance_func::L2)             \
-  X(u8_r64_l2,   uint32_t, 64,  uint8_t, float, jasper::distance_func::L2)
+  X(f16_r32_l2,   uint32_t, 32,  __half,   float, jasper::distance_func::L2)             \
+  X(f16_r64_l2,   uint32_t, 64,  __half,   float, jasper::distance_func::L2)             \
+  X(f16_r32_ip,   uint32_t, 32,  __half,   float, jasper::distance_func::INNER_PRODUCT)  \
+  X(f16_r64_ip,   uint32_t, 64,  __half,   float, jasper::distance_func::INNER_PRODUCT)
 
 #define DECLARE_CONFIGS(id, IDX, R, DAT, DIST, FUNC)                          \
   using cfg_##id          = jasper::graph_config<IDX, R, DAT, DIST, FUNC>;   \
@@ -55,14 +53,22 @@ size_t parse_size(const std::string& value) {
 template <typename GraphCfg, typename ConstructCfg, typename DataT>
 void construct(
     const std::string& filename,
+    const std::string& src_dtype,
     float              alpha,
     size_t             n_parts,
     size_t             workspace_budget,
     size_t             n_vector_limit,
     const std::string& index_out)
 {
-  // Load vectors into pinned host memory (padded rows)
-  auto vecs = jasper::load_vectors_from_file<DataT>(filename);
+  // Load vectors into pinned host memory (padded rows), casting src_dtype -> DataT
+  jasper::vector_view<DataT> vecs;
+  if (src_dtype == "float") {
+    vecs = jasper::load_vectors_from_file_cast<DataT, float>(filename);
+  } else if (src_dtype == "uint8") {
+    vecs = jasper::load_vectors_from_file_cast<DataT, uint8_t>(filename);
+  } else {
+    throw std::runtime_error("Unsupported source dtype: " + src_dtype);
+  }
   if (!vecs.data) throw std::runtime_error("Failed to load vectors from: " + filename);
 
   if (n_vector_limit > 0 && n_vector_limit < vecs.n_vectors) {
@@ -116,12 +122,14 @@ void construct(
   g.deallocate();
 }
 
-template <typename DataT, jasper::distance_func Func>
+// All configs use __half for storage. Source dtype (float / uint8) is
+// applied at load time; it doesn't affect the chosen config.
+template <jasper::distance_func Func>
 bool config_matches(const std::string& datatype, uint64_t n_neighbors,
                     const std::string& distance, uint64_t R) {
-  std::string expected_dtype = std::is_same_v<DataT, float> ? "float" : "uint8";
-  std::string expected_dist  = (Func == jasper::distance_func::L2) ? "l2" : "ip";
-  return datatype == expected_dtype && n_neighbors == R && distance == expected_dist;
+  std::string expected_dist = (Func == jasper::distance_func::L2) ? "l2" : "ip";
+  bool dtype_ok = (datatype == "float" || datatype == "uint8");
+  return dtype_ok && n_neighbors == R && distance == expected_dist;
 }
 
 void dispatch(
@@ -136,11 +144,11 @@ void dispatch(
     const std::string& index_out)
 {
   #define TRY_DISPATCH(id, IDX, R, DAT, DIST, FUNC)                           \
-    if (config_matches<DAT, FUNC>(datatype, n_neighbors, distance, R)) {      \
+    if (config_matches<FUNC>(datatype, n_neighbors, distance, R)) {           \
       std::cout << "  Config: " #id << std::endl;                             \
       construct<cfg_##id, construct_cfg_##id, DAT>(                           \
-          filename, alpha, n_parts, workspace_budget, n_vector_limit,         \
-          index_out);                                                          \
+          filename, datatype, alpha, n_parts, workspace_budget,               \
+          n_vector_limit, index_out);                                         \
       return;                                                                  \
     }
 
@@ -163,7 +171,7 @@ int main(int argc, char** argv) {
   program.add_argument("--datatype", "-t")
     .required()
     .choices("uint8", "float")
-    .help("Vector datatype [\"uint8\", \"float\"]");
+    .help("Vector datatype [\"uint8\", \"float\"] (cast to __half internally)");
 
   program.add_argument("--distance", "-d")
     .default_value(std::string{"l2"})

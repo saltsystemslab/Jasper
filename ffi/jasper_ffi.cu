@@ -1,6 +1,7 @@
 #include <tvm/ffi/tvm_ffi.h>
 #include <tvm/ffi/extra/c_env_api.h>
 #include <thrust/pair.h>
+#include <cuda_fp16.h>
 
 #include "jasper/jasper.cuh"
 
@@ -17,13 +18,10 @@ namespace ffi = tvm::ffi;
 // (CONFIG_ID, INDEX_T, N_NEIGHBORS, DATA_T, DISTANCE_T, DIST_FUNC)
 
 #define JASPER_FOR_EACH_CONFIG(X)                                              \
-  X(f32_r32_l2,   uint32_t, 32, float, float, jasper::distance_func::L2)      \
-  X(f32_r64_l2,   uint32_t, 64, float, float, jasper::distance_func::L2)      \
-  X(f32_r128_l2,  uint32_t, 128, float, float, jasper::distance_func::L2)     \
-  X(f32_r32_ip,   uint32_t, 32, float, float, jasper::distance_func::INNER_PRODUCT) \
-  X(f32_r64_ip,   uint32_t, 64, float, float, jasper::distance_func::INNER_PRODUCT) \
-  X(u8_r32_l2,    uint32_t, 32, uint8_t, float, jasper::distance_func::L2)    \
-  X(u8_r64_l2,    uint32_t, 64, uint8_t, float, jasper::distance_func::L2)
+  X(f16_r32_l2,   uint32_t, 32, __half, float, jasper::distance_func::L2)      \
+  X(f16_r64_l2,   uint32_t, 64, __half, float, jasper::distance_func::L2)      \
+  X(f16_r32_ip,   uint32_t, 32, __half, float, jasper::distance_func::INNER_PRODUCT) \
+  X(f16_r64_ip,   uint32_t, 64, __half, float, jasper::distance_func::INNER_PRODUCT)
 
 // ── Generate graph config types ────────────────────────────────
 #define DECLARE_CONFIG(id, IDX, R, DAT, DIST, FUNC) \

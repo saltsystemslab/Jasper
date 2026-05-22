@@ -9,6 +9,7 @@
 #include <set>
 #include <stdexcept>
 #include <vector>
+#include <cuda_fp16.h>
 
 #include "jasper/jasper.cuh"
 
@@ -24,13 +25,10 @@
 
 // ── Config table ───────────────────────────────────────────────
 #define JASPER_FOR_EACH_CONFIG(X)                                              \
-  X(f32_r32_l2,   uint32_t, 32,  float,   float, jasper::distance_func::L2)             \
-  X(f32_r64_l2,   uint32_t, 64,  float,   float, jasper::distance_func::L2)             \
-  X(f32_r128_l2,  uint32_t, 128, float,   float, jasper::distance_func::L2)             \
-  X(f32_r32_ip,   uint32_t, 32,  float,   float, jasper::distance_func::INNER_PRODUCT)  \
-  X(f32_r64_ip,   uint32_t, 64,  float,   float, jasper::distance_func::INNER_PRODUCT)  \
-  X(u8_r32_l2,    uint32_t, 32,  uint8_t, float, jasper::distance_func::L2)             \
-  X(u8_r64_l2,    uint32_t, 64,  uint8_t, float, jasper::distance_func::L2)
+  X(f16_r32_l2,   uint32_t, 32,  __half,   float, jasper::distance_func::L2)             \
+  X(f16_r64_l2,   uint32_t, 64,  __half,   float, jasper::distance_func::L2)             \
+  X(f16_r32_ip,   uint32_t, 32,  __half,   float, jasper::distance_func::INNER_PRODUCT)  \
+  X(f16_r64_ip,   uint32_t, 64,  __half,   float, jasper::distance_func::INNER_PRODUCT)
 
 #define DECLARE_CONFIGS_(id, IDX, R, DAT, DIST, FUNC)                          \
   using cfg_##id = jasper::graph_config<IDX, R, DAT, DIST, FUNC>;
@@ -38,12 +36,14 @@
 JASPER_FOR_EACH_CONFIG(DECLARE_CONFIGS_)
 #undef DECLARE_CONFIGS_
 
-template <typename DataT, jasper::distance_func Func>
+// All configs use __half for storage. Source dtype (float / uint8) is
+// applied at load time; it doesn't affect the chosen config.
+template <jasper::distance_func Func>
 bool config_matches(const std::string& datatype, uint64_t n_neighbors,
                     const std::string& distance, uint64_t R) {
-  std::string expected_dtype = std::is_same_v<DataT, float> ? "float" : "uint8";
-  std::string expected_dist  = (Func == jasper::distance_func::L2) ? "l2" : "ip";
-  return datatype == expected_dtype && n_neighbors == R && distance == expected_dist;
+  std::string expected_dist = (Func == jasper::distance_func::L2) ? "l2" : "ip";
+  bool dtype_ok = (datatype == "float" || datatype == "uint8");
+  return dtype_ok && n_neighbors == R && distance == expected_dist;
 }
 
 // ── Unpack thrust::pair results into separate arrays ───────────
@@ -207,6 +207,7 @@ template <typename GraphCfg, typename DataT>
 void load_and_bench(const std::string& index_path,
                     const std::string& query_path,
                     const std::string& gt_path,
+                    const std::string& src_dtype,
                     uint32_t dim,
                     uint32_t k,
                     const std::vector<std::pair<uint32_t, uint32_t>>& beam_limit_pairs) {
@@ -216,30 +217,31 @@ void load_and_bench(const std::string& index_path,
   auto graph = jasper::load_graph_from_file<GraphCfg>(index_path, dim);
   std::cout << "  " << graph.n_vectors << " vectors, dim=" << graph.dim << std::endl;
 
-  // Load queries (format: [n_vectors: u32][dim: u32][data])
+  // Load queries, casting src_dtype -> DataT (__half)
   std::cout << "Loading queries..." << std::endl;
-  std::ifstream fin(query_path, std::ios::binary);
-  if (!fin) throw std::runtime_error("Cannot open query file: " + query_path);
+  jasper::vector_view<DataT> h_queries_view;
+  if (src_dtype == "float") {
+    h_queries_view = jasper::load_vectors_from_file_cast<DataT, float>(query_path);
+  } else if (src_dtype == "uint8") {
+    h_queries_view = jasper::load_vectors_from_file_cast<DataT, uint8_t>(query_path);
+  } else {
+    throw std::runtime_error("Unsupported source dtype: " + src_dtype);
+  }
+  if (!h_queries_view.data)
+    throw std::runtime_error("Failed to load queries from: " + query_path);
 
-  uint32_t n_queries, file_dim;
-  fin.read(reinterpret_cast<char*>(&n_queries), sizeof(n_queries));
-  fin.read(reinterpret_cast<char*>(&file_dim), sizeof(file_dim));
-
-  if (file_dim != dim)
+  if (h_queries_view.dim != dim)
     throw std::runtime_error(
-      "Query file dim=" + std::to_string(file_dim) +
+      "Query file dim=" + std::to_string(h_queries_view.dim) +
       " does not match --dim=" + std::to_string(dim));
 
-  size_t query_bytes = static_cast<size_t>(n_queries) * dim * sizeof(DataT);
-  DataT* h_queries = new DataT[static_cast<size_t>(n_queries) * dim];
-  fin.read(reinterpret_cast<char*>(h_queries), query_bytes);
-  fin.close();
-  std::cout << "  " << n_queries << " queries, dim=" << file_dim << std::endl;
+  uint32_t n_queries = h_queries_view.n_vectors;
+  std::cout << "  " << n_queries << " queries, dim=" << h_queries_view.dim << std::endl;
 
-  DataT* d_queries = nullptr;
-  CUDA_CHECK(cudaMalloc(&d_queries, query_bytes));
-  CUDA_CHECK(cudaMemcpy(d_queries, h_queries, query_bytes, cudaMemcpyHostToDevice));
-  delete[] h_queries;
+  // Upload padded buffer to device
+  auto d_queries_view = h_queries_view.to_device();
+  cudaFreeHost(h_queries_view.data);
+  DataT* d_queries = d_queries_view.data;
 
   // Load ground truth
   GroundTruth gt;
@@ -306,7 +308,7 @@ int main(int argc, char** argv) {
   program.add_argument("--datatype", "-t")
     .required()
     .choices("uint8", "float")
-    .help("Vector datatype [\"uint8\", \"float\"]");
+    .help("Vector datatype [\"uint8\", \"float\"] (cast to __half internally)");
 
   program.add_argument("--distance", "-d")
     .default_value(std::string{"l2"})
@@ -379,10 +381,11 @@ int main(int argc, char** argv) {
     bool dispatched = false;
 
     #define TRY_DISPATCH(id, IDX, R, DAT, DIST, FUNC)                         \
-      if (!dispatched && config_matches<DAT, FUNC>(datatype, n_neighbors, distance, R)) { \
+      if (!dispatched && config_matches<FUNC>(datatype, n_neighbors, distance, R)) { \
         std::cout << "  Config: " #id << std::endl;                           \
         load_and_bench<cfg_##id, DAT>(                                        \
-            index_path, query_path, gt_path, dim, k, beam_limit_pairs);       \
+            index_path, query_path, gt_path, datatype,                        \
+            dim, k, beam_limit_pairs);                                        \
         dispatched = true;                                                     \
       }
 
