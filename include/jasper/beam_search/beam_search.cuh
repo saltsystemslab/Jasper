@@ -11,6 +11,7 @@
 #include "jasper/index/graph.cuh"
 #include "jasper/beam_search/config.cuh"
 #include "jasper/beam_search/entry.cuh"
+#include "jasper/beam_search/device_kernels.cuh"
 #include "jasper/distance/distance.cuh"
 
 #include "assert.h"
@@ -20,247 +21,10 @@ namespace cg = cooperative_groups;
 
 namespace jasper {
 
-template <typename GRAPH_CFG, uint32_t TILE_SIZE, distance_func DIST_FUNC>
-__device__ void populate_distances(
-    typename GRAPH_CFG::data_t *query_vec,
-    typename graph<GRAPH_CFG>::device_view& graph,
-    ENTRY_T *result_buffer,
-    uint32_t *result_buffer_count, 
-    uint32_t offset) {
-
-  using INDEX_T = typename GRAPH_CFG::index_t;
-  using DATA_T = typename GRAPH_CFG::data_t;
-  using DISTANCE_T = typename GRAPH_CFG::distance_t;
-  using EDGE_LIST_T = typename GRAPH_CFG::edge_list_t;
-  
-  auto thread_block = cg::this_thread_block();
-  cg::thread_block_tile<TILE_SIZE> my_tile =
-      cg::tiled_partition<TILE_SIZE>(thread_block);
-  uint64_t tid = my_tile.meta_group_rank();
-  // 0x7FFFFFFF matches the index stored by empty_entry() (31-bit max after masking)
-  constexpr INDEX_T INVALID_INDEX = static_cast<INDEX_T>(0x7FFFFFFFu);
-  uint32_t padded_dim = graph.get_padded_dim();
-
-  uint32_t count = result_buffer_count[0];
-  for (unsigned i = tid + offset; i < count; i += my_tile.meta_group_size()) {
-    auto dest = get_index(result_buffer[i]);
-    if (dest != INVALID_INDEX) {
-      float dist = compute_distance<DIST_FUNC, DATA_T, DISTANCE_T, TILE_SIZE>(
-        query_vec, graph.get_vector(dest), padded_dim, my_tile);
-      if (my_tile.thread_rank() == 0) {
-        result_buffer[i] = set_distance(result_buffer[i], dist);
-      }
-    }
-  }
-  __threadfence();
-  __syncthreads();
-}
-
-// select and return the new frontier
-template <typename INDEX_T, typename DISTANCE_T, uint32_t BLOCK_SIZE, uint32_t MAX_SEARCH_WIDTH>
-__device__ thrust::pair<INDEX_T, bool> choose_new_frontier(
-    ENTRY_T *result_buffer,
-    uint32_t *result_buffer_count) {
-
-  constexpr uint32_t ELEMENTS_PER_THREAD = (MAX_SEARCH_WIDTH - 1) / BLOCK_SIZE + 1;
-
-  // first_index is the index we want to find that we haven't traversed yet.
-  __shared__ INDEX_T first_index;
-  if (threadIdx.x == 0) first_index = ~0u;
-  __syncthreads();
-
-  for (uint i=0; i<ELEMENTS_PER_THREAD; i++) {
-    INDEX_T visited;
-    INDEX_T index_to_visit = i * BLOCK_SIZE + threadIdx.x;
-    if (index_to_visit < *result_buffer_count) {
-      visited = static_cast<uint32_t>(get_visited(result_buffer[index_to_visit]));
-    } else {
-      visited = 1;
-    }
-    unsigned mask = __ballot_sync(0xffffffff, !visited);
-    if (mask != 0) {
-      int lane_id = threadIdx.x % warpSize;
-      int first_lane = __ffs(mask) - 1;
-      if (lane_id == first_lane) {
-        atomicMin(&first_index, index_to_visit);
-      }
-    }
-  }
-  __syncthreads();
-  
-  return {first_index, first_index != ~0u};
-}
-
-// adding the newly selected frontier's neighbors to the frontier list
-template <typename GRAPH_CFG>
-__device__ void add_frontier_out(
-    typename graph<GRAPH_CFG>::device_view& graph, 
-    ENTRY_T *result_buffer,
-    uint32_t *result_buffer_count, 
-    const typename GRAPH_CFG::index_t & frontier, 
-    const uint32_t & k,
-    const uint32_t & beam_width) {
-
-  using INDEX_T = typename GRAPH_CFG::index_t;
-  using EDGE_LIST_T = typename GRAPH_CFG::edge_list_t;
-
-  uint8_t n_edges = graph.get_edge_count(frontier);
-  uint32_t offset = result_buffer_count[0];
-  __syncthreads();
-
-  const uint4* l_ptr = reinterpret_cast<const uint4*>(&graph.get_neighbor_list(frontier).edges);
-
-  const INDEX_T range_lo = graph.global_offset;
-  const INDEX_T range_hi = graph.global_offset + graph.n_vectors;
-
-  for (uint i = threadIdx.x*4; i < n_edges; i += blockDim.x*4){
-    uint4 loaded_edges = l_ptr[i/4];
-    const uint32_t * loaded_edges_ptr = (uint32_t *) &loaded_edges;
-    for (uint j = 0; j < 4; j++){
-      INDEX_T nb = static_cast<INDEX_T>(loaded_edges_ptr[j]);
-      if (nb >= range_lo && nb < range_hi) {
-        result_buffer[offset+i+j] = set_index(empty_entry(), nb);
-      } else {
-        // Out-of-range: mark visited so it is never selected as a frontier
-        result_buffer[offset+i+j] = set_visited(empty_entry());
-      }
-    }
-  }
-
-  __syncthreads();
-  if (threadIdx.x == 0) {
-    result_buffer_count[0] += n_edges;
-  }
-  __syncthreads();
-}
-
-// Custom comparison for {index, distance} pairs
-struct CustomPairLess {
-  __device__ __forceinline__ bool operator()(
-      const ENTRY_T &a,
-      const ENTRY_T &b) {
-    float da = __uint_as_float(a & 0xFFFFFFFFu);
-    float db = __uint_as_float(b & 0xFFFFFFFFu);
-
-    // distance comparison
-    uint32_t dist_lt = static_cast<uint32_t>(da < db);
-    uint32_t dist_eq = static_cast<uint32_t>(da == db);
-
-    // index comparison. (31 bits)
-    uint32_t ia = static_cast<uint32_t>((a >> 32) & 0x7FFFFFFFul);
-    uint32_t ib = static_cast<uint32_t>((b >> 32) & 0x7FFFFFFFul);
-    uint32_t idx_lt = static_cast<uint32_t>(ia < ib);
-
-    // final result: (dist_lt) OR (dist_eq AND idx_lt)
-    return (dist_lt | (dist_eq & idx_lt)) != 0;
-  }
-};
-
-// sort the result
-template <typename INDEX_T, typename DISTANCE_T, uint32_t BLOCK_SIZE,
-          uint32_t MAX_SEARCH_WIDTH, typename BlockMergeSortT>
-__device__ void merge_sort(ENTRY_T *result_buffer,
-                           uint32_t *result_buffer_count,
-                           typename BlockMergeSortT::TempStorage &temp_storage) {
-  uint32_t count = result_buffer_count[0];
-  constexpr uint32_t ELEMENTS_PER_THREAD = (MAX_SEARCH_WIDTH - 1) / BLOCK_SIZE + 1;
-
-  ENTRY_T thread_item[ELEMENTS_PER_THREAD];
-#pragma unroll
-  for (unsigned i = 0; i < ELEMENTS_PER_THREAD; i++) {
-    uint32_t element_id = threadIdx.x * ELEMENTS_PER_THREAD + i;
-    if (element_id < count) {
-      thread_item[i] = result_buffer[element_id];
-    } else {
-      thread_item[i] = empty_entry();
-    }
-  }
-
-  // sort by distance
-  BlockMergeSortT(temp_storage).Sort(thread_item, CustomPairLess());
-
-#pragma unroll
-  for (unsigned i = 0; i < ELEMENTS_PER_THREAD; i++) {
-    uint32_t element_id = threadIdx.x * ELEMENTS_PER_THREAD + i;
-    if (element_id < count) {
-      result_buffer[element_id] = thread_item[i];
-    }
-  }
-
-  __syncthreads();
-}
-
-// clip the search results to beam_width
-__device__ void clip_k(uint32_t* result_buffer_count, const uint32_t & beam_width) {
-  if (threadIdx.x == 0) {
-    result_buffer_count[0] = min(result_buffer_count[0], beam_width);
-  }
-  __syncthreads();
-}
-
-// deduplicate the frontier list
-// assume the list is already sorted
-template <typename INDEX_T, typename DISTANCE_T, uint32_t BLOCK_SIZE,
-          uint32_t MAX_SEARCH_WIDTH, typename BlockScanT>
-__device__ void dedup_results(ENTRY_T *result_buffer,
-                              uint32_t *result_buffer_count,
-                              typename BlockScanT::TempStorage &temp_storage) {
-  constexpr uint32_t ELEMENTS_PER_THREAD =
-      (MAX_SEARCH_WIDTH - 1) / BLOCK_SIZE + 1;
-
-  uint32_t count = result_buffer_count[0];
-
-  ENTRY_T this_entry[ELEMENTS_PER_THREAD];
-  bool is_unique[ELEMENTS_PER_THREAD];
-
-#pragma unroll
-  for (unsigned i = 0; i < ELEMENTS_PER_THREAD; i++) {
-    is_unique[i] = true;
-    uint32_t element_id = threadIdx.x * ELEMENTS_PER_THREAD + i;
-    if (element_id < count) {
-      this_entry[i] = result_buffer[element_id];
-      INDEX_T this_index = get_index(this_entry[i]);
-      INDEX_T last_index = get_index(result_buffer[element_id - 1]);
-      if (element_id > 0 && (this_index == last_index)) {
-        is_unique[i] = false;
-
-        #if MEASURE_WASTED_CALCS
-        atomicAdd(&wasted_distance_calcs, 1);
-        #endif
-
-      }
-    } else {
-      is_unique[i] = false;
-    }
-  }
-  __syncthreads();
-
-  uint32_t thread_data[ELEMENTS_PER_THREAD];
-#pragma unroll
-  for (unsigned i = 0; i < ELEMENTS_PER_THREAD; i++) {
-    thread_data[i] = is_unique[i] ? 1 : 0;
-  }
-
-  BlockScanT(temp_storage).ExclusiveSum(thread_data, thread_data);
-
-#pragma unroll
-  for (unsigned i = 0; i < ELEMENTS_PER_THREAD; i++) {
-    if (is_unique[i]) {
-      result_buffer[thread_data[i]] = this_entry[i];
-    }
-  }
-  if (threadIdx.x == blockDim.x - 1) {
-    // result_buffer_count[0] = thread_data[ELEMENTS_PER_THREAD - 1];
-    result_buffer_count[0] = thread_data[ELEMENTS_PER_THREAD - 1]
-                           + (is_unique[ELEMENTS_PER_THREAD - 1] ? 1 : 0);
-  }
-  __syncthreads();
-}
-
 // main search kernel
 template <typename GRAPH_CFG, uint32_t BLOCK_SIZE, distance_func DISTANCE_FUNC,
           uint32_t MAX_SEARCH_WIDTH, bool GET_VISITED, uint32_t TILE_SIZE = 4, uint32_t MAX_RESULT_SIZE = 1024>
-__global__ void beam_search_single_kernel(
+__global__ void beam_search_kernel(
     typename graph<GRAPH_CFG>::device_view graph,
     thrust::pair<typename GRAPH_CFG::index_t, typename GRAPH_CFG::distance_t> *frontier_results,
     thrust::pair<typename GRAPH_CFG::index_t, typename GRAPH_CFG::distance_t> *visited_results,
@@ -319,17 +83,8 @@ __global__ void beam_search_single_kernel(
   // Load query vector to shared memory (including zero padding for aligned loads)
   DATA_T *query_vec;
   if (use_range) {
-    if (threadIdx.x == 0 && (query_start + query_id) >= graph.n_vectors) {
-      printf("[OOB] block=%u query_start=%u query_id=%u index=%u n_vectors=%u query_end=%u\n",
-             blockIdx.x, query_start, query_id,
-             query_start + query_id, (uint32_t)graph.n_vectors, query_end);
-    }
     query_vec = graph.get_vector(query_start + query_id);
   } else {
-    if (threadIdx.x == 0 && query_id >= query_vectors.n_vectors) {
-      printf("[OOB] block=%u query_id=%u query_vectors.n_vectors=%u\n",
-             blockIdx.x, query_id, query_vectors.n_vectors);
-    }
     query_vec = query_vectors[query_id];
   }
   for (uint i = threadIdx.x; i < graph.get_padded_dim(); i += blockDim.x) {
@@ -538,7 +293,7 @@ beam_search(const beam_search_params<Cfg>& p, cudaStream_t stream = 0) {
   auto graph_device_view = p.graph.view();
 
   // Launch
-  beam_search_single_kernel<
+  beam_search_kernel<
       typename Cfg::graph_cfg_t,
       Cfg::block_size, Cfg::dist_func,
       Cfg::max_search_width, Cfg::get_visited,
@@ -590,7 +345,7 @@ __host__ void beam_search(
   auto graph_device_view = p.graph.view();
 
   // Launch
-  beam_search_single_kernel<
+  beam_search_kernel<
       typename Cfg::graph_cfg_t,
       Cfg::block_size, Cfg::dist_func,
       Cfg::max_search_width, Cfg::get_visited,

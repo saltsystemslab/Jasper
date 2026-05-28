@@ -83,7 +83,7 @@ struct graph_construct_params {
   bool prerotate = false;
 
   // Prerotate seed
-  uint32_t prerotate_seed = 440;
+  uint32_t prerotate_seed = 42;
 };
 
 template <typename INDEX_T>
@@ -973,6 +973,7 @@ __host__ graph<typename CONSTRUCT_GRAPH_CONFIG::graph_cfg_t> construct_graph(
   // Replace each row v of params.data_vectors with v * P, where P is a
   // random orthogonal matrix seeded by params.prerotate_seed.
   if (params.prerotate) {
+    std::cout << "[construct] params.prerotate is enabled, rotating the vector dataset." << std::endl;
     using data_t = typename graph_cfg_t::data_t;
     static_assert(std::is_same<data_t, __half>::value,
                   "prerotate requires __half (f16) data_t");

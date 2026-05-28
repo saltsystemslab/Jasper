@@ -7,6 +7,9 @@
 #include <thrust/device_vector.h>
 
 #include "jasper/distance/distance.cuh"
+#include "jasper/lsh/edge_lsh.cuh"
+#include "jasper/lsh/lsh_globals.cuh"
+#include "jasper/lsh/lsh_kernels.cuh"
 
 #include "assert.h"
 #include "stdio.h"
@@ -35,23 +38,32 @@ template <typename INDEX_T,
           uint8_t N_NEIGHBORS,
           typename DATA_T,
           typename DISTANCE_T,
-          distance_func DIST_FUNC>
+          distance_func DIST_FUNC,
+          bool USE_LSH = false,
+          uint8_t K_RANKS = 0>
 struct graph_config {
   using index_t = INDEX_T;
   using data_t = DATA_T;
   using distance_t = DISTANCE_T;
   using edge_list_t = edge_list<INDEX_T, N_NEIGHBORS>;
+  using edge_lsh_list_t = edge_lsh_list<INDEX_T, N_NEIGHBORS, K_RANKS>;
   using vector_view_t = vector_view<DATA_T>;
   
   static constexpr uint8_t n_neighbors = N_NEIGHBORS;
   static constexpr distance_func dist_func = DIST_FUNC;
   static constexpr index_t vectors_per_segment = 1u << 20;
+  static constexpr bool use_lsh = USE_LSH;
+  static constexpr uint8_t k_ranks = K_RANKS;
+
+  static_assert(!USE_LSH || K_RANKS > 0, "USE_LSH requires K_RANKS > 0");
+  static_assert(K_RANKS <= N_NEIGHBORS, "K_RANKS must fit in a neighbor slot");
 };
 
 template <typename graph_cfg>
 struct graph_segment {
   using index_t     = typename graph_cfg::index_t;
   using edge_list_t = typename graph_cfg::edge_list_t;
+  using edge_lsh_list_t = typename graph_cfg::edge_lsh_list_t;
   using vector_view_t    = typename graph_cfg::vector_view_t;
 
   static constexpr uint32_t max_vectors = graph_cfg::vectors_per_segment;
@@ -63,6 +75,7 @@ struct graph_segment {
   edge_list_t *edges;
   uint8_t *edge_counts;
   vector_view_t vectors;
+  edge_lsh_list_t* edge_lshs; // only enabled if USE_LSH
 
   // if on_host is true, the data is allocated on cpu pinned memory
   bool on_host = false;
@@ -89,6 +102,20 @@ struct graph_segment {
 
     seg.vectors = vector_view_t::allocate(dim, max_vectors, on_host);
 
+    if constexpr (graph_cfg::use_lsh) {
+      if (on_host) {
+        check(cudaMallocHost(&seg.edge_lshs,
+                             max_vectors * sizeof(edge_lsh_list_t)),
+              "cudaMallocHost(edge_lshs)");
+      } else {
+        check(cudaMalloc(&seg.edge_lshs,
+                         max_vectors * sizeof(edge_lsh_list_t)),
+              "cudaMalloc(edge_lshs)");
+      }
+    } else {
+      seg.edge_lshs = nullptr;
+    }
+
     return seg;
   }
 
@@ -99,6 +126,10 @@ struct graph_segment {
     } else {
         cudaFree(edges);
         cudaFree(edge_counts);
+    }
+    if constexpr (graph_cfg::use_lsh) {
+      if (on_host) cudaFreeHost(edge_lshs); else cudaFree(edge_lshs);
+      edge_lshs = nullptr;
     }
     vectors.deallocate();
     edges = nullptr;
@@ -120,16 +151,23 @@ struct graph_segment {
     // Allocate new buffers on the target side (same capacity as allocate()).
     edge_list_t* new_edges       = nullptr;
     uint8_t*     new_edge_counts = nullptr;
+    edge_lsh_list_t* new_edge_lshs = nullptr;
 
     if (target_on_host) {
       cudaMallocHost(&new_edges,       max_vectors * sizeof(edge_list_t));
       cudaMallocHost(&new_edge_counts, max_vectors * sizeof(uint8_t));
       std::memset(new_edge_counts, 0,  max_vectors * sizeof(uint8_t));
+      if constexpr (graph_cfg::use_lsh) {
+        cudaMallocHost(&new_edge_lshs, max_vectors * sizeof(edge_lsh_list_t));
+      }
     } else {
       cudaMalloc(&new_edges,       max_vectors * sizeof(edge_list_t));
       cudaMalloc(&new_edge_counts, max_vectors * sizeof(uint8_t));
       cudaMemsetAsync(new_edge_counts, 0,
                       max_vectors * sizeof(uint8_t), stream);
+      if constexpr (graph_cfg::use_lsh) {
+        cudaMalloc(&new_edge_lshs, max_vectors * sizeof(edge_lsh_list_t));
+      }
     }
     vector_view_t new_vectors =
         vector_view_t::allocate(vectors.dim, max_vectors, target_on_host);
@@ -142,6 +180,11 @@ struct graph_segment {
       cudaMemcpyAsync(new_edge_counts, edge_counts,
                       static_cast<size_t>(n_vectors) * sizeof(uint8_t),
                       copy_kind, stream);
+      if constexpr (graph_cfg::use_lsh) {
+        cudaMemcpyAsync(new_edge_lshs, edge_lshs,
+                        static_cast<size_t>(n_vectors) * sizeof(edge_lsh_list_t),
+                        copy_kind, stream);
+      }
       cudaMemcpyAsync(new_vectors.data, vectors.data,
                       static_cast<size_t>(n_vectors) * padded_dim * sizeof(data_t),
                       copy_kind, stream);
@@ -152,15 +195,18 @@ struct graph_segment {
     if (on_host) {
       cudaFreeHost(edges);
       cudaFreeHost(edge_counts);
+      if constexpr (graph_cfg::use_lsh) cudaFreeHost(edge_lshs);
     } else {
       cudaFree(edges);
       cudaFree(edge_counts);
+      if constexpr (graph_cfg::use_lsh) cudaFree(edge_lshs);
     }
     vectors.deallocate();
 
     // Install new buffers.
     edges       = new_edges;
     edge_counts = new_edge_counts;
+    if constexpr (graph_cfg::use_lsh) edge_lshs = new_edge_lshs;
     vectors     = new_vectors;
     on_host     = target_on_host;
   }
@@ -193,6 +239,11 @@ struct graph_segment {
       cudaMemcpyAsync(target.edge_counts, edge_counts,
                       static_cast<size_t>(n_vectors) * sizeof(uint8_t),
                       kind, stream);
+      if constexpr (graph_cfg::use_lsh) {
+        cudaMemcpyAsync(target.edge_lshs, edge_lshs,
+                        static_cast<size_t>(n_vectors) * sizeof(edge_lsh_list_t),
+                        kind, stream);
+      }
       cudaMemcpyAsync(target.vectors.data, vectors.data,
                       static_cast<size_t>(n_vectors) * padded_dim * sizeof(data_t),
                       kind, stream);
@@ -277,9 +328,13 @@ struct graph {
   using data_t = typename graph_cfg::data_t;
   using segment_t   = graph_segment<graph_cfg>;
   using edge_list_t = typename graph_cfg::edge_list_t;
+  using edge_lsh_list_t = typename graph_cfg::edge_lsh_list_t;
   using vector_view_t    = typename graph_cfg::vector_view_t;
 
+  static constexpr uint32_t n_neighbors = graph_cfg::n_neighbors;
   static constexpr uint32_t vectors_per_segment = graph_cfg::vectors_per_segment;
+  static constexpr bool use_lsh = graph_cfg::use_lsh;
+  static constexpr uint8_t k_ranks = graph_cfg::k_ranks;
 
   uint32_t dim;
   index_t n_vectors;
@@ -594,6 +649,64 @@ struct graph {
       assert(local_idx < n_vectors && "global_idx out of bounds");
       segments[segment_of(local_idx)].set_neighbor_dist(local_of(local_idx), neighbor_idx, dist_val);
     }
+
+    __device__ __forceinline__
+    uint16_t get_lsh_coord(index_t global_idx, uint8_t edge_idx, uint8_t rank) const {
+      if constexpr (use_lsh) {
+        index_t local_idx = to_local(global_idx);
+        assert(local_idx < n_vectors && "global_idx out of bounds");
+        return segments[segment_of(local_idx)]
+            .edge_lshs[local_of(local_idx)]
+            .get_coord(edge_idx, rank);
+      } else {
+        assert(false && "get_lsh_coord called with use_lsh=false");
+        return 0;
+      }
+    }
+
+    __device__ __forceinline__
+    float get_lsh_sign(index_t global_idx, uint8_t edge_idx, uint8_t rank) const {
+      if constexpr (use_lsh) {
+        index_t local_idx = to_local(global_idx);
+        assert(local_idx < n_vectors && "global_idx out of bounds");
+        return segments[segment_of(local_idx)]
+            .edge_lshs[local_of(local_idx)]
+            .get_sign(edge_idx, rank);
+      } else {
+        assert(false && "get_lsh_sign called with use_lsh=false");
+        return 0.0f;
+      }
+    }
+
+    __device__ __forceinline__
+    void set_lsh_coord(index_t global_idx, uint8_t edge_idx, uint8_t rank, uint16_t coord) {
+      if constexpr (use_lsh) {
+        index_t local_idx = to_local(global_idx);
+        assert(local_idx < n_vectors && "global_idx out of bounds");
+        assert((coord & uint16_t{0x8000}) == 0 && "coord must fit in 15 bits");
+        uint16_t& slot = segments[segment_of(local_idx)]
+            .edge_lshs[local_of(local_idx)]
+            .packed[edge_idx][rank];
+        slot = (slot & uint16_t{0x8000}) | (coord & uint16_t{0x7FFF});
+      } else {
+        assert(false && "set_lsh_coord called with use_lsh=false");
+      }
+    }
+
+    __device__ __forceinline__
+    void set_lsh_sign(index_t global_idx, uint8_t edge_idx, uint8_t rank, bool is_positive) {
+      if constexpr (use_lsh) {
+        index_t local_idx = to_local(global_idx);
+        assert(local_idx < n_vectors && "global_idx out of bounds");
+        uint16_t& slot = segments[segment_of(local_idx)]
+            .edge_lshs[local_of(local_idx)]
+            .packed[edge_idx][rank];
+        if (is_positive) slot &= uint16_t{0x7FFF};
+        else             slot |= uint16_t{0x8000};
+      } else {
+        assert(false && "set_lsh_sign called with use_lsh=false");
+      }
+    }
   };
 
   __host__ double avg_degree() const {
@@ -664,6 +777,148 @@ struct graph {
       medoid,
       global_offset
     };
+  }
+
+  // Given a rotated vector, populate the edge lsh.
+  void populate_edge_lsh() {
+    static_assert(graph_cfg::use_lsh,
+                  "populate_edge_lsh requires graph_cfg::use_lsh");
+
+    // Pick a block size. 128 or 256 is usually fine for this kernel since the
+    // work per thread is light. Put it in graph_cfg if you want it tunable.
+    constexpr uint32_t block_threads = 128;
+    static_assert(block_threads % 32 == 0);
+
+    const uint32_t padded_dim = get_padded_dim();
+    const uint32_t nwarps     = block_threads / 32;
+
+    const size_t smem_bytes =
+          ((padded_dim * sizeof(data_t)   + 15) & ~15)   // relative_vec
+        + ((padded_dim * sizeof(uint32_t) + 15) & ~15)   // packed keys
+        +  nwarps * sizeof(uint32_t);                    // warp scratch
+
+    // Opt in to >48KB shared mem if needed. Harmless if smem_bytes is small.
+    // static bool attr_set = false;
+    // if (!attr_set) {
+    //   cudaFuncSetAttribute(populate_lsh<graph_cfg>,
+    //                       cudaFuncAttributeMaxDynamicSharedMemorySize,
+    //                       96 * 1024);   // raise if your padded_dim is large
+    //   attr_set = true;
+    // }
+
+    const dim3 grid(static_cast<uint32_t>(n_vectors));
+    populate_lsh<graph_cfg><<<grid, block_threads, smem_bytes>>>(view());
+  }
+
+  lsh_globals<graph_cfg::k_ranks> generate_lsh_globals(
+    uint32_t n_samples = 16384,
+    uint64_t seed      = 42
+  ) const {
+    static_assert(graph_cfg::use_lsh,
+                  "generate_lsh_globals requires graph_cfg::use_lsh");
+
+    if (on_host) {
+      throw std::runtime_error(
+          "generate_lsh_globals requires graph on device — "
+          "call move_to(false) first");
+    }
+    if (n_vectors == 0) {
+      throw std::runtime_error("generate_lsh_globals: graph is empty");
+    }
+
+    constexpr uint8_t  k_ranks       = graph_cfg::k_ranks;
+    constexpr uint32_t block_threads = 128;
+    static_assert(block_threads % 32 == 0);
+
+    using globals_t = lsh_globals<k_ranks>;
+
+    const uint32_t padded_dim = get_padded_dim();
+    const uint32_t nwarps     = block_threads / 32;
+    const size_t   smem_bytes =
+          ((padded_dim * sizeof(uint32_t) + 15) & ~15)   // packed keys
+        +  nwarps * sizeof(uint32_t);                    // warp scratch
+
+    float*     d_rank_sum = nullptr;
+    uint32_t*  d_n_valid  = nullptr;
+    globals_t* d_globals  = nullptr;
+    cudaMalloc(&d_rank_sum, k_ranks * sizeof(float));
+    cudaMalloc(&d_n_valid,  sizeof(uint32_t));
+    cudaMalloc(&d_globals,  sizeof(globals_t));
+
+    cudaStream_t stream;
+    cudaStreamCreate(&stream);
+
+    cudaMemsetAsync(d_rank_sum, 0, k_ranks * sizeof(float), stream);
+    cudaMemsetAsync(d_n_valid,  0, sizeof(uint32_t),        stream);
+
+    accumulate_rank_sums<graph_cfg>
+        <<<n_samples, block_threads, smem_bytes, stream>>>(
+            view(), d_rank_sum, d_n_valid, seed);
+
+    finalize_lsh_globals<k_ranks>
+        <<<1, 1, 0, stream>>>(d_rank_sum, d_n_valid, d_globals);
+
+    globals_t h_globals{};
+    cudaMemcpyAsync(&h_globals, d_globals, sizeof(globals_t),
+                    cudaMemcpyDeviceToHost, stream);
+
+    cudaStreamSynchronize(stream);
+    cudaStreamDestroy(stream);
+
+    cudaFree(d_globals);
+    cudaFree(d_n_valid);
+    cudaFree(d_rank_sum);
+
+    return h_globals;
+  }
+
+  __host__ void dump_edge_lsh(index_t start = 0, index_t count = 10,
+                            std::ostream& out = std::cout) const {
+    if constexpr (!graph_cfg::use_lsh) {
+      out << "[dump_edge_lsh] use_lsh disabled for this config\n";
+      return;
+    } else {
+      index_t end = (count == 0) ? n_vectors
+                                : std::min(start + count, n_vectors);
+
+      std::vector<segment_t> h_segs(segments.begin(), segments.end());
+
+      for (index_t idx = start; idx < end; ++idx) {
+        uint32_t        seg_id = segment_of(idx);
+        uint32_t        loc    = local_of(idx);
+        uint8_t         cnt;
+        edge_list_t     edges;
+        edge_lsh_list_t el;
+
+        if (on_host) {
+          cnt   = h_segs[seg_id].edge_counts[loc];
+          edges = h_segs[seg_id].edges[loc];
+          el    = h_segs[seg_id].edge_lshs[loc];
+        } else {
+          cudaMemcpy(&cnt,   h_segs[seg_id].edge_counts + loc,
+                    sizeof(uint8_t),         cudaMemcpyDeviceToHost);
+          cudaMemcpy(&edges, h_segs[seg_id].edges       + loc,
+                    sizeof(edge_list_t),     cudaMemcpyDeviceToHost);
+          cudaMemcpy(&el,    h_segs[seg_id].edge_lshs   + loc,
+                    sizeof(edge_lsh_list_t), cudaMemcpyDeviceToHost);
+        }
+
+        out << "[" << (idx + global_offset) << "] LSH ("
+            << static_cast<int>(cnt) << " edges):\n";
+
+        for (uint8_t e = 0; e < cnt; ++e) {
+          out << "  edge[" << static_cast<int>(e)
+              << "] -> " << edges.edges[e] << ":";
+          for (uint32_t r = 0; r < graph_cfg::k_ranks; ++r) {
+            const uint16_t p     = el.packed[e][r];
+            const uint16_t coord = p & uint16_t{0x7FFF};
+            const char     sgn   = (p & uint16_t{0x8000}) ? '-' : '+';
+            out << ' ' << sgn << coord;
+          }
+          out << '\n';
+        }
+      }
+    }
   }
 };
 
