@@ -1059,6 +1059,17 @@ __host__ graph<typename CONSTRUCT_GRAPH_CONFIG::graph_cfg_t> construct_graph(
     if (input_on_host) cudaFree(d_in);
   }
 
+  cudaError_t err = cudaStreamSynchronize(stream);
+  if (err != cudaSuccess) {
+    std::cerr << "Construct launch failed: "
+              << cudaGetErrorString(err) << std::endl;
+  }
+
+  size_t free_bytes, total_bytes;
+  cudaMemGetInfo(&free_bytes, &total_bytes);
+  std::cout << "[graph malloc] free=" << (free_bytes >> 20)
+            << " MiB / total=" << (total_bytes >> 20) << " MiB\n";
+
   // allocate a graph with only vector populated.
   graph_t g = graph_t::allocate_and_load(params.data_vectors, params.on_host);
 
@@ -1088,7 +1099,7 @@ __host__ graph<typename CONSTRUCT_GRAPH_CONFIG::graph_cfg_t> construct_graph(
   construction_round<CONSTRUCT_GRAPH_CONFIG, beam_search_cfg>(
     g, ws, alpha, params.max_batch_size, second_round_timer, stream
   );
-  // second_round_timer.print();
+  second_round_timer.print();
 
   ws.free();
   return g;

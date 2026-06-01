@@ -416,8 +416,8 @@ def generate_groundtruth(
     in batches to stay within device memory.
 
     Args:
-        vectors:           [n, dim] CPU tensor (float32) — the database.
-        queries:           [nq, dim] CPU tensor (float32) — the queries.
+        vectors:           [n, dim] CPU tensor (float32 or float16) — the database.
+        queries:           [nq, dim] CPU tensor (float32 or float16) — the queries.
         k:                 Number of nearest neighbors.
         distance:          "l2" or "ip" (inner product).
         query_batch_size:  Queries transferred to device per batch.
@@ -428,13 +428,21 @@ def generate_groundtruth(
         indices:   int32   [nq, k]  (CPU)
         distances: float32 [nq, k]  (CPU)
     """
-    assert vectors.dtype == torch.float32 and queries.dtype == torch.float32
+    assert vectors.dtype in (torch.float32, torch.float16), \
+        f"vectors must be float32 or float16, got {vectors.dtype}"
+    assert queries.dtype in (torch.float32, torch.float16), \
+        f"queries must be float32 or float16, got {queries.dtype}"
     assert vectors.size(1) == queries.size(1)
+
+    # Promote to float32 for L2 accumulation to avoid fp16 overflow;
+    # for IP, fp16 matmul is fine and we only upcast the final distances.
+    use_fp16 = vectors.dtype == torch.float16 and queries.dtype == torch.float16
+    compute_dtype = torch.float16 if (use_fp16 and distance == "ip") else torch.float32
 
     n, dim = vectors.shape
     nq = queries.size(0)
 
-    # Final results live on CPU
+    # Final results live on CPU in float32
     final_ids = torch.empty(nq, k, dtype=torch.int32)
     final_dists = torch.empty(nq, k, dtype=torch.float32)
 
@@ -443,14 +451,14 @@ def generate_groundtruth(
 
     for qi, q_start in enumerate(range(0, nq, query_batch_size)):
         q_end = min(q_start + query_batch_size, nq)
-        q_batch = queries[q_start:q_end].to(device)  # [qbs, dim]
+        q_batch = queries[q_start:q_end].to(device=device, dtype=compute_dtype)  # [qbs, dim]
         qbs = q_batch.size(0)
 
         if distance == "l2":
             q_sq = (q_batch * q_batch).sum(dim=1, keepdim=True)  # [qbs, 1]
 
-        # Accumulate top-k across vector batches on device
-        top_dists = torch.full((qbs, k), float("inf"), device=device)
+        # Accumulate top-k across vector batches on device (always float32)
+        top_dists = torch.full((qbs, k), float("inf"), dtype=torch.float32, device=device)
         top_ids = torch.zeros((qbs, k), dtype=torch.int64, device=device)
 
         for vi, v_start in enumerate(range(0, n, vector_batch_size)):
@@ -460,7 +468,7 @@ def generate_groundtruth(
                 end="", flush=True,
             )
             v_end = min(v_start + vector_batch_size, n)
-            v_batch = vectors[v_start:v_end].to(device)  # [vbs, dim]
+            v_batch = vectors[v_start:v_end].to(device=device, dtype=compute_dtype)  # [vbs, dim]
 
             if distance == "l2":
                 v_sq = (v_batch * v_batch).sum(dim=1)  # [vbs]
@@ -470,6 +478,9 @@ def generate_groundtruth(
                 dists = -(q_batch @ v_batch.T)  # negate so smaller = better
             else:
                 raise ValueError(f"Unknown distance: {distance}")
+
+            # Upcast to float32 before merging into top-k accumulator
+            dists = dists.float()
 
             # Offset local indices to global vector indices
             local_ids = torch.arange(v_start, v_end, device=device).unsqueeze(0).expand(qbs, -1)

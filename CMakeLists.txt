@@ -149,7 +149,7 @@ if(JASPER_BUILD_FFI)
 
   # Set CUDA arch — adjust to your target GPU
   set_target_properties(jasper_ffi PROPERTIES
-    CUDA_ARCHITECTURES "89;90;120"
+    CUDA_ARCHITECTURES "80;89;90;120"
     CUDA_SEPARABLE_COMPILATION ON
   )
 

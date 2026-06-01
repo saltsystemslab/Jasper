@@ -25,12 +25,12 @@
 
 // (CONFIG_ID, INDEX_T, N_NEIGHBORS, DATA_T, DISTANCE_T, DIST_FUNC, K_RANKS)
 #define JASPER_FOR_EACH_CONFIG(X)                                              \
-  X(f16_r64_l2_k4,  uint32_t, 64, __half, float, jasper::distance_func::L2,            4)  \
-  X(f16_r64_l2_k8,  uint32_t, 64, __half, float, jasper::distance_func::L2,            8)  \
-  X(f16_r64_l2_k16, uint32_t, 64, __half, float, jasper::distance_func::L2,           16)  
-  // X(f16_r32_ip_k4,  uint32_t, 32, __half, float, jasper::distance_func::INNER_PRODUCT,  4)  \
-  // X(f16_r32_ip_k8,  uint32_t, 32, __half, float, jasper::distance_func::INNER_PRODUCT,  8)  \
-  // X(f16_r32_ip_k16, uint32_t, 32, __half, float, jasper::distance_func::INNER_PRODUCT, 16)  \
+  X(f16_r16_l2_k4,  uint32_t, 16, __half, float, jasper::distance_func::L2,  4)  \
+  X(f16_r16_l2_k8,  uint32_t, 16, __half, float, jasper::distance_func::L2,  8)  \
+  X(f16_r16_l2_k16, uint32_t, 16, __half, float, jasper::distance_func::L2, 16) \
+  X(f16_r32_l2_k4,  uint32_t, 32, __half, float, jasper::distance_func::L2,  4)  \
+  X(f16_r32_l2_k8,  uint32_t, 32, __half, float, jasper::distance_func::L2,  8)  \
+  X(f16_r32_l2_k16, uint32_t, 32, __half, float, jasper::distance_func::L2, 16)  
   // X(f16_r64_ip_k4,  uint32_t, 64, __half, float, jasper::distance_func::INNER_PRODUCT,  4)  \
   // X(f16_r64_ip_k8,  uint32_t, 64, __half, float, jasper::distance_func::INNER_PRODUCT,  8)  \
   // X(f16_r64_ip_k16, uint32_t, 64, __half, float, jasper::distance_func::INNER_PRODUCT, 16)
@@ -408,18 +408,18 @@ void construct_and_save(const std::string& filename,
 
   std::cout << "  Loaded " << h_vecs.n_vectors << " vectors, dim=" << dim << std::endl;
 
-  auto d_vecs = h_vecs.to_device();
-  cudaFreeHost(h_vecs.data);
+  // auto d_vecs = h_vecs.to_device();
+  // cudaFreeHost(h_vecs.data);
 
   // Construction params.
   jasper::graph_construct_params<ConstructCfg> params;
   jasper::graph_construct_workspace<ConstructCfg> ws;
   uint32_t max_batch_size = min(
     ws.max_batch_size_for_budget(workspace_budget_bytes),
-    d_vecs.n_vectors / 50
+    h_vecs.n_vectors / 50
   );
 
-  params.data_vectors   = d_vecs;
+  params.data_vectors   = h_vecs;
   params.alpha          = alpha;
   params.max_batch_size = max_batch_size;
   params.on_host        = false;
@@ -446,7 +446,7 @@ void construct_and_save(const std::string& filename,
     std::cout << "\n  No --queries provided; skipping benchmark." << std::endl;
   }
 
-  cudaFree(d_vecs.data);
+  cudaFreeHost(h_vecs.data);
   g.deallocate();
 }
 
