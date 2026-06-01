@@ -154,7 +154,7 @@ beam_search_result<GRAPH_CFG> directional_search_dispatch_width(
 }
 
 template <typename GRAPH_CFG,
-          uint32_t BLOCK_SIZE      = 64,
+          uint32_t BLOCK_SIZE      = 128,
           uint32_t TILE_SIZE       = 4,
           uint32_t MAX_RESULT_SIZE = 2048>
 beam_search_result<GRAPH_CFG> directional_search(
@@ -166,11 +166,11 @@ beam_search_result<GRAPH_CFG> directional_search(
                 "directional_search requires graph_cfg::use_lsh");
 
   const uint32_t bw = params.beam_width;
-  if      (bw + 64 < 128)  return directional_search_dispatch_width<GRAPH_CFG, BLOCK_SIZE, 128,  TILE_SIZE, MAX_RESULT_SIZE>(g, globals, d_queries, params);
-  else if (bw + 64 < 256)  return directional_search_dispatch_width<GRAPH_CFG, BLOCK_SIZE, 256,  TILE_SIZE, MAX_RESULT_SIZE>(g, globals, d_queries, params);
-  else if (bw + 64 < 512)  return directional_search_dispatch_width<GRAPH_CFG, BLOCK_SIZE, 512,  TILE_SIZE, MAX_RESULT_SIZE>(g, globals, d_queries, params);
-  else if (bw + 64 < 1024) return directional_search_dispatch_width<GRAPH_CFG, BLOCK_SIZE, 1024, TILE_SIZE, MAX_RESULT_SIZE>(g, globals, d_queries, params);
-  else if (bw + 64 < 2048) return directional_search_dispatch_width<GRAPH_CFG, BLOCK_SIZE, 2048, TILE_SIZE, MAX_RESULT_SIZE>(g, globals, d_queries, params);
+  if      (bw + 64 < 128)  return directional_search_dispatch_width<GRAPH_CFG, BLOCK_SIZE, 128,  TILE_SIZE, 128>(g, globals, d_queries, params);
+  else if (bw + 64 < 256)  return directional_search_dispatch_width<GRAPH_CFG, BLOCK_SIZE, 256,  TILE_SIZE, 256>(g, globals, d_queries, params);
+  else if (bw + 64 < 512)  return directional_search_dispatch_width<GRAPH_CFG, BLOCK_SIZE, 512,  TILE_SIZE, 512>(g, globals, d_queries, params);
+  else if (bw + 64 < 1024) return directional_search_dispatch_width<GRAPH_CFG, BLOCK_SIZE, 1024, TILE_SIZE, 1024>(g, globals, d_queries, params);
+  else if (bw + 64 < 2048) return directional_search_dispatch_width<GRAPH_CFG, BLOCK_SIZE, 2048, TILE_SIZE, 2048>(g, globals, d_queries, params);
   else throw std::invalid_argument(
       "beam_width " + std::to_string(bw) +
       " is too large (beam_width + 64 must be < 2048)");

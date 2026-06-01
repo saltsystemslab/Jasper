@@ -146,21 +146,23 @@ __device__ __forceinline__ void populate_estimated_distances(
     uint8_t                                        n_edges)
 {
   using INDEX_T  = typename GRAPH_CFG::index_t;
+  using row_t    = typename GRAPH_CFG::edge_lsh_list_t::row_t;
   constexpr uint8_t K_RANKS       = GRAPH_CFG::k_ranks;
   constexpr INDEX_T INVALID_INDEX = static_cast<INDEX_T>(0x7FFFFFFFu);
 
-  // ── Hoist u-side segment lookup out of the edge loop ──
-  // segment_of(u) and local_of(u) are constant across the loop, but each
-  // get_lsh_coord / get_lsh_sign / get_neighbor_dist call recomputes them
-  // from scratch — that's 3·K_RANKS + 1 redundant div/mod per edge.
+  // Hoist u-side segment lookup.
   const INDEX_T  u_lid    = u_gid - graph.global_offset;
   const uint32_t u_segid  = static_cast<uint32_t>(u_lid / GRAPH_CFG::vectors_per_segment);
   const uint32_t u_locidx = static_cast<uint32_t>(u_lid % GRAPH_CFG::vectors_per_segment);
   const auto&    u_segment = graph.segments[u_segid];
-  const uint16_t* __restrict__ packed_base =
-      &u_segment.edge_lshs[u_locidx].packed[0][0];
 
-  // Cache c_per_rank in registers (compiler usually does this, make explicit).
+  // Row stride in uint16 units. For K=4: sizeof(row_t)/2 = 12/2 = 6.
+  // For K=8: 20/2 = 10.
+  const uint16_t* __restrict__ row_base =
+      reinterpret_cast<const uint16_t*>(&u_segment.edge_lshs[u_locidx].rows[0]);
+  constexpr uint32_t ROW_U16_STRIDE = sizeof(row_t) / sizeof(uint16_t);
+
+  // c_per_rank in registers.
   float c_reg[K_RANKS];
   #pragma unroll
   for (uint8_t r = 0; r < K_RANKS; ++r) c_reg[r] = globals.c_per_rank[r];
@@ -170,60 +172,42 @@ __device__ __forceinline__ void populate_estimated_distances(
     INDEX_T v     = static_cast<INDEX_T>(get_index(entry));
     if (v == INVALID_INDEX) continue;
 
-    // ── Vectorized load of packed[e][0..K_RANKS) ──
-    // For K_RANKS=4 the row is 8 bytes, one uint2 load. Each edge_lsh_list_t
-    // is cudaMalloc-backed (≥256B aligned), so packed[e] for K_RANKS=4 is
-    // 8-byte aligned. __ldg routes through the read-only cache.
+    const uint16_t* row_ptr = row_base + e * ROW_U16_STRIDE;
+
+    // ─── Load K_RANKS LSH words + mag_sq from same 32B cache sector ──
     uint16_t p[K_RANKS];
     if constexpr (K_RANKS == 4) {
-      const uint2 v2 = __ldg(reinterpret_cast<const uint2*>(packed_base) + e);
-      p[0] = static_cast<uint16_t>( v2.x        & 0xFFFFu);
-      p[1] = static_cast<uint16_t>((v2.x >> 16) & 0xFFFFu);
-      p[2] = static_cast<uint16_t>( v2.y        & 0xFFFFu);
-      p[3] = static_cast<uint16_t>((v2.y >> 16) & 0xFFFFu);
-    } else if constexpr (K_RANKS == 2) {
-      const uint32_t v32 = __ldg(reinterpret_cast<const uint32_t*>(packed_base) + e);
-      p[0] = static_cast<uint16_t>( v32        & 0xFFFFu);
-      p[1] = static_cast<uint16_t>((v32 >> 16) & 0xFFFFu);
+      const uint32_t lsh_lo = __ldg(reinterpret_cast<const uint32_t*>(row_ptr));
+      const uint32_t lsh_hi = __ldg(reinterpret_cast<const uint32_t*>(row_ptr) + 1);
+      p[0] = static_cast<uint16_t>( lsh_lo        & 0xFFFFu);
+      p[1] = static_cast<uint16_t>((lsh_lo >> 16) & 0xFFFFu);
+      p[2] = static_cast<uint16_t>( lsh_hi        & 0xFFFFu);
+      p[3] = static_cast<uint16_t>((lsh_hi >> 16) & 0xFFFFu);
     } else if constexpr (K_RANKS == 8) {
-      const uint4 v4 = __ldg(reinterpret_cast<const uint4*>(packed_base) + e);
-      p[0] = static_cast<uint16_t>( v4.x        & 0xFFFFu);
-      p[1] = static_cast<uint16_t>((v4.x >> 16) & 0xFFFFu);
-      p[2] = static_cast<uint16_t>( v4.y        & 0xFFFFu);
-      p[3] = static_cast<uint16_t>((v4.y >> 16) & 0xFFFFu);
-      p[4] = static_cast<uint16_t>( v4.z        & 0xFFFFu);
-      p[5] = static_cast<uint16_t>((v4.z >> 16) & 0xFFFFu);
-      p[6] = static_cast<uint16_t>( v4.w        & 0xFFFFu);
-      p[7] = static_cast<uint16_t>((v4.w >> 16) & 0xFFFFu);
-    } else if constexpr (K_RANKS == 16) {
-      // 32 bytes per row, two uint4 loads. packed[e][0..16) is at
-      // packed_base + e*16 uint16s = packed_base + e*32 bytes.
-      const uint4* row_ptr = reinterpret_cast<const uint4*>(packed_base) + e * 2;
-      const uint4 v0 = __ldg(row_ptr + 0);
-      const uint4 v1 = __ldg(row_ptr + 1);
-      p[ 0] = static_cast<uint16_t>( v0.x        & 0xFFFFu);
-      p[ 1] = static_cast<uint16_t>((v0.x >> 16) & 0xFFFFu);
-      p[ 2] = static_cast<uint16_t>( v0.y        & 0xFFFFu);
-      p[ 3] = static_cast<uint16_t>((v0.y >> 16) & 0xFFFFu);
-      p[ 4] = static_cast<uint16_t>( v0.z        & 0xFFFFu);
-      p[ 5] = static_cast<uint16_t>((v0.z >> 16) & 0xFFFFu);
-      p[ 6] = static_cast<uint16_t>( v0.w        & 0xFFFFu);
-      p[ 7] = static_cast<uint16_t>((v0.w >> 16) & 0xFFFFu);
-      p[ 8] = static_cast<uint16_t>( v1.x        & 0xFFFFu);
-      p[ 9] = static_cast<uint16_t>((v1.x >> 16) & 0xFFFFu);
-      p[10] = static_cast<uint16_t>( v1.y        & 0xFFFFu);
-      p[11] = static_cast<uint16_t>((v1.y >> 16) & 0xFFFFu);
-      p[12] = static_cast<uint16_t>( v1.z        & 0xFFFFu);
-      p[13] = static_cast<uint16_t>((v1.z >> 16) & 0xFFFFu);
-      p[14] = static_cast<uint16_t>( v1.w        & 0xFFFFu);
-      p[15] = static_cast<uint16_t>((v1.w >> 16) & 0xFFFFu);
+      const uint32_t* p32 = reinterpret_cast<const uint32_t*>(row_ptr);
+      const uint32_t w0 = __ldg(p32 + 0);
+      const uint32_t w1 = __ldg(p32 + 1);
+      const uint32_t w2 = __ldg(p32 + 2);
+      const uint32_t w3 = __ldg(p32 + 3);
+      p[0] = static_cast<uint16_t>( w0        & 0xFFFFu);
+      p[1] = static_cast<uint16_t>((w0 >> 16) & 0xFFFFu);
+      p[2] = static_cast<uint16_t>( w1        & 0xFFFFu);
+      p[3] = static_cast<uint16_t>((w1 >> 16) & 0xFFFFu);
+      p[4] = static_cast<uint16_t>( w2        & 0xFFFFu);
+      p[5] = static_cast<uint16_t>((w2 >> 16) & 0xFFFFu);
+      p[6] = static_cast<uint16_t>( w3        & 0xFFFFu);
+      p[7] = static_cast<uint16_t>((w3 >> 16) & 0xFFFFu);
     } else {
       #pragma unroll
-      for (uint8_t r = 0; r < K_RANKS; ++r)
-        p[r] = packed_base[e * K_RANKS + r];
+      for (uint8_t r = 0; r < K_RANKS; ++r) p[r] = __ldg(row_ptr + r);
     }
 
-    // ── Estimator: one word per rank, coord + sign extracted in registers ──
+    // mag_sq sits immediately after the K_RANKS LSH words.
+    const __nv_bfloat16 mag_sq_bf = __ldg(
+        reinterpret_cast<const __nv_bfloat16*>(row_ptr + K_RANKS));
+    const float mag_sq = __bfloat162float(mag_sq_bf);
+
+    // ─── Estimator ───
     float dot_acc = 0.0f;
     #pragma unroll
     for (uint8_t r = 0; r < K_RANKS; ++r) {
@@ -234,12 +218,8 @@ __device__ __forceinline__ void populate_estimated_distances(
       dot_acc += c_reg[r] * sgn * diff;
     }
     const float dot_est = dot_acc * inv_norm_denom;
-
-    // Reuse u_segment to skip the segment_of/local_of recomputation.
-    const float mag_sq = u_segment.get_neighbor_dist(u_locidx,
-                                                     static_cast<uint8_t>(e));
-    const float mag    = sqrtf(mag_sq);
-    const float est_sq = exact_dist_u_sq + mag_sq - 2.0f * mag * dot_est;
+    const float mag     = sqrtf(mag_sq);
+    const float est_sq  = exact_dist_u_sq + mag_sq - 2.0f * mag * dot_est;
 
     result_buffer[offset + e] = set_distance(entry, est_sq);
   }

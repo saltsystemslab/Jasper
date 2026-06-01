@@ -350,20 +350,32 @@ struct graph {
     g.dim = dim;
     g.n_vectors = 0;
     g.medoid = 0;
-    g.n_segments = (n_vector_slots+vectors_per_segment-1)/vectors_per_segment;
+    g.n_segments = (n_vector_slots + vectors_per_segment - 1) / vectors_per_segment;
     g.on_host = on_host;
 
     const size_t padded_dim = vector_view_t::pad(dim);
-    const size_t bytes_per_segment =
+    size_t bytes_per_segment =
         static_cast<size_t>(vectors_per_segment) * sizeof(edge_list_t)
       + static_cast<size_t>(vectors_per_segment) * sizeof(uint8_t)
       + static_cast<size_t>(vectors_per_segment) * padded_dim * sizeof(data_t);
+    if constexpr (use_lsh) {
+      bytes_per_segment +=
+          static_cast<size_t>(vectors_per_segment) * sizeof(edge_lsh_list_t);
+    }
     const size_t total_bytes = bytes_per_segment * g.n_segments;
+
     std::cout << "[graph::allocate]: " << g.n_segments << " segments x "
               << (bytes_per_segment / (1ull << 20)) << " MB = "
               << (total_bytes / (1ull << 20)) << " MB ("
               << (total_bytes / (1ull << 30)) << " GB) on "
-              << (on_host ? "host" : "device") << "\n";
+              << (on_host ? "host" : "device");
+    if constexpr (use_lsh) {
+      std::cout << " (LSH enabled, +"
+                << (static_cast<size_t>(vectors_per_segment)
+                    * sizeof(edge_lsh_list_t) / (1ull << 20))
+                << " MB/segment for edge_lsh_list)";
+    }
+    std::cout << "\n";
 
     std::vector<segment_t> h_segments(g.n_segments);
     for (uint32_t i = 0; i < g.n_segments; i++) {
@@ -679,6 +691,20 @@ struct graph {
     }
 
     __device__ __forceinline__
+    float get_lsh_mag_sq(index_t global_idx, uint8_t edge_idx) const {
+      if constexpr (use_lsh) {
+        index_t local_idx = to_local(global_idx);
+        assert(local_idx < n_vectors && "global_idx out of bounds");
+        return segments[segment_of(local_idx)]
+            .edge_lshs[local_of(local_idx)]
+            .get_mag_sq(edge_idx);
+      } else {
+        assert(false && "get_lsh_mag_sq called with use_lsh=false");
+        return 0.0f;
+      }
+    }
+
+    __device__ __forceinline__
     void set_lsh_coord(index_t global_idx, uint8_t edge_idx, uint8_t rank, uint16_t coord) {
       if constexpr (use_lsh) {
         index_t local_idx = to_local(global_idx);
@@ -686,7 +712,7 @@ struct graph {
         assert((coord & uint16_t{0x8000}) == 0 && "coord must fit in 15 bits");
         uint16_t& slot = segments[segment_of(local_idx)]
             .edge_lshs[local_of(local_idx)]
-            .packed[edge_idx][rank];
+            .rows[edge_idx].packed[rank];
         slot = (slot & uint16_t{0x8000}) | (coord & uint16_t{0x7FFF});
       } else {
         assert(false && "set_lsh_coord called with use_lsh=false");
@@ -700,11 +726,24 @@ struct graph {
         assert(local_idx < n_vectors && "global_idx out of bounds");
         uint16_t& slot = segments[segment_of(local_idx)]
             .edge_lshs[local_of(local_idx)]
-            .packed[edge_idx][rank];
+            .rows[edge_idx].packed[rank];
         if (is_positive) slot &= uint16_t{0x7FFF};
         else             slot |= uint16_t{0x8000};
       } else {
         assert(false && "set_lsh_sign called with use_lsh=false");
+      }
+    }
+
+    __device__ __forceinline__
+    void set_lsh_mag_sq(index_t global_idx, uint8_t edge_idx, __nv_bfloat16 mag_sq) {
+      if constexpr (use_lsh) {
+        index_t local_idx = to_local(global_idx);
+        assert(local_idx < n_vectors && "global_idx out of bounds");
+        segments[segment_of(local_idx)]
+            .edge_lshs[local_of(local_idx)]
+            .rows[edge_idx].mag_sq = mag_sq;
+      } else {
+        assert(false && "set_lsh_mag_sq called with use_lsh=false");
       }
     }
   };
