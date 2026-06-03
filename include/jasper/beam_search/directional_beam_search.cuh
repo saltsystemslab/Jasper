@@ -312,6 +312,11 @@ __global__ void directional_beam_search_kernel(
   p += sizeof(uint32_t);
 
   p = reinterpret_cast<unsigned char*>(
+      (reinterpret_cast<uintptr_t>(p) + 7) & ~uintptr_t(7));
+  ENTRY_T* __restrict__ merge_scratch = reinterpret_cast<ENTRY_T*>(p);
+  p += GRAPH_CFG::n_neighbors * sizeof(ENTRY_T);
+
+  p = reinterpret_cast<unsigned char*>(
         (reinterpret_cast<uintptr_t>(p) + 15) & ~uintptr_t(15));
   DATA_T* __restrict__ smem_query_vec = reinterpret_cast<DATA_T*>(p);
   p += padded_dim * sizeof(DATA_T);
@@ -332,13 +337,23 @@ __global__ void directional_beam_search_kernel(
   //   typename BlockScanT::TempStorage      scan_storage;
   // };
   // __shared__ TempStorage temp_storage;
-  constexpr uint32_t ELEMENTS_PER_THREAD = (MAX_SEARCH_WIDTH - 1) / BLOCK_SIZE + 1;
-  using BlockRadixSortT = cub::BlockRadixSort<uint32_t, BLOCK_SIZE,
-                                              ELEMENTS_PER_THREAD, uint32_t>;
-  using BlockScanT      = cub::BlockScan<uint32_t, BLOCK_SIZE>;
+  // constexpr uint32_t ELEMENTS_PER_THREAD = (MAX_SEARCH_WIDTH - 1) / BLOCK_SIZE + 1;
+  // using BlockRadixSortT = cub::BlockRadixSort<uint32_t, BLOCK_SIZE,
+  //                                             ELEMENTS_PER_THREAD, uint32_t>;
+  // using SmallSortT = cub::BlockRadixSort<uint32_t, GRAPH_CFG::n_neighbors, 1, uint32_t>;
+  // using BlockScanT      = cub::BlockScan<uint32_t, BLOCK_SIZE>;
+  // union TempStorage {
+  //   typename BlockRadixSortT::TempStorage sort_storage;
+  //   typename BlockScanT::TempStorage      scan_storage;
+  // };
+  // __shared__ TempStorage temp_storage;
+  constexpr uint32_t TAIL_EPT =
+    (GRAPH_CFG::n_neighbors + BLOCK_SIZE - 1) / BLOCK_SIZE;
+  using TailSortT  = cub::BlockMergeSort<ENTRY_T, BLOCK_SIZE, TAIL_EPT>;
+  using BlockScanT = cub::BlockScan<uint32_t, BLOCK_SIZE>;
   union TempStorage {
-    typename BlockRadixSortT::TempStorage sort_storage;
-    typename BlockScanT::TempStorage      scan_storage;
+    typename TailSortT::TempStorage  tail_sort_storage;
+    typename BlockScanT::TempStorage scan_storage;
   };
   __shared__ TempStorage temp_storage;
 
@@ -421,10 +436,16 @@ __global__ void directional_beam_search_kernel(
     // 7) Sort / dedup / clip the candidate buffer (estimated distances).
     // merge_sort<INDEX_T, DISTANCE_T, BLOCK_SIZE, MAX_SEARCH_WIDTH, BlockMergeSortT>(
     //     result_buffer, result_buffer_count, temp_storage.sort_storage);
-    radix_sort<INDEX_T, DISTANCE_T, BLOCK_SIZE, MAX_SEARCH_WIDTH, BlockRadixSortT>(
-      result_buffer, result_buffer_count, temp_storage.sort_storage);
+    // radix_sort<INDEX_T, DISTANCE_T, BLOCK_SIZE, MAX_SEARCH_WIDTH, BlockRadixSortT>(
+    //   result_buffer, result_buffer_count, temp_storage.sort_storage);
+    merge_sort_tail<INDEX_T, DISTANCE_T, BLOCK_SIZE, MAX_SEARCH_WIDTH,
+                GRAPH_CFG::n_neighbors, TailSortT>(
+      result_buffer, result_buffer_count, /*head_len=*/offset,
+      merge_scratch, temp_storage.tail_sort_storage);
+
     dedup_results<INDEX_T, DISTANCE_T, BLOCK_SIZE, MAX_SEARCH_WIDTH, BlockScanT>(
         result_buffer, result_buffer_count, temp_storage.scan_storage);
+
     clip_k(result_buffer_count, beam_width);
   }
 
@@ -455,14 +476,16 @@ __host__ inline uint32_t get_directional_smem_size(
 {
   using DATA_T = typename GRAPH_CFG::data_t;
   uint32_t s = 0;
-  s += sizeof(ENTRY_T) * (beam_width + GRAPH_CFG::n_neighbors); // candidate_buffer
-  s += sizeof(uint32_t);                       // candidate_buffer_count
+  s += sizeof(ENTRY_T) * (beam_width + GRAPH_CFG::n_neighbors); // result_buffer
+  s += sizeof(uint32_t);                                         // result_buffer_count
   s = (s + 7) & ~7u;
-  s += sizeof(ENTRY_T) * k;                    // frontier_buffer
-  s += sizeof(uint32_t);                       // frontier_buffer_count
+  s += sizeof(ENTRY_T) * k;                                      // frontier_buffer
+  s += sizeof(uint32_t);                                         // frontier_buffer_count
+  s = (s + 7) & ~7u;
+  s += sizeof(ENTRY_T) * GRAPH_CFG::n_neighbors;                 // merge_scratch  (NEW)
   s = (s + 15) & ~15u;
-  s += sizeof(DATA_T) * padded_dim;            // smem_query_vec
-  s += sizeof(DATA_T) * padded_dim;            // smem_qu_diff
+  s += sizeof(DATA_T) * padded_dim;                              // smem_query_vec
+  s += sizeof(DATA_T) * padded_dim;                              // smem_qu_diff
   return s;
 }
 
