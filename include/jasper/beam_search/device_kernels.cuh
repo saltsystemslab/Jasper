@@ -287,4 +287,124 @@ __device__ void dedup_results(ENTRY_T *result_buffer,
   __syncthreads();
 }
 
+template <typename LessT>
+__device__ __forceinline__ uint32_t merge_path_search(
+    const ENTRY_T* __restrict__ A, uint32_t lenA,
+    const ENTRY_T* __restrict__ B, uint32_t lenB,
+    uint32_t diag, LessT less)
+{
+  uint32_t lo = (diag > lenB) ? (diag - lenB) : 0u;
+  uint32_t hi = (diag < lenA) ? diag : lenA;
+  while (lo < hi) {
+    uint32_t mid = (lo + hi) >> 1;
+    // Advance lo while A[mid] <= B[diag-1-mid] (i.e. !less(B[…], A[mid])).
+    if (!less(B[diag - 1 - mid], A[mid])) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  return lo;
+}
+
+// Sort result_buffer[0..count) exploiting the fact that
+//   result_buffer[0 .. head_len)      is already sorted ascending,
+//   result_buffer[head_len .. count)  (≤ MAX_NEIGHBORS items) is unordered.
+//
+// Phase 1 — small CUB block sort over just the tail (TAIL_EPT items/thread).
+// Phase 2 — parallel merge-path merge of head (in result_buffer) with sorted
+//           tail (staged in `scratch`), writing back into result_buffer.
+//
+// `scratch` must have ≥ MAX_NEIGHBORS ENTRY_T slots in shared memory.
+template <typename INDEX_T, typename DISTANCE_T,
+          uint32_t BLOCK_SIZE, uint32_t MAX_SEARCH_WIDTH,
+          uint32_t MAX_NEIGHBORS, typename TailSortT>
+__device__ void merge_sort_tail(
+    ENTRY_T*  __restrict__ result_buffer,
+    uint32_t* __restrict__ result_buffer_count,
+    uint32_t               head_len,
+    ENTRY_T*  __restrict__ scratch,
+    typename TailSortT::TempStorage& tail_temp)
+{
+  const uint32_t count    = result_buffer_count[0];
+  const uint32_t tail_len = (count > head_len) ? (count - head_len) : 0u;
+
+  // No new neighbors → head is already the answer.
+  if (tail_len == 0) { __syncthreads(); return; }
+
+  // ─── Phase 1: load + sort the tail in registers ──────────────────────
+  constexpr uint32_t TAIL_EPT =
+      (MAX_NEIGHBORS + BLOCK_SIZE - 1) / BLOCK_SIZE;
+  ENTRY_T tail_items[TAIL_EPT];
+
+  #pragma unroll
+  for (uint32_t i = 0; i < TAIL_EPT; ++i) {
+    const uint32_t lid = threadIdx.x * TAIL_EPT + i;
+    tail_items[i] = (lid < tail_len)
+        ? result_buffer[head_len + lid]
+        : empty_entry();                  // pad sorts to the end
+  }
+  TailSortT(tail_temp).Sort(tail_items, CustomPairLess());
+
+  // Stage sorted tail in scratch so the merge can address it randomly.
+  #pragma unroll
+  for (uint32_t i = 0; i < TAIL_EPT; ++i) {
+    const uint32_t lid = threadIdx.x * TAIL_EPT + i;
+    if (lid < tail_len) scratch[lid] = tail_items[i];
+  }
+  __syncthreads();
+
+  // Degenerate: empty head → result_buffer is just the sorted tail.
+  if (head_len == 0) {
+    for (uint32_t i = threadIdx.x; i < tail_len; i += BLOCK_SIZE)
+      result_buffer[i] = scratch[i];
+    __syncthreads();
+    return;
+  }
+
+  // ─── Phase 2: parallel merge via merge-path partitioning ─────────────
+  constexpr uint32_t MERGE_EPT =
+      (MAX_SEARCH_WIDTH + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+  CustomPairLess less{};
+  const uint32_t diag_lo = min(threadIdx.x * MERGE_EPT, count);
+  const uint32_t diag_hi = min(diag_lo + MERGE_EPT, count);
+
+  // Bound this thread's output window with two partition points.
+  const uint32_t i_lo = merge_path_search(result_buffer, head_len,
+                                          scratch, tail_len, diag_lo, less);
+  const uint32_t i_hi = merge_path_search(result_buffer, head_len,
+                                          scratch, tail_len, diag_hi, less);
+  const uint32_t j_lo = diag_lo - i_lo;
+  const uint32_t j_hi = diag_hi - i_hi;
+  const uint32_t a_n  = i_hi - i_lo;
+  const uint32_t b_n  = j_hi - j_lo;   // a_n + b_n == diag_hi - diag_lo
+
+  // Read this thread's input window BEFORE any thread starts writing —
+  // otherwise an overlapping write to result_buffer[k < head_len] could
+  // race against another thread's read of the head.
+  ENTRY_T my_a[MERGE_EPT];
+  ENTRY_T my_b[MERGE_EPT];
+  #pragma unroll
+  for (uint32_t k = 0; k < MERGE_EPT; ++k)
+    if (k < a_n) my_a[k] = result_buffer[i_lo + k];
+  #pragma unroll
+  for (uint32_t k = 0; k < MERGE_EPT; ++k)
+    if (k < b_n) my_b[k] = scratch[j_lo + k];
+
+  __syncthreads();   // all reads of result_buffer done; safe to overwrite.
+
+  // Serial merge of my_a and my_b into result_buffer[diag_lo .. diag_hi).
+  uint32_t ia = 0, ib = 0;
+  for (uint32_t k = 0; k < a_n + b_n; ++k) {
+    ENTRY_T out;
+    if      (ia >= a_n)                 out = my_b[ib++];
+    else if (ib >= b_n)                 out = my_a[ia++];
+    else if (!less(my_b[ib], my_a[ia])) out = my_a[ia++];
+    else                                out = my_b[ib++];
+    result_buffer[diag_lo + k] = out;
+  }
+  __syncthreads();
+}
+
 }
