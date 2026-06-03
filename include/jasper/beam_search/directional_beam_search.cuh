@@ -286,16 +286,16 @@ __global__ void directional_beam_search_kernel(
   const uint32_t  padded_dim = graph.get_padded_dim();
   constexpr INDEX_T INVALID_INDEX = static_cast<INDEX_T>(0x7FFFFFFFu);
 
-  assert(beam_width + 64 <= MAX_SEARCH_WIDTH);
+  assert(beam_width + GRAPH_CFG::n_neighbors <= MAX_SEARCH_WIDTH);
 
   // ---- Shared memory layout ----
-  //   result_buffer[beam_width+64]    ENTRY_T   (candidate buffer, estimated dists)
+  //   result_buffer[beam_width+n_neighbors]    ENTRY_T   (candidate buffer, estimated dists)
   //   result_buffer_count             uint32_t
   //   frontier_buffer[k]              ENTRY_T   (top-k by EXACT dist, sorted asc)
   //   frontier_buffer_count           uint32_t
   //   smem_query_vec[padded_dim]      DATA_T
   //   smem_qu_diff[padded_dim]        DATA_T    (q - u for current explored u)
-  const uint32_t result_buffer_size = beam_width + 64;
+  const uint32_t result_buffer_size = beam_width + GRAPH_CFG::n_neighbors;
   extern __shared__ __align__(16) unsigned char smem_raw[];
   unsigned char* p = smem_raw;
 
@@ -455,8 +455,8 @@ __host__ inline uint32_t get_directional_smem_size(
 {
   using DATA_T = typename GRAPH_CFG::data_t;
   uint32_t s = 0;
-  s += sizeof(ENTRY_T) * (beam_width + 64);   // result_buffer
-  s += sizeof(uint32_t);                       // result_buffer_count
+  s += sizeof(ENTRY_T) * (beam_width + GRAPH_CFG::n_neighbors); // candidate_buffer
+  s += sizeof(uint32_t);                       // candidate_buffer_count
   s = (s + 7) & ~7u;
   s += sizeof(ENTRY_T) * k;                    // frontier_buffer
   s += sizeof(uint32_t);                       // frontier_buffer_count
