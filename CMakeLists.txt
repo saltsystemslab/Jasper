@@ -102,9 +102,10 @@ if(JASPER_BUILD_CMD)
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
   )
   set_target_properties(create_lsh_index PROPERTIES
-    CUDA_ARCHITECTURES "89;90;120"
+    CUDA_ARCHITECTURES "120"
     CUDA_SEPARABLE_COMPILATION ON
   )
+  target_compile_definitions(create_lsh_index PRIVATE JASPER_PROFILE_CLOCKS)
 
   add_executable(run_query cmd/run_query.cu)
   target_link_libraries(run_query PRIVATE jasper)

@@ -13,6 +13,13 @@
 
 #include "jasper/jasper.cuh"
 
+
+#if defined(JASPER_PROFILE_CLOCKS)
+namespace jasper {
+__device__ uint64_t g_phase_clocks[PHASE_COUNT];
+}  // namespace jasper
+#endif
+
 #define CUDA_CHECK(call)                                                       \
   do {                                                                         \
     cudaError_t err = (call);                                                  \
@@ -232,11 +239,13 @@ void run_directional_round(
     .get_visited = false,
   };
 
+  jasper::reset_phase_clocks();
   run_round_generic(
     n_queries, k, beam_width, limit, gt, print_throughput,
     [&]() {
       return jasper::directional_search(graph, globals, query_view, params);
     });
+  jasper::print_phase_clocks();
 }
 
 template <typename DataT>

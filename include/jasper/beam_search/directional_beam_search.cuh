@@ -15,6 +15,68 @@ namespace cg = cooperative_groups;
 
 namespace jasper {
 
+// ── Clock-based phase profiling ───────────────────────────────────────────────
+#if defined(JASPER_PROFILE_CLOCKS)
+
+enum PhaseIdx : int {
+  PHASE_POP      = 0,
+  PHASE_EXACT    = 1,
+  PHASE_FRONTIER = 2,
+  PHASE_EXPAND   = 3,
+  PHASE_ESTIMATE = 4,
+  PHASE_SORT     = 5,
+  PHASE_DEDUP    = 6,
+  PHASE_CLIP     = 7,
+  PHASE_COUNT    = 8,
+};
+
+extern __device__ uint64_t g_phase_clocks[PHASE_COUNT];
+
+#define CLOCK_START(var) \
+  uint64_t var = 0; \
+  if (blockIdx.x == 0 && threadIdx.x == 0) { var = clock64(); }
+
+#define CLOCK_ACCUM(var, phase) \
+  if (blockIdx.x == 0 && threadIdx.x == 0) { \
+    uint64_t _end = clock64(); \
+    atomicAdd(reinterpret_cast<unsigned long long*>(&g_phase_clocks[phase]), \
+              static_cast<unsigned long long>(_end - (var))); \
+  }
+
+inline void print_phase_clocks(double sm_clock_ghz = 1.98) {
+  uint64_t h_clocks[PHASE_COUNT];
+  cudaMemcpyFromSymbol(h_clocks, g_phase_clocks, sizeof(uint64_t) * PHASE_COUNT);
+  const char* names[PHASE_COUNT] = {
+    "pop_candidate", "exact_distance", "frontier_insert",
+    "expand_neighbors", "estimate_distances",
+    "sort_and_merge", "dedup_results", "clip_k"
+  };
+  uint64_t total = 0;
+  for (int i = 0; i < PHASE_COUNT; ++i) total += h_clocks[i];
+  printf("\n=== Phase clock breakdown (block 0) ===\n");
+  for (int i = 0; i < PHASE_COUNT; ++i) {
+    double pct = total > 0 ? 100.0 * h_clocks[i] / total : 0.0;
+    double ms  = h_clocks[i] / (sm_clock_ghz * 1e6);
+    printf("  %-22s %12llu cycles  %6.1f%%  %.3f ms\n",
+           names[i], (unsigned long long)h_clocks[i], pct, ms);
+  }
+  printf("  %-22s %12llu cycles  100.0%%\n",
+         "TOTAL", (unsigned long long)total);
+}
+
+inline void reset_phase_clocks() {
+  void* ptr = nullptr;
+  cudaGetSymbolAddress(&ptr, g_phase_clocks);
+  cudaMemset(ptr, 0, sizeof(uint64_t) * PHASE_COUNT);
+}
+
+#else
+#define CLOCK_START(var)        ((void)0)
+#define CLOCK_ACCUM(var, phase) ((void)0)
+inline void print_phase_clocks(double = 1.98) {}
+inline void reset_phase_clocks() {}
+#endif  // JASPER_PROFILE_CLOCKS
+
 // ===== Helper: ||q - u||^2 (exact) + store (q - u) in smem, single pass =====
 // Requires DATA_T == __half and padded_dim divisible by 8.
 // vector_view::pad already rounds padded_dim up to ≥16, so the divisibility
@@ -377,9 +439,12 @@ __global__ void directional_beam_search_kernel(
     ++loop_count;
 
     // 1) Pop next candidate (lowest estimated distance, not yet visited).
+    __syncthreads();
+    CLOCK_START(t_pop);
     auto [frontierIdx, found] =
         choose_new_frontier<INDEX_T, DISTANCE_T, BLOCK_SIZE, MAX_SEARCH_WIDTH>(
             result_buffer, result_buffer_count);
+    CLOCK_ACCUM(t_pop, PHASE_POP);
     if (!found) break;
 
     // 2) Mark visited in candidate buffer (so we never pop it again).
@@ -397,12 +462,15 @@ __global__ void directional_beam_search_kernel(
 
     // 3) Fetch u's full vector. Compute (q-u) into smem and EXACT ||q-u||² in
     //    one pass. This is the ONE I/O per explored node referenced in the paper.
+    CLOCK_START(t_exact);
     DATA_T* u_vec = graph.get_vector(u_gid);
     const float exact_dist_u_sq =
         compute_qu_diff_and_l2sq<DATA_T, BLOCK_SIZE>(
             smem_query_vec, u_vec, smem_qu_diff, padded_dim);
+    CLOCK_ACCUM(t_exact, PHASE_EXACT);
 
     // 4) Add u to frontier (top-k explored by EXACT dist) and visited log.
+    CLOCK_START(t_frontier);
     if (threadIdx.x == 0) {
       ENTRY_T u_entry =
           set_distance(set_index(empty_entry(), u_gid), exact_dist_u_sq);
@@ -418,35 +486,46 @@ __global__ void directional_beam_search_kernel(
     ++visited_counter;
     if (visited_counter == MAX_RESULT_SIZE) break;
     __syncthreads();
+    CLOCK_ACCUM(t_frontier, PHASE_FRONTIER);
 
     // 5) Append u's neighbors to candidates as placeholders (no neighbor I/O).
+    CLOCK_START(t_expand);
     const uint32_t offset = result_buffer_count[0];
     __syncthreads();
     add_frontier_out<GRAPH_CFG>(graph, result_buffer, result_buffer_count,
                                 u_gid, k, beam_width);
     __syncthreads();
+    CLOCK_ACCUM(t_expand, PHASE_EXPAND);
 
     // 6) ESTIMATE ||q-v||² for the newly-appended neighbors using the LSH info
     //    stored on edges (u, v) — no fetch of v's vector required.
+    CLOCK_START(t_estimate);
     const uint8_t n_edges = graph.get_edge_count(u_gid);
     populate_estimated_distances<GRAPH_CFG>(
         smem_qu_diff, exact_dist_u_sq, graph, u_gid, globals, inv_norm_denom,
         result_buffer, offset, n_edges);
+    CLOCK_ACCUM(t_estimate, PHASE_ESTIMATE);
 
     // 7) Sort / dedup / clip the candidate buffer (estimated distances).
     // merge_sort<INDEX_T, DISTANCE_T, BLOCK_SIZE, MAX_SEARCH_WIDTH, BlockMergeSortT>(
     //     result_buffer, result_buffer_count, temp_storage.sort_storage);
     // radix_sort<INDEX_T, DISTANCE_T, BLOCK_SIZE, MAX_SEARCH_WIDTH, BlockRadixSortT>(
     //   result_buffer, result_buffer_count, temp_storage.sort_storage);
+    CLOCK_START(t_sort);
     merge_sort_tail<INDEX_T, DISTANCE_T, BLOCK_SIZE, MAX_SEARCH_WIDTH,
                 GRAPH_CFG::n_neighbors, TailSortT>(
       result_buffer, result_buffer_count, /*head_len=*/offset,
       merge_scratch, temp_storage.tail_sort_storage);
+    CLOCK_ACCUM(t_sort, PHASE_SORT);
 
+    CLOCK_START(t_dedup);
     dedup_results<INDEX_T, DISTANCE_T, BLOCK_SIZE, MAX_SEARCH_WIDTH, BlockScanT>(
         result_buffer, result_buffer_count, temp_storage.scan_storage);
+    CLOCK_ACCUM(t_dedup, PHASE_DEDUP);
 
+    CLOCK_START(t_clip);
     clip_k(result_buffer_count, beam_width);
+    CLOCK_ACCUM(t_clip,  PHASE_CLIP);
   }
 
   // ---- Write top-k from frontier_buffer (already sorted ascending) ----
