@@ -53,6 +53,7 @@ def main():
     print(f"Graph construction complete, time: {elapsed:.4f} seconds.")
 
     queries = jasper.read_bin(args.queries, args.dtype).to(device="cuda")
+    print(f"Read {queries.dim()} queries")
     gt_indices, gt_distances = jasper.read_groundtruth(args.groundtruth, args.k)
 
     if args.out_index != "":

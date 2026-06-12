@@ -105,7 +105,18 @@ if(JASPER_BUILD_CMD)
     CUDA_ARCHITECTURES "120"
     CUDA_SEPARABLE_COMPILATION ON
   )
-  target_compile_definitions(create_lsh_index PRIVATE JASPER_PROFILE_CLOCKS)
+  # target_compile_definitions(create_lsh_index PRIVATE JASPER_PROFILE_CLOCKS)
+
+  add_executable(create_lsh_index_block_tuning cmd/create_lsh_index_block_tuning.cu)
+  target_link_libraries(create_lsh_index_block_tuning PRIVATE jasper)
+  set_target_properties(create_lsh_index_block_tuning PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+  )
+  set_target_properties(create_lsh_index_block_tuning PROPERTIES
+    CUDA_ARCHITECTURES "120"
+    CUDA_SEPARABLE_COMPILATION ON
+  )
 
   add_executable(run_query cmd/run_query.cu)
   target_link_libraries(run_query PRIVATE jasper)

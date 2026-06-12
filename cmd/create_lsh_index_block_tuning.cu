@@ -10,7 +10,6 @@
 #include <set>
 #include <stdexcept>
 #include <cuda_fp16.h>
-#include <chrono>
 
 #include "jasper/jasper.cuh"
 
@@ -33,6 +32,9 @@ __device__ uint64_t g_phase_clocks[PHASE_COUNT];
 
 // (CONFIG_ID, INDEX_T, N_NEIGHBORS, DATA_T, DISTANCE_T, DIST_FUNC, K_RANKS)
 #define JASPER_FOR_EACH_CONFIG(X)                                              \
+  X(f16_r32_l2_k4,  uint32_t, 32, __half, float, jasper::distance_func::L2,  4) \
+  X(f16_r32_l2_k8,  uint32_t, 32, __half, float, jasper::distance_func::L2,  8)  \
+  X(f16_r32_l2_k16, uint32_t, 32, __half, float, jasper::distance_func::L2, 16)  \
   X(f16_r64_l2_k4,  uint32_t, 64, __half, float, jasper::distance_func::L2,  4)  \
   X(f16_r64_l2_k8,  uint32_t, 64, __half, float, jasper::distance_func::L2,  8)  \
   X(f16_r64_l2_k16, uint32_t, 64, __half, float, jasper::distance_func::L2, 16)
@@ -59,18 +61,6 @@ __global__ void unpack_results_kernel(
     out_indices[i]   = static_cast<int32_t>(pairs[i].first);
     out_distances[i] = pairs[i].second;
   }
-}
-
-// Helper to print available memory
-void print_available_memory() {
-  size_t free_byte, total_byte;
-  cudaMemGetInfo(&free_byte, &total_byte);
-  
-  double free_db = (double)free_byte / (1024 * 1024);
-  double total_db = (double)total_byte / (1024 * 1024);
-  
-  printf("GPU memory usage: used = %f MB, free = %f MB, total = %f MB\n", 
-          total_db - free_db, free_db, total_db);
 }
 
 // ── Ground truth I/O & recall ──────────────────────────────────
@@ -202,7 +192,7 @@ void run_round_generic(
 }
 
 // ── Single conventional beam-search round ──────────────────────
-template <typename GraphCfg, typename DataT>
+template <typename GraphCfg, typename DataT, uint32_t BLOCK_SIZE=128>
 void run_beam_search_round(
     jasper::graph<GraphCfg>& graph,
     DataT*    d_queries,
@@ -224,11 +214,11 @@ void run_beam_search_round(
 
   run_round_generic(
     n_queries, k, beam_width, limit, gt, print_throughput,
-    [&]() { return jasper::search(graph, query_view, params); });
+    [&]() { return jasper::search<GraphCfg, BLOCK_SIZE>(graph, query_view, params); });
 }
 
 // ── Single directional-search round ────────────────────────────
-template <typename GraphCfg, typename DataT>
+template <typename GraphCfg, typename DataT, uint32_t BLOCK_SIZE=128>
 void run_directional_round(
     jasper::graph<GraphCfg>&                       graph,
     const jasper::lsh_globals<GraphCfg::k_ranks>&  globals,
@@ -253,7 +243,7 @@ void run_directional_round(
   run_round_generic(
     n_queries, k, beam_width, limit, gt, print_throughput,
     [&]() {
-      return jasper::directional_search(graph, globals, query_view, params);
+      return jasper::directional_search<GraphCfg, BLOCK_SIZE>(graph, globals, query_view, params);
     });
   jasper::print_phase_clocks();
 }
@@ -314,8 +304,6 @@ void benchmark_all(
     uint32_t k,
     const std::vector<std::pair<uint32_t, uint32_t>>& beam_limit_pairs) {
 
-  print_available_memory();
-
   std::cout << "Loading queries..." << std::endl;
   jasper::vector_view<DataT> h_queries_view;
   if (src_dtype == "float") {
@@ -354,30 +342,124 @@ void benchmark_all(
 
   auto [warmup_bw, warmup_limit] = beam_limit_pairs.front();
 
-  print_available_memory();
-
   // ─── Conventional beam search ───────────────────────────────
-  std::cout << "\n=== Conventional Beam Search Benchmark (k=" << k << ") ===" << std::endl;
+  std::cout << "\n=== Conventional Beam Search Benchmark (k=" << k << ", block_size=32) ===" << std::endl;
   std::cout << "Warmup..." << std::endl;
-  run_beam_search_round<GraphCfg, DataT>(
+  run_beam_search_round<GraphCfg, DataT, 32>(
     graph, d_queries, n_queries, dim, k,
     warmup_bw, warmup_limit, nullptr, false);
 
   for (auto& [bw, lim] : beam_limit_pairs) {
-    run_beam_search_round<GraphCfg, DataT>(
+    run_beam_search_round<GraphCfg, DataT, 32>(
+      graph, d_queries, n_queries, dim, k,
+      bw, lim, has_gt ? &gt : nullptr, true);
+  }
+
+  std::cout << "\n=== Conventional Beam Search Benchmark (k=" << k << ", block_size=64) ===" << std::endl;
+  std::cout << "Warmup..." << std::endl;
+  run_beam_search_round<GraphCfg, DataT, 64>(
+    graph, d_queries, n_queries, dim, k,
+    warmup_bw, warmup_limit, nullptr, false);
+
+  for (auto& [bw, lim] : beam_limit_pairs) {
+    run_beam_search_round<GraphCfg, DataT, 64>(
+      graph, d_queries, n_queries, dim, k,
+      bw, lim, has_gt ? &gt : nullptr, true);
+  }
+
+  std::cout << "\n=== Conventional Beam Search Benchmark (k=" << k << ", block_size=128) ===" << std::endl;
+  std::cout << "Warmup..." << std::endl;
+  run_beam_search_round<GraphCfg, DataT, 128>(
+    graph, d_queries, n_queries, dim, k,
+    warmup_bw, warmup_limit, nullptr, false);
+
+  for (auto& [bw, lim] : beam_limit_pairs) {
+    run_beam_search_round<GraphCfg, DataT, 128>(
+      graph, d_queries, n_queries, dim, k,
+      bw, lim, has_gt ? &gt : nullptr, true);
+  }
+
+  std::cout << "\n=== Conventional Beam Search Benchmark (k=" << k << ", block_size=256) ===" << std::endl;
+  std::cout << "Warmup..." << std::endl;
+  run_beam_search_round<GraphCfg, DataT, 256>(
+    graph, d_queries, n_queries, dim, k,
+    warmup_bw, warmup_limit, nullptr, false);
+
+  for (auto& [bw, lim] : beam_limit_pairs) {
+    run_beam_search_round<GraphCfg, DataT, 256>(
+      graph, d_queries, n_queries, dim, k,
+      bw, lim, has_gt ? &gt : nullptr, true);
+  }
+
+  std::cout << "\n=== Conventional Beam Search Benchmark (k=" << k << ", block_size=512) ===" << std::endl;
+  std::cout << "Warmup..." << std::endl;
+  run_beam_search_round<GraphCfg, DataT, 512>(
+    graph, d_queries, n_queries, dim, k,
+    warmup_bw, warmup_limit, nullptr, false);
+
+  for (auto& [bw, lim] : beam_limit_pairs) {
+    run_beam_search_round<GraphCfg, DataT, 512>(
       graph, d_queries, n_queries, dim, k,
       bw, lim, has_gt ? &gt : nullptr, true);
   }
 
   // ─── Directional beam search ────────────────────────────────
-  std::cout << "\n=== Directional Beam Search Benchmark (k=" << k << ") ===" << std::endl;
+  std::cout << "\n=== Directional Beam Search Benchmark (k=" << k << ", block_size=32) ===" << std::endl;
   std::cout << "Warmup..." << std::endl;
-  run_directional_round<GraphCfg, DataT>(
+  run_directional_round<GraphCfg, DataT,32>(
     graph, globals, d_queries, n_queries, dim, k,
     warmup_bw, warmup_limit, nullptr, false);
 
   for (auto& [bw, lim] : beam_limit_pairs) {
-    run_directional_round<GraphCfg, DataT>(
+    run_directional_round<GraphCfg, DataT,32>(
+      graph, globals, d_queries, n_queries, dim, k,
+      bw, lim, has_gt ? &gt : nullptr, true);
+  }
+
+  std::cout << "\n=== Directional Beam Search Benchmark (k=" << k << ", block_size=64) ===" << std::endl;
+  std::cout << "Warmup..." << std::endl;
+  run_directional_round<GraphCfg, DataT,64>(
+    graph, globals, d_queries, n_queries, dim, k,
+    warmup_bw, warmup_limit, nullptr, false);
+
+  for (auto& [bw, lim] : beam_limit_pairs) {
+    run_directional_round<GraphCfg, DataT,64>(
+      graph, globals, d_queries, n_queries, dim, k,
+      bw, lim, has_gt ? &gt : nullptr, true);
+  }
+
+  std::cout << "\n=== Directional Beam Search Benchmark (k=" << k << ", block_size=128) ===" << std::endl;
+  std::cout << "Warmup..." << std::endl;
+  run_directional_round<GraphCfg, DataT,128>(
+    graph, globals, d_queries, n_queries, dim, k,
+    warmup_bw, warmup_limit, nullptr, false);
+
+  for (auto& [bw, lim] : beam_limit_pairs) {
+    run_directional_round<GraphCfg, DataT,128>(
+      graph, globals, d_queries, n_queries, dim, k,
+      bw, lim, has_gt ? &gt : nullptr, true);
+  }
+
+  std::cout << "\n=== Directional Beam Search Benchmark (k=" << k << ", block_size=256) ===" << std::endl;
+  std::cout << "Warmup..." << std::endl;
+  run_directional_round<GraphCfg, DataT,256>(
+    graph, globals, d_queries, n_queries, dim, k,
+    warmup_bw, warmup_limit, nullptr, false);
+
+  for (auto& [bw, lim] : beam_limit_pairs) {
+    run_directional_round<GraphCfg, DataT,256>(
+      graph, globals, d_queries, n_queries, dim, k,
+      bw, lim, has_gt ? &gt : nullptr, true);
+  }
+
+  std::cout << "\n=== Directional Beam Search Benchmark (k=" << k << ", block_size=512) ===" << std::endl;
+  std::cout << "Warmup..." << std::endl;
+  run_directional_round<GraphCfg, DataT,512>(
+    graph, globals, d_queries, n_queries, dim, k,
+    warmup_bw, warmup_limit, nullptr, false);
+
+  for (auto& [bw, lim] : beam_limit_pairs) {
+    run_directional_round<GraphCfg, DataT,512>(
       graph, globals, d_queries, n_queries, dim, k,
       bw, lim, has_gt ? &gt : nullptr, true);
   }
@@ -452,23 +534,11 @@ void construct_and_save(const std::string& filename,
   std::cout << "  Constructing graph..." << std::endl;
   auto g = jasper::construct_graph<ConstructCfg>(params);
 
-  cudaDeviceSynchronize();
-  auto t0 = std::chrono::steady_clock::now();
   std::cout << "  Populating graph lsh..." << std::endl;
   g.populate_edge_lsh();
-  cudaDeviceSynchronize();
-  auto t1 = std::chrono::steady_clock::now();
 
   std::cout << "  Sampling for lsh global..." << std::endl;
   auto lsh_globals = g.generate_lsh_globals(/*n_samples=*/32768);
-
-  auto t2 = std::chrono::steady_clock::now();
-
-  auto ms1 = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
-  auto ms2 = std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count();
-
-  std::cout << "  populate_edge_lsh: "      << ms1 << " ms\n";
-  std::cout << "  generate_lsh_globals: "   << ms2 << " ms\n";
 
   g.move_to(on_host); // move to host
 
@@ -594,7 +664,7 @@ int main(int argc, char** argv) {
   program.add_argument("--beam_limits", "-b")
     .default_value(std::vector<std::string>{
       "1:128", "2:128", "4:128", "8:128", "16:128",
-      "32:128", "64:128", "128:256", "256:512", "512:1024", "1024:2048", "1536:2048", "1982:2048"
+      "32:128", "64:128", "128:256", "256:512", "512:1024", "1024:2048"
     })
     .nargs(argparse::nargs_pattern::at_least_one)
     .help("beam_width:limit pairs to benchmark (e.g. 16:128 64:256)");
