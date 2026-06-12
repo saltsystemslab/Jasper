@@ -1022,6 +1022,8 @@ __host__ graph<typename CONSTRUCT_GRAPH_CONFIG::graph_cfg_t> construct_graph(
     // Same orientation trick as rotate_data_vec in rotation.cuh, but with
     // stride = padded_dim to skip row pad lanes. Uses __half I/O with FP32
     // accumulation for accuracy.
+    cudaDeviceSynchronize();
+    auto r0 = std::chrono::steady_clock::now();
     cublasHandle_t handle;
     cublasCreate(&handle);
     cublasSetStream(handle, stream);
@@ -1048,6 +1050,10 @@ __host__ graph<typename CONSTRUCT_GRAPH_CONFIG::graph_cfg_t> construct_graph(
           "cublasGemmEx failed during prerotate: status=" +
           std::to_string(stat));
     }
+    cudaDeviceSynchronize();
+    auto r1 = std::chrono::steady_clock::now();
+    auto rs1 = std::chrono::duration_cast<std::chrono::milliseconds>(r1 - r0).count();
+    std::cout << "  rotate_data_vectors: "      << rs1 << " ms\n";
 
     cudaMemcpyKind kind =
         input_on_host ? cudaMemcpyDeviceToHost : cudaMemcpyDeviceToDevice;
