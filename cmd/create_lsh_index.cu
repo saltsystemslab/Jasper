@@ -31,18 +31,18 @@ __device__ uint64_t g_phase_clocks[PHASE_COUNT];
     }                                                                          \
   } while (0)
 
-// (CONFIG_ID, INDEX_T, N_NEIGHBORS, DATA_T, DISTANCE_T, DIST_FUNC, K_RANKS)
+// (CONFIG_ID, INDEX_T, N_NEIGHBORS, DATA_T, DISTANCE_T, DIST_FUNC, K_RANKS, PACKED_T)
 #define JASPER_FOR_EACH_CONFIG(X)                                              \
-  X(f16_r64_l2_k4,  uint32_t, 64, __half, float, jasper::distance_func::L2,  4)  \
-  X(f16_r64_l2_k8,  uint32_t, 64, __half, float, jasper::distance_func::L2,  8)  \
-  X(f16_r64_l2_k16, uint32_t, 64, __half, float, jasper::distance_func::L2, 16)
-  // X(f16_r64_ip_k4,  uint32_t, 64, __half, float, jasper::distance_func::INNER_PRODUCT,  4)  \
-  // X(f16_r64_ip_k8,  uint32_t, 64, __half, float, jasper::distance_func::INNER_PRODUCT,  8)  \
-  // X(f16_r64_ip_k16, uint32_t, 64, __half, float, jasper::distance_func::INNER_PRODUCT, 16)
+  X(f16_r64_l2_k4_d128,  uint32_t, 64, __half, float, jasper::distance_func::L2,  4, uint8_t)  \
+  X(f16_r64_l2_k8_d128,  uint32_t, 64, __half, float, jasper::distance_func::L2,  8, uint8_t)  \
+  X(f16_r64_l2_k16_d128, uint32_t, 64, __half, float, jasper::distance_func::L2, 16, uint8_t)  \
+  X(f16_r64_l2_k4_d32678,  uint32_t, 64, __half, float, jasper::distance_func::L2,  4, uint16_t)  \
+  X(f16_r64_l2_k8_d32678,  uint32_t, 64, __half, float, jasper::distance_func::L2,  8, uint16_t)  \
+  X(f16_r64_l2_k16_d32678, uint32_t, 64, __half, float, jasper::distance_func::L2, 16, uint16_t)  \
 
 // Graph + construct config types. K_RANKS is now a macro parameter.
-#define DECLARE_CONFIGS(id, IDX, R, DAT, DIST, FUNC, KR)                       \
-  using cfg_##id = jasper::graph_config<IDX, R, DAT, DIST, FUNC, true, KR>;    \
+#define DECLARE_CONFIGS(id, IDX, R, DAT, DIST, FUNC, KR, PACKEDT)                       \
+  using cfg_##id = jasper::graph_config<IDX, R, DAT, DIST, FUNC, true, KR, PACKEDT>;    \
   using construct_cfg_##id = jasper::graph_construct_config<cfg_##id, 64, 4, R, 64>;
 
 JASPER_FOR_EACH_CONFIG(DECLARE_CONFIGS)
@@ -452,25 +452,31 @@ void construct_and_save(const std::string& filename,
   std::cout << "  Constructing graph..." << std::endl;
   auto g = jasper::construct_graph<ConstructCfg>(params);
 
+
   cudaDeviceSynchronize();
   auto t0 = std::chrono::steady_clock::now();
-  std::cout << "  Populating graph lsh..." << std::endl;
-  g.populate_edge_lsh();
-  cudaDeviceSynchronize();
-  auto t1 = std::chrono::steady_clock::now();
 
   std::cout << "  Sampling for lsh global..." << std::endl;
   auto lsh_globals = g.generate_lsh_globals(/*n_samples=*/32768);
+  cudaDeviceSynchronize();
 
-  auto t2 = std::chrono::steady_clock::now();
-
-  auto ms1 = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
-  auto ms2 = std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count();
-
-  std::cout << "  populate_edge_lsh: "      << ms1 << " ms\n";
-  std::cout << "  generate_lsh_globals: "   << ms2 << " ms\n";
+  auto t1 = std::chrono::steady_clock::now();
 
   g.move_to(on_host); // move to host
+
+  auto t2 = std::chrono::steady_clock::now();
+  
+  std::cout << "  Populating graph lsh..." << std::endl;
+  g.populate_edge_lsh();
+  cudaDeviceSynchronize();
+
+  auto t3 = std::chrono::steady_clock::now();
+
+  auto ms1 = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+  auto ms2 = std::chrono::duration_cast<std::chrono::milliseconds>(t3 - t2).count();
+
+  std::cout << "  generate_lsh_globals: "   << ms1 << " ms\n";
+  std::cout << "  populate_edge_lsh: "      << ms2 << " ms\n";
 
   // ── Benchmark step ───────────────────────────────────────────
   if (!query_path.empty()) {
@@ -486,12 +492,16 @@ void construct_and_save(const std::string& filename,
 }
 
 // ── Dispatch ───────────────────────────────────────────────────
-template <jasper::distance_func Func, uint32_t KR>
+template <jasper::distance_func Func, uint32_t KR, typename PackedT>
 bool config_matches(const std::string& datatype, uint64_t n_neighbors,
-                    const std::string& distance, uint64_t R, uint32_t k_ranks) {
+                    const std::string& distance, uint64_t R, uint32_t k_ranks,
+                    uint32_t dim) {
   std::string expected_dist = (Func == jasper::distance_func::L2) ? "l2" : "ip";
   bool dtype_ok = (datatype == "float" || datatype == "uint8");
-  return dtype_ok && n_neighbors == R && distance == expected_dist && k_ranks == KR;
+  // uint8_t packing → d128 configs (dim <= 128); uint16_t packing → d32678 (dim > 128).
+  bool dim_ok = (sizeof(PackedT) == 1) ? (dim <= 128) : (dim > 128);
+  return dtype_ok && n_neighbors == R && distance == expected_dist &&
+         k_ranks == KR && dim_ok;
 }
 
 void dispatch(const std::string& datatype,
@@ -508,8 +518,8 @@ void dispatch(const std::string& datatype,
               const std::vector<std::pair<uint32_t, uint32_t>>& beam_limit_pairs,
               bool on_host) {
 
-  #define TRY_DISPATCH(id, IDX, R, DAT, DIST, FUNC, KR)                       \
-    if (config_matches<FUNC, KR>(datatype, n_neighbors, distance, R, k_ranks)) { \
+  #define TRY_DISPATCH(id, IDX, R, DAT, DIST, FUNC, KR, PACKEDT)              \
+    if (config_matches<FUNC, KR, PACKEDT>(datatype, n_neighbors, distance, R, k_ranks, dim)) { \
       std::cout << "  Config: " #id << std::endl;                             \
       construct_and_save<cfg_##id, construct_cfg_##id, DAT>(                  \
           filename, query_path, gt_path, datatype,                            \
