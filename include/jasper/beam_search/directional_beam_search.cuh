@@ -209,8 +209,17 @@ __device__ __forceinline__ void populate_estimated_distances(
 {
   using INDEX_T  = typename GRAPH_CFG::index_t;
   using row_t    = typename GRAPH_CFG::edge_lsh_list_t::row_t;
-  constexpr uint8_t K_RANKS       = GRAPH_CFG::k_ranks;
-  constexpr INDEX_T INVALID_INDEX = static_cast<INDEX_T>(0x7FFFFFFFu);
+  using PACKED_T = typename GRAPH_CFG::packed_t;
+  constexpr uint8_t  K_RANKS       = GRAPH_CFG::k_ranks;
+  constexpr INDEX_T  INVALID_INDEX = static_cast<INDEX_T>(0x7FFFFFFFu);
+
+  // Packed-word layout (compile-time): sign in the MSB, coord in the low bits.
+  // packed_t is uint8_t (7-bit coord) or uint16_t (15-bit coord).
+  constexpr PACKED_T SIGN_MASK    = static_cast<PACKED_T>(PACKED_T{1} << (sizeof(PACKED_T) * 8 - 1));
+  constexpr PACKED_T COORD_MASK   = static_cast<PACKED_T>(~SIGN_MASK);
+  constexpr uint32_t PACKED_BYTES = static_cast<uint32_t>(K_RANKS) * sizeof(PACKED_T);
+  // mag_sq follows the packed array, aligned up to alignof(bf16) == 2.
+  constexpr uint32_t MAG_OFFSET   = (PACKED_BYTES + 1u) & ~1u;
 
   // Hoist u-side segment lookup.
   const INDEX_T  u_lid    = u_gid - graph.global_offset;
@@ -218,11 +227,12 @@ __device__ __forceinline__ void populate_estimated_distances(
   const uint32_t u_locidx = static_cast<uint32_t>(u_lid % GRAPH_CFG::vectors_per_segment);
   const auto&    u_segment = graph.segments[u_segid];
 
-  // Row stride in uint16 units. For K=4: sizeof(row_t)/2 = 12/2 = 6.
-  // For K=8: 20/2 = 10.
-  const uint16_t* __restrict__ row_base =
-      reinterpret_cast<const uint16_t*>(&u_segment.edge_lshs[u_locidx].rows[0]);
-  constexpr uint32_t ROW_U16_STRIDE = sizeof(row_t) / sizeof(uint16_t);
+  // Row stride in bytes. row_t = packed_t packed[K_RANKS] + bf16 mag_sq, with
+  // __align__(4) padding up to a 4-byte multiple.
+  //   u8/K=4: 4 + 2 → 8 bytes.   u16/K=8: 16 + 2 → 20 bytes.
+  const uint8_t* __restrict__ row_base =
+      reinterpret_cast<const uint8_t*>(&u_segment.edge_lshs[u_locidx].rows[0]);
+  constexpr uint32_t ROW_BYTES = sizeof(row_t);
 
   // c_per_rank in registers.
   float c_reg[K_RANKS];
@@ -234,48 +244,47 @@ __device__ __forceinline__ void populate_estimated_distances(
     INDEX_T v     = static_cast<INDEX_T>(get_index(entry));
     if (v == INVALID_INDEX) continue;
 
-    const uint16_t* row_ptr = row_base + e * ROW_U16_STRIDE;
+    const uint8_t* row_ptr = row_base + e * ROW_BYTES;
 
-    // ─── Load K_RANKS LSH words + mag_sq from same 32B cache sector ──
-    uint16_t p[K_RANKS];
-    if constexpr (K_RANKS == 4) {
-      const uint32_t lsh_lo = __ldg(reinterpret_cast<const uint32_t*>(row_ptr));
-      const uint32_t lsh_hi = __ldg(reinterpret_cast<const uint32_t*>(row_ptr) + 1);
-      p[0] = static_cast<uint16_t>( lsh_lo        & 0xFFFFu);
-      p[1] = static_cast<uint16_t>((lsh_lo >> 16) & 0xFFFFu);
-      p[2] = static_cast<uint16_t>( lsh_hi        & 0xFFFFu);
-      p[3] = static_cast<uint16_t>((lsh_hi >> 16) & 0xFFFFu);
-    } else if constexpr (K_RANKS == 8) {
-      const uint32_t* p32 = reinterpret_cast<const uint32_t*>(row_ptr);
-      const uint32_t w0 = __ldg(p32 + 0);
-      const uint32_t w1 = __ldg(p32 + 1);
-      const uint32_t w2 = __ldg(p32 + 2);
-      const uint32_t w3 = __ldg(p32 + 3);
-      p[0] = static_cast<uint16_t>( w0        & 0xFFFFu);
-      p[1] = static_cast<uint16_t>((w0 >> 16) & 0xFFFFu);
-      p[2] = static_cast<uint16_t>( w1        & 0xFFFFu);
-      p[3] = static_cast<uint16_t>((w1 >> 16) & 0xFFFFu);
-      p[4] = static_cast<uint16_t>( w2        & 0xFFFFu);
-      p[5] = static_cast<uint16_t>((w2 >> 16) & 0xFFFFu);
-      p[6] = static_cast<uint16_t>( w3        & 0xFFFFu);
-      p[7] = static_cast<uint16_t>((w3 >> 16) & 0xFFFFu);
-    } else {
+    // ─── Load K_RANKS packed words + mag_sq from the same row ──
+    PACKED_T p[K_RANKS];
+    if constexpr (PACKED_BYTES % 4u == 0u) {
+      // Packed array is a whole number of 32-bit words → vectorize the loads
+      // (row_ptr is 4-byte aligned via row_t's __align__(4)).
+      constexpr uint32_t N_WORDS = PACKED_BYTES / 4u;
+      const uint32_t* __restrict__ p32 = reinterpret_cast<const uint32_t*>(row_ptr);
+      uint32_t words[N_WORDS];
       #pragma unroll
-      for (uint8_t r = 0; r < K_RANKS; ++r) p[r] = __ldg(row_ptr + r);
+      for (uint32_t w = 0; w < N_WORDS; ++w) words[w] = __ldg(p32 + w);
+      #pragma unroll
+      for (uint32_t r = 0; r < K_RANKS; ++r) {
+        if constexpr (sizeof(PACKED_T) == 1u) {
+          p[r] = static_cast<PACKED_T>((words[r >> 2] >> ((r & 3u) * 8u)) & 0xFFu);
+        } else {
+          p[r] = static_cast<PACKED_T>((words[r >> 1] >> ((r & 1u) * 16u)) & 0xFFFFu);
+        }
+      }
+    } else {
+      // Odd packed size (e.g. uint8_t with K_RANKS not a multiple of 4): load
+      // each packed word directly.
+      const PACKED_T* __restrict__ pp = reinterpret_cast<const PACKED_T*>(row_ptr);
+      #pragma unroll
+      for (uint8_t r = 0; r < K_RANKS; ++r) p[r] = __ldg(pp + r);
     }
 
-    // mag_sq sits immediately after the K_RANKS LSH words.
+    // mag_sq sits after the packed array (MAG_OFFSET accounts for sizeof(packed_t)
+    // and bf16 alignment padding).
     const __nv_bfloat16 mag_sq_bf = __ldg(
-        reinterpret_cast<const __nv_bfloat16*>(row_ptr + K_RANKS));
+        reinterpret_cast<const __nv_bfloat16*>(row_ptr + MAG_OFFSET));
     const float mag_sq = __bfloat162float(mag_sq_bf);
 
     // ─── Estimator ───
     float dot_acc = 0.0f;
     #pragma unroll
     for (uint8_t r = 0; r < K_RANKS; ++r) {
-      const uint16_t word  = p[r];
-      const uint16_t coord = word & uint16_t{0x7FFF};
-      const float    sgn   = (word & uint16_t{0x8000}) ? -1.0f : +1.0f;
+      const PACKED_T word  = p[r];
+      const uint32_t coord = static_cast<uint32_t>(word & COORD_MASK);
+      const float    sgn   = (word & SIGN_MASK) ? -1.0f : +1.0f;
       const float    diff  = static_cast<float>(smem_qu_diff[coord]);
       dot_acc += c_reg[r] * sgn * diff;
     }

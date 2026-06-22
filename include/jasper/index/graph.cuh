@@ -40,13 +40,15 @@ template <typename INDEX_T,
           typename DISTANCE_T,
           distance_func DIST_FUNC,
           bool USE_LSH = false,
-          uint8_t K_RANKS = 0>
+          uint8_t K_RANKS = 0,
+          typename PACKED_T = uint8_t>
 struct graph_config {
   using index_t = INDEX_T;
   using data_t = DATA_T;
   using distance_t = DISTANCE_T;
   using edge_list_t = edge_list<INDEX_T, N_NEIGHBORS>;
-  using edge_lsh_list_t = edge_lsh_list<INDEX_T, N_NEIGHBORS, K_RANKS>;
+  using edge_lsh_list_t = edge_lsh_list<INDEX_T, N_NEIGHBORS, K_RANKS, PACKED_T>;
+  using packed_t = PACKED_T;
   using vector_view_t = vector_view<DATA_T>;
   
   static constexpr uint8_t n_neighbors = N_NEIGHBORS;
@@ -102,21 +104,32 @@ struct graph_segment {
 
     seg.vectors = vector_view_t::allocate(dim, max_vectors, on_host);
 
-    if constexpr (graph_cfg::use_lsh) {
-      if (on_host) {
-        check(cudaMallocHost(&seg.edge_lshs,
-                             max_vectors * sizeof(edge_lsh_list_t)),
-              "cudaMallocHost(edge_lshs)");
-      } else {
-        check(cudaMalloc(&seg.edge_lshs,
-                         max_vectors * sizeof(edge_lsh_list_t)),
-              "cudaMalloc(edge_lshs)");
-      }
-    } else {
-      seg.edge_lshs = nullptr;
-    }
+    // edge_lshs is allocated lazily on the first populate_edge_lsh() call.
+    seg.edge_lshs = nullptr;
 
     return seg;
+  }
+
+  // Lazily allocate the edge_lsh storage. No-op if already allocated or if
+  // use_lsh is disabled. Allocated on host pinned memory or device to match
+  // this segment's on_host flag.
+  void allocate_edge_lsh() {
+    if constexpr (graph_cfg::use_lsh) {
+      if (edge_lshs != nullptr) return;
+
+      auto check = [](cudaError_t err, const char* name) {
+        if (err != cudaSuccess)
+          throw std::runtime_error(std::string(name) + " failed: " + cudaGetErrorString(err));
+      };
+
+      if (on_host) {
+        check(cudaMallocHost(&edge_lshs, max_vectors * sizeof(edge_lsh_list_t)),
+              "cudaMallocHost(edge_lshs)");
+      } else {
+        check(cudaMalloc(&edge_lshs, max_vectors * sizeof(edge_lsh_list_t)),
+              "cudaMalloc(edge_lshs)");
+      }
+    }
   }
 
   void deallocate() {
@@ -158,7 +171,8 @@ struct graph_segment {
       cudaMallocHost(&new_edge_counts, max_vectors * sizeof(uint8_t));
       std::memset(new_edge_counts, 0,  max_vectors * sizeof(uint8_t));
       if constexpr (graph_cfg::use_lsh) {
-        cudaMallocHost(&new_edge_lshs, max_vectors * sizeof(edge_lsh_list_t));
+        if (edge_lshs != nullptr)
+          cudaMallocHost(&new_edge_lshs, max_vectors * sizeof(edge_lsh_list_t));
       }
     } else {
       cudaMalloc(&new_edges,       max_vectors * sizeof(edge_list_t));
@@ -166,7 +180,8 @@ struct graph_segment {
       cudaMemsetAsync(new_edge_counts, 0,
                       max_vectors * sizeof(uint8_t), stream);
       if constexpr (graph_cfg::use_lsh) {
-        cudaMalloc(&new_edge_lshs, max_vectors * sizeof(edge_lsh_list_t));
+        if (edge_lshs != nullptr)
+          cudaMalloc(&new_edge_lshs, max_vectors * sizeof(edge_lsh_list_t));
       }
     }
     vector_view_t new_vectors =
@@ -181,9 +196,10 @@ struct graph_segment {
                       static_cast<size_t>(n_vectors) * sizeof(uint8_t),
                       copy_kind, stream);
       if constexpr (graph_cfg::use_lsh) {
-        cudaMemcpyAsync(new_edge_lshs, edge_lshs,
-                        static_cast<size_t>(n_vectors) * sizeof(edge_lsh_list_t),
-                        copy_kind, stream);
+        if (edge_lshs != nullptr)
+          cudaMemcpyAsync(new_edge_lshs, edge_lshs,
+                          static_cast<size_t>(n_vectors) * sizeof(edge_lsh_list_t),
+                          copy_kind, stream);
       }
       cudaMemcpyAsync(new_vectors.data, vectors.data,
                       static_cast<size_t>(n_vectors) * padded_dim * sizeof(data_t),
@@ -240,9 +256,12 @@ struct graph_segment {
                       static_cast<size_t>(n_vectors) * sizeof(uint8_t),
                       kind, stream);
       if constexpr (graph_cfg::use_lsh) {
-        cudaMemcpyAsync(target.edge_lshs, edge_lshs,
-                        static_cast<size_t>(n_vectors) * sizeof(edge_lsh_list_t),
-                        kind, stream);
+        if (edge_lshs != nullptr) {
+          target.allocate_edge_lsh();  // no-op if target already has it
+          cudaMemcpyAsync(target.edge_lshs, edge_lshs,
+                          static_cast<size_t>(n_vectors) * sizeof(edge_lsh_list_t),
+                          kind, stream);
+        }
       }
       cudaMemcpyAsync(target.vectors.data, vectors.data,
                       static_cast<size_t>(n_vectors) * padded_dim * sizeof(data_t),
@@ -329,6 +348,7 @@ struct graph {
   using segment_t   = graph_segment<graph_cfg>;
   using edge_list_t = typename graph_cfg::edge_list_t;
   using edge_lsh_list_t = typename graph_cfg::edge_lsh_list_t;
+  using packed_t = typename graph_cfg::packed_t;
   using vector_view_t    = typename graph_cfg::vector_view_t;
 
   static constexpr uint32_t n_neighbors = graph_cfg::n_neighbors;
@@ -663,7 +683,7 @@ struct graph {
     }
 
     __device__ __forceinline__
-    uint16_t get_lsh_coord(index_t global_idx, uint8_t edge_idx, uint8_t rank) const {
+    uint32_t get_lsh_coord(index_t global_idx, uint8_t edge_idx, uint8_t rank) const {
       if constexpr (use_lsh) {
         index_t local_idx = to_local(global_idx);
         assert(local_idx < n_vectors && "global_idx out of bounds");
@@ -677,16 +697,35 @@ struct graph {
     }
 
     __device__ __forceinline__
-    float get_lsh_sign(index_t global_idx, uint8_t edge_idx, uint8_t rank) const {
+    void set_lsh_coord(index_t global_idx, uint8_t edge_idx, uint8_t rank, uint32_t coord) {
+      if constexpr (use_lsh) {
+        // slot width (uint8_t / uint16_t) is fixed at compile time by packed_t.
+        constexpr packed_t SIGN_MASK  = static_cast<packed_t>(packed_t{1} << (sizeof(packed_t) * 8 - 1));
+        constexpr packed_t COORD_MASK = static_cast<packed_t>(~SIGN_MASK);
+        index_t local_idx = to_local(global_idx);
+        assert(local_idx < n_vectors && "global_idx out of bounds");
+        assert(coord <= COORD_MASK && "coord does not fit in packed_t coord bits");
+        packed_t& slot = segments[segment_of(local_idx)]
+            .edge_lshs[local_of(local_idx)]
+            .rows[edge_idx].packed[rank];
+        slot = static_cast<packed_t>((slot & SIGN_MASK) | (static_cast<packed_t>(coord) & COORD_MASK));
+      } else {
+        assert(false && "set_lsh_coord called with use_lsh=false");
+      }
+    }
+
+    // Store a pre-packed coord|sign word (sign in the MSB, coord in the low
+    // bits) in one write — used when the caller already holds the packed form.
+    __device__ __forceinline__
+    void set_lsh_packed(index_t global_idx, uint8_t edge_idx, uint8_t rank, packed_t word) {
       if constexpr (use_lsh) {
         index_t local_idx = to_local(global_idx);
         assert(local_idx < n_vectors && "global_idx out of bounds");
-        return segments[segment_of(local_idx)]
+        segments[segment_of(local_idx)]
             .edge_lshs[local_of(local_idx)]
-            .get_sign(edge_idx, rank);
+            .rows[edge_idx].packed[rank] = word;
       } else {
-        assert(false && "get_lsh_sign called with use_lsh=false");
-        return 0.0f;
+        assert(false && "set_lsh_packed called with use_lsh=false");
       }
     }
 
@@ -705,30 +744,17 @@ struct graph {
     }
 
     __device__ __forceinline__
-    void set_lsh_coord(index_t global_idx, uint8_t edge_idx, uint8_t rank, uint16_t coord) {
-      if constexpr (use_lsh) {
-        index_t local_idx = to_local(global_idx);
-        assert(local_idx < n_vectors && "global_idx out of bounds");
-        assert((coord & uint16_t{0x8000}) == 0 && "coord must fit in 15 bits");
-        uint16_t& slot = segments[segment_of(local_idx)]
-            .edge_lshs[local_of(local_idx)]
-            .rows[edge_idx].packed[rank];
-        slot = (slot & uint16_t{0x8000}) | (coord & uint16_t{0x7FFF});
-      } else {
-        assert(false && "set_lsh_coord called with use_lsh=false");
-      }
-    }
-
-    __device__ __forceinline__
     void set_lsh_sign(index_t global_idx, uint8_t edge_idx, uint8_t rank, bool is_positive) {
       if constexpr (use_lsh) {
+        constexpr packed_t SIGN_MASK  = static_cast<packed_t>(packed_t{1} << (sizeof(packed_t) * 8 - 1));
+        constexpr packed_t COORD_MASK = static_cast<packed_t>(~SIGN_MASK);
         index_t local_idx = to_local(global_idx);
         assert(local_idx < n_vectors && "global_idx out of bounds");
-        uint16_t& slot = segments[segment_of(local_idx)]
+        packed_t& slot = segments[segment_of(local_idx)]
             .edge_lshs[local_of(local_idx)]
             .rows[edge_idx].packed[rank];
-        if (is_positive) slot &= uint16_t{0x7FFF};
-        else             slot |= uint16_t{0x8000};
+        if (is_positive) slot &= COORD_MASK;
+        else             slot |= SIGN_MASK;
       } else {
         assert(false && "set_lsh_sign called with use_lsh=false");
       }
@@ -823,6 +849,23 @@ struct graph {
     static_assert(graph_cfg::use_lsh,
                   "populate_edge_lsh requires graph_cfg::use_lsh");
 
+    // Lazily allocate edge_lsh storage on the first call. Pull the segment
+    // structs back to host, allocate any missing edge_lsh buffers, then
+    // re-upload so the device-side structs (and view()) see the new pointers.
+    {
+      std::vector<segment_t> h_segs(segments.begin(), segments.end());
+      bool any_allocated = false;
+      for (auto& seg : h_segs) {
+        if (seg.edge_lshs == nullptr) {
+          seg.allocate_edge_lsh();
+          any_allocated = true;
+        }
+      }
+      if (any_allocated) {
+        segments = thrust::device_vector<segment_t>(h_segs.begin(), h_segs.end());
+      }
+    }
+
     // Pick a block size. 128 or 256 is usually fine for this kernel since the
     // work per thread is light. Put it in graph_cfg if you want it tunable.
     constexpr uint32_t block_threads = 128;
@@ -912,7 +955,7 @@ struct graph {
   }
 
   __host__ void dump_edge_lsh(index_t start = 0, index_t count = 10,
-                            std::ostream& out = std::cout) const {
+                          std::ostream& out = std::cout) const {
     if constexpr (!graph_cfg::use_lsh) {
       out << "[dump_edge_lsh] use_lsh disabled for this config\n";
       return;
@@ -928,6 +971,12 @@ struct graph {
         uint8_t         cnt;
         edge_list_t     edges;
         edge_lsh_list_t el;
+
+        if (h_segs[seg_id].edge_lshs == nullptr) {
+          out << "[" << (idx + global_offset)
+              << "] LSH not populated (call populate_edge_lsh() first)\n";
+          continue;
+        }
 
         if (on_host) {
           cnt   = h_segs[seg_id].edge_counts[loc];
@@ -949,9 +998,8 @@ struct graph {
           out << "  edge[" << static_cast<int>(e)
               << "] -> " << edges.edges[e] << ":";
           for (uint32_t r = 0; r < graph_cfg::k_ranks; ++r) {
-            const uint16_t p     = el.packed[e][r];
-            const uint16_t coord = p & uint16_t{0x7FFF};
-            const char     sgn   = (p & uint16_t{0x8000}) ? '-' : '+';
+            const uint32_t coord = el.get_coord(e, r);
+            const char     sgn   = (el.get_sign(e, r) < 0.0f) ? '-' : '+';
             out << ' ' << sgn << coord;
           }
           out << '\n';

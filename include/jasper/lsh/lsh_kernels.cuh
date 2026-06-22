@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cassert>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
@@ -17,6 +18,17 @@ __global__ void populate_lsh(graph_t g) {
   const index_t  query_gid = query_lid + g.global_offset;
   const uint32_t padded_dim = g.get_padded_dim();
   const uint8_t  k_ranks    = graph_cfg::k_ranks;
+
+  // The dim index is packed into the low COORD_BITS of the sort key and later
+  // stored in a packed_t LSH coord slot (uint8_t → 7 bits, uint16_t → 15 bits).
+  using packed_t = typename graph_cfg::packed_t;
+  constexpr uint32_t COORD_BITS = sizeof(packed_t) * 8u - 1u;
+  constexpr uint32_t COORD_MASK = (1u << COORD_BITS) - 1u;
+  constexpr uint32_t SIGN_SHIFT = COORD_BITS;
+  constexpr uint32_t MAG_SHIFT  = COORD_BITS + 1u;
+
+  assert(padded_dim <= COORD_MASK + 1u &&
+         "populate_lsh: padded_dim exceeds the dim-index width of packed_t");
 
   extern __shared__ unsigned char smem_lsh[];
   data_t   *relative_vec = reinterpret_cast<data_t*>(smem_lsh);
@@ -37,6 +49,10 @@ __global__ void populate_lsh(graph_t g) {
     data_t *neighbor_vec = g.get_vector(neighbor_gid);
 
     // ─── Build Δ, packed keys, AND accumulate ||Δ||² in one pass ─────
+    // Key layout (uint32_t, MSB → LSB), parametrized by packed_t width:
+    //   magnitude : |d| as half bits, at bits [MAG_SHIFT .. MAG_SHIFT+14] (sort key)
+    //   sign      : bit SIGN_SHIFT (1 = negative)
+    //   dim index : low COORD_BITS bits (0 .. COORD_MASK)
     float l2sq_local = 0.0f;
     for (uint32_t i = threadIdx.x; i < padded_dim; i += blockDim.x) {
       data_t   d        = neighbor_vec[i] - query_vec[i];
@@ -44,7 +60,7 @@ __global__ void populate_lsh(graph_t g) {
       uint16_t bits     = __half_as_ushort(d);
       uint32_t abs_key  = bits & 0x7FFFu;
       uint32_t sign_bit = (bits >> 15) & 1u;
-      keys[i] = (abs_key << 16) | (sign_bit << 15) | (i & 0x7FFFu);
+      keys[i] = (abs_key << MAG_SHIFT) | (sign_bit << SIGN_SHIFT) | (i & COORD_MASK);
 
       float f      = __half2float(d);
       l2sq_local  += f * f;
@@ -95,18 +111,18 @@ __global__ void populate_lsh(graph_t g) {
       const uint32_t block_max = warp_scratch[0];
 
       if (threadIdx.x == 0) {
-        const uint32_t win_dim = block_max & 0x7FFFu;
-        const bool     neg     = (block_max >> 15) & 1u;
-        g.set_lsh_coord(query_gid, static_cast<uint8_t>(neighbor_idx), r,
-                        static_cast<uint16_t>(win_dim));
-        g.set_lsh_sign (query_gid, static_cast<uint8_t>(neighbor_idx), r,
-                        /*is_positive=*/ !neg);
+        const uint32_t win_dim = block_max & COORD_MASK;
+        // block_max's low (COORD_BITS+1) bits already match the packed_t coord|
+        // sign layout, so casting to packed_t drops the magnitude bits and
+        // yields the word directly — one write instead of two RMWs.
+        g.set_lsh_packed(query_gid, static_cast<uint8_t>(neighbor_idx), r,
+                         static_cast<packed_t>(block_max));
         keys[win_dim] = 0;
       }
       __syncthreads();
     }
 
-    // ─── Store mag_sq for this edge as __half ────────────────────────
+    // ─── Store mag_sq for this edge as bf16 ──────────────────────────
     if (threadIdx.x == 0) {
       g.set_lsh_mag_sq(query_gid, static_cast<uint8_t>(neighbor_idx),
                        __float2bfloat16(s_mag_sq));
