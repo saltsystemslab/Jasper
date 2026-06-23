@@ -12,10 +12,10 @@
 
 // (CONFIG_ID, INDEX_T, N_NEIGHBORS, DATA_T, DISTANCE_T, DIST_FUNC)
 #define JASPER_FOR_EACH_CONFIG(X)                                              \
-  X(f16_r32_l2,   uint32_t, 32,  __half,   float, jasper::distance_func::L2)             \
-  X(f16_r64_l2,   uint32_t, 64,  __half,   float, jasper::distance_func::L2)             \
-  X(f16_r32_ip,   uint32_t, 32,  __half,   float, jasper::distance_func::INNER_PRODUCT)  \
-  X(f16_r64_ip,   uint32_t, 64,  __half,   float, jasper::distance_func::INNER_PRODUCT)
+  X(f16_r32_l2, uint32_t, 32, __half, float, jasper::distance_func::L2)             \
+  X(f16_r64_l2, uint32_t, 64, __half, float, jasper::distance_func::L2)             \
+  X(f16_r32_ip, uint32_t, 32, __half, float, jasper::distance_func::INNER_PRODUCT)  \
+  X(f16_r64_ip, uint32_t, 64, __half, float, jasper::distance_func::INNER_PRODUCT)
 
 #define DECLARE_CONFIGS(id, IDX, R, DAT, DIST, FUNC)                          \
   using cfg_##id          = jasper::graph_config<IDX, R, DAT, DIST, FUNC>;   \
@@ -103,23 +103,19 @@ void construct(
 
   print_available_memory();
 
+  std::cout << "  Average degree: " << ig.avg_degree() << "\n";
+
+  // Fused concat + save: stream partitions straight to disk in global order,
+  // freeing each as it is written so peak host memory never doubles.
   t0 = std::chrono::steady_clock::now();
-  auto g = ig.concat();
+  std::cout << "  Saving index to: " << index_out << std::endl;
+  ig.save_to_file(index_out);
   t1 = std::chrono::steady_clock::now();
   elapsed_s = std::chrono::duration<double>(t1 - t0).count();
-  std::cout << "  concat: " << std::fixed << std::setprecision(3)
+  std::cout << "  concat+save: " << std::fixed << std::setprecision(3)
             << elapsed_s << " s" << std::endl;
 
-  std::cout << "  Average degree: " << g.avg_degree() << "\n";
-
-  //g.dump_neighborhood(0, 100);
-
-  std::cout << "  Saving index to: " << index_out << std::endl;
-  jasper::save_graph_to_file(g, index_out);
-
   cudaFreeHost(vecs.data);
-  for (auto& g : ig.partitions) g.deallocate();
-  g.deallocate();
 }
 
 // All configs use __half for storage. Source dtype (float / uint8) is
