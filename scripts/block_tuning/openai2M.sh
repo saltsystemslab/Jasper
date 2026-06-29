@@ -2,7 +2,7 @@
 
 FILENAME="/projects/SaltSystemsLab/ann_data/openai/openai_base.bin"
 QUERIES="/projects/SaltSystemsLab/ann_data/openai/openai_query.bin"
-GROUNDTRUTH="/projects/SaltSystemsLab/ann_gt/openai_gt"
+GROUNDTRUTH="/projects/SaltSystemsLab/ann_gt/openai-gt"
 DATATYPE="float"
 DIM="1536"
 

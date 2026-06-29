@@ -118,6 +118,17 @@ if(JASPER_BUILD_CMD)
     CUDA_SEPARABLE_COMPILATION ON
   )
 
+  add_executable(incremental_construction cmd/incremental_construction.cu)
+  target_link_libraries(incremental_construction PRIVATE jasper)
+  set_target_properties(incremental_construction PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+  )
+  set_target_properties(incremental_construction PROPERTIES
+    CUDA_ARCHITECTURES "89;90;120"
+    CUDA_SEPARABLE_COMPILATION ON
+  )
+
   add_executable(run_query cmd/run_query.cu)
   target_link_libraries(run_query PRIVATE jasper)
   set_target_properties(run_query PROPERTIES

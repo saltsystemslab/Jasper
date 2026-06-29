@@ -5,7 +5,7 @@ QUERIES="/projects/SaltSystemsLab/ann_data/gist/gist_query.bin"
 DATATYPE="float"
 DIM="960"
 
-GROUNDTRUTH="/projects/SaltSystemsLab/ann_gt/gist_gt"
+GROUNDTRUTH="/projects/SaltSystemsLab/ann_gt/gist-gt"
 DISTANCE="l2"
 N_NEIGHBORS=64
 BEAM_LIMITS="1:128 2:128 4:128 8:128 16:128 32:128 64:128 128:256 256:512 512:1024 1024:2048 1536:2048 1982:2048"

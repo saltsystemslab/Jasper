@@ -914,12 +914,14 @@ __host__ void construction_round(
   float alpha,
   uint32_t max_batch_size,
   construct_timer& timer,
-  cudaStream_t stream = 0
+  cudaStream_t stream = 0,
+  uint32_t start = 0
 ){
-  uint32_t count = 0;
+  uint32_t count = start;
   uint32_t batch_size = 1;
 
-  std::printf("[construct] round alpha=%.2f, n_vectors=%u, max_batch_size=%u\n", alpha, graph.n_vectors, max_batch_size);
+  std::printf("[construct] round alpha=%.2f, range=[%u, %u), max_batch_size=%u\n",
+              alpha, start, graph.n_vectors, max_batch_size);
 
   while (count < graph.n_vectors) {
     batch_size = std::min(batch_size, graph.n_vectors - count);
@@ -941,6 +943,45 @@ __host__ void construction_round(
 
   std::printf("\n");
   // std::printf("\n[construct] round complete\n");
+}
+
+// Append a batch of new vectors to an existing graph and build their neighbor
+// lists. The vectors are inserted via graph::insert (growing segments and
+// n_vectors as needed, copying only the vector data), then a single
+// construction round runs over just the newly inserted range
+// [start, graph.n_vectors). Existing edges are preserved; the reverse-edge
+// pass may attach back-edges from new nodes onto existing ones.
+//
+// Note: new_vectors must already live in the same (rotated, if the base graph
+// was prerotated) space as the graph's stored vectors.
+template <typename CONSTRUCT_GRAPH_CONFIG,
+          typename BEAM_SEARCH_CONFIG>
+__host__ void insert_and_construct(
+  typename CONSTRUCT_GRAPH_CONFIG::graph_t &graph,
+  graph_construct_workspace<CONSTRUCT_GRAPH_CONFIG> &ws,
+  typename CONSTRUCT_GRAPH_CONFIG::vector_view_t new_vectors,
+  float alpha,
+  uint32_t max_batch_size,
+  construct_timer& timer,
+  cudaStream_t stream = 0
+){
+  using index_t = typename CONSTRUCT_GRAPH_CONFIG::index_t;
+
+  if (new_vectors.n_vectors == 0) return;
+
+  // Append the new vectors: grows segments if needed, copies data, and bumps
+  // graph.n_vectors. Returns the global index of the first inserted vector.
+  const index_t start = graph.insert(new_vectors);
+
+  std::printf("[insert] appended %u vectors at [%u, %u)\n",
+              static_cast<uint32_t>(graph.n_vectors - start),
+              static_cast<uint32_t>(start),
+              static_cast<uint32_t>(graph.n_vectors));
+
+  // Build edges for only the newly inserted range.
+  construction_round<CONSTRUCT_GRAPH_CONFIG, BEAM_SEARCH_CONFIG>(
+    graph, ws, alpha, max_batch_size, timer, stream,
+    static_cast<uint32_t>(start));
 }
 
 template <typename CONSTRUCT_GRAPH_CONFIG>

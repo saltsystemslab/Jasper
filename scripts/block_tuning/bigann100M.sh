@@ -1,8 +1,8 @@
 #!/bin/bash
 
-FILENAME="/projects/SaltSystemsLab/ann_data/bigann/bigann100M"
+FILENAME="/projects/SaltSystemsLab/ann_data/bigann/bigann10M"
 QUERIES="/projects/SaltSystemsLab/ann_data/bigann/bigann10kquery"
-GROUNDTRUTH="/projects/SaltSystemsLab/ann_gt/GT_100M/bigann-100M"
+GROUNDTRUTH="/projects/SaltSystemsLab/ann_gt/GT_10M/bigann-10M"
 DATATYPE="uint8"
 DIM="128"
 
@@ -15,7 +15,7 @@ BEAM_LIMITS="1:128 2:128 4:128 8:128 16:128 32:128 64:128 128:256 256:512 512:10
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && cd ../.. && pwd)"
 BINARY="$SCRIPT_DIR/build/bin/create_lsh_index_block_tuning"
-LOG_FILE="$SCRIPT_DIR/results/block_tuning_bigann100M_k${K}.log"
+LOG_FILE="$SCRIPT_DIR/results/block_tuning_bigann10M_k${K}.log"
 
 mkdir -p "$(dirname "$LOG_FILE")"
 

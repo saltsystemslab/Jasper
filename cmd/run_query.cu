@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstring>
 #include <set>
+#include <algorithm>
 #include <stdexcept>
 #include <vector>
 #include <chrono>
@@ -693,6 +694,19 @@ int main(int argc, char** argv) {
     beam_limit_pairs = parse_beam_limit_pairs(beam_args);
   } catch (const std::exception& err) {
     std::cerr << "Error parsing --beam_limits: " << err.what() << std::endl;
+    return 1;
+  }
+
+  // A beam narrower than k can never return k neighbors; drop those rounds.
+  beam_limit_pairs.erase(
+    std::remove_if(beam_limit_pairs.begin(), beam_limit_pairs.end(),
+                   [k](const std::pair<uint32_t, uint32_t>& p) {
+                     return p.first < k;
+                   }),
+    beam_limit_pairs.end());
+  if (beam_limit_pairs.empty()) {
+    std::cerr << "Error: all beam widths are smaller than k=" << k
+              << "; nothing to benchmark." << std::endl;
     return 1;
   }
 

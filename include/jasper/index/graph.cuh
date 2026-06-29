@@ -453,6 +453,75 @@ struct graph {
     return g;
   }
 
+  // Append data.n_vectors new vectors to the end of the graph, growing the
+  // segment array if the currently allocated segments cannot hold them.
+  __host__ index_t insert(vector_view_t data) {
+    if (data.dim != dim) {
+      throw std::runtime_error("graph::insert: dim mismatch");
+    }
+
+    const uint32_t padded_dim = vector_view_t::pad(dim);
+    const index_t  start = n_vectors;
+    const index_t  count = static_cast<index_t>(data.n_vectors);
+    if (count == 0) return start;
+    const index_t  end = start + count;
+
+    // Pull segment structs back to host so we can mutate pointers / counts,
+    // and grow the segment array if the new vectors don't fit.
+    std::vector<segment_t> h_segments(segments.begin(), segments.end());
+
+    const uint32_t required_segments = static_cast<uint32_t>(
+        (end + vectors_per_segment - 1) / vectors_per_segment);
+    for (uint32_t s = n_segments; s < required_segments; s++) {
+      h_segments.push_back(segment_t::allocate(dim, on_host));
+    }
+    n_segments = required_segments;
+
+    // Memcpy direction inferred from where the source data and segments live.
+    const cudaMemcpyKind copy_kind = [&]{
+      if (data.on_host &&  on_host) return cudaMemcpyHostToHost;
+      if (data.on_host && !on_host) return cudaMemcpyHostToDevice;
+      if (!data.on_host && on_host) return cudaMemcpyDeviceToHost;
+      return cudaMemcpyDeviceToDevice;
+    }();
+
+    cudaStream_t stream;
+    cudaStreamCreate(&stream);
+
+    // Copy the new vectors into the segments, spanning segment boundaries.
+    index_t copied = 0;
+    for (index_t idx = start; idx < end; ) {
+      uint32_t seg_id    = segment_of(idx);
+      uint32_t local_idx = local_of(idx);
+      uint32_t space     = vectors_per_segment - local_idx;
+      uint32_t remaining = static_cast<uint32_t>(end - idx);
+      uint32_t n         = std::min(space, remaining);
+
+      cudaMemcpyAsync(
+          h_segments[seg_id].vectors.data + static_cast<size_t>(local_idx) * padded_dim,
+          data.data + static_cast<size_t>(copied) * padded_dim,
+          static_cast<size_t>(n) * padded_dim * sizeof(data_t),
+          copy_kind, stream);
+
+      h_segments[seg_id].n_vectors = static_cast<index_t>(local_idx + n);
+
+      idx    += n;
+      copied += n;
+    }
+
+    cudaStreamSynchronize(stream);
+    cudaStreamDestroy(stream);
+
+    n_vectors = end;
+
+    // Re-upload segment structs so device-side view() sees the new pointers
+    // and updated per-segment n_vectors.
+    segments = thrust::device_vector<segment_t>(h_segments.begin(), h_segments.end());
+
+    cudaDeviceSynchronize();
+    return start;
+  }
+
   // load the range of vectors with index [start, end) to a vector view
   // useful for graph construction
   __host__ void load_vectors_to_view(vector_view_t target, index_t start, index_t end) {
