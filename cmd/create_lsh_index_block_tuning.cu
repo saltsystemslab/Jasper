@@ -192,7 +192,7 @@ void run_round_generic(
 }
 
 // ── Single conventional beam-search round ──────────────────────
-template <typename GraphCfg, typename DataT, uint32_t BLOCK_SIZE=128>
+template <typename GraphCfg, typename DataT, uint32_t BLOCK_SIZE=128, uint32_t TILE_SIZE=4>
 void run_beam_search_round(
     jasper::graph<GraphCfg>& graph,
     DataT*    d_queries,
@@ -214,11 +214,11 @@ void run_beam_search_round(
 
   run_round_generic(
     n_queries, k, beam_width, limit, gt, print_throughput,
-    [&]() { return jasper::search<GraphCfg, BLOCK_SIZE>(graph, query_view, params); });
+    [&]() { return jasper::search<GraphCfg, BLOCK_SIZE, TILE_SIZE>(graph, query_view, params); });
 }
 
 // ── Single directional-search round ────────────────────────────
-template <typename GraphCfg, typename DataT, uint32_t BLOCK_SIZE=128>
+template <typename GraphCfg, typename DataT, uint32_t BLOCK_SIZE=128, uint32_t TILE_SIZE=4>
 void run_directional_round(
     jasper::graph<GraphCfg>&                       graph,
     const jasper::lsh_globals<GraphCfg::k_ranks>&  globals,
@@ -243,7 +243,7 @@ void run_directional_round(
   run_round_generic(
     n_queries, k, beam_width, limit, gt, print_throughput,
     [&]() {
-      return jasper::directional_search<GraphCfg, BLOCK_SIZE>(graph, globals, query_view, params);
+      return jasper::directional_search<GraphCfg, BLOCK_SIZE, TILE_SIZE>(graph, globals, query_view, params);
     });
   jasper::print_phase_clocks();
 }
@@ -403,6 +403,55 @@ void benchmark_all(
       bw, lim, has_gt ? &gt : nullptr, true);
   }
 
+  // ─── Tile size tuning (block_size fixed at 64) ──────────────
+  std::cout << "\n=== Conventional Beam Search Benchmark (k=" << k << ", block_size=64, tile_size=4) ===" << std::endl;
+  std::cout << "Warmup..." << std::endl;
+  run_beam_search_round<GraphCfg, DataT, 64, 4>(
+    graph, d_queries, n_queries, dim, k,
+    warmup_bw, warmup_limit, nullptr, false);
+
+  for (auto& [bw, lim] : beam_limit_pairs) {
+    run_beam_search_round<GraphCfg, DataT, 64, 4>(
+      graph, d_queries, n_queries, dim, k,
+      bw, lim, has_gt ? &gt : nullptr, true);
+  }
+
+  std::cout << "\n=== Conventional Beam Search Benchmark (k=" << k << ", block_size=64, tile_size=8) ===" << std::endl;
+  std::cout << "Warmup..." << std::endl;
+  run_beam_search_round<GraphCfg, DataT, 64, 8>(
+    graph, d_queries, n_queries, dim, k,
+    warmup_bw, warmup_limit, nullptr, false);
+
+  for (auto& [bw, lim] : beam_limit_pairs) {
+    run_beam_search_round<GraphCfg, DataT, 64, 8>(
+      graph, d_queries, n_queries, dim, k,
+      bw, lim, has_gt ? &gt : nullptr, true);
+  }
+
+  std::cout << "\n=== Conventional Beam Search Benchmark (k=" << k << ", block_size=64, tile_size=16) ===" << std::endl;
+  std::cout << "Warmup..." << std::endl;
+  run_beam_search_round<GraphCfg, DataT, 64, 16>(
+    graph, d_queries, n_queries, dim, k,
+    warmup_bw, warmup_limit, nullptr, false);
+
+  for (auto& [bw, lim] : beam_limit_pairs) {
+    run_beam_search_round<GraphCfg, DataT, 64, 16>(
+      graph, d_queries, n_queries, dim, k,
+      bw, lim, has_gt ? &gt : nullptr, true);
+  }
+
+  std::cout << "\n=== Conventional Beam Search Benchmark (k=" << k << ", block_size=64, tile_size=32) ===" << std::endl;
+  std::cout << "Warmup..." << std::endl;
+  run_beam_search_round<GraphCfg, DataT, 64, 32>(
+    graph, d_queries, n_queries, dim, k,
+    warmup_bw, warmup_limit, nullptr, false);
+
+  for (auto& [bw, lim] : beam_limit_pairs) {
+    run_beam_search_round<GraphCfg, DataT, 64, 32>(
+      graph, d_queries, n_queries, dim, k,
+      bw, lim, has_gt ? &gt : nullptr, true);
+  }
+
   // ─── Directional beam search ────────────────────────────────
   std::cout << "\n=== Directional Beam Search Benchmark (k=" << k << ", block_size=32) ===" << std::endl;
   std::cout << "Warmup..." << std::endl;
@@ -460,6 +509,55 @@ void benchmark_all(
 
   for (auto& [bw, lim] : beam_limit_pairs) {
     run_directional_round<GraphCfg, DataT,512>(
+      graph, globals, d_queries, n_queries, dim, k,
+      bw, lim, has_gt ? &gt : nullptr, true);
+  }
+
+  // ─── Directional tile size tuning (block_size fixed at 64) ──
+  std::cout << "\n=== Directional Beam Search Benchmark (k=" << k << ", block_size=64, tile_size=4) ===" << std::endl;
+  std::cout << "Warmup..." << std::endl;
+  run_directional_round<GraphCfg, DataT, 64, 4>(
+    graph, globals, d_queries, n_queries, dim, k,
+    warmup_bw, warmup_limit, nullptr, false);
+
+  for (auto& [bw, lim] : beam_limit_pairs) {
+    run_directional_round<GraphCfg, DataT, 64, 4>(
+      graph, globals, d_queries, n_queries, dim, k,
+      bw, lim, has_gt ? &gt : nullptr, true);
+  }
+
+  std::cout << "\n=== Directional Beam Search Benchmark (k=" << k << ", block_size=64, tile_size=8) ===" << std::endl;
+  std::cout << "Warmup..." << std::endl;
+  run_directional_round<GraphCfg, DataT, 64, 8>(
+    graph, globals, d_queries, n_queries, dim, k,
+    warmup_bw, warmup_limit, nullptr, false);
+
+  for (auto& [bw, lim] : beam_limit_pairs) {
+    run_directional_round<GraphCfg, DataT, 64, 8>(
+      graph, globals, d_queries, n_queries, dim, k,
+      bw, lim, has_gt ? &gt : nullptr, true);
+  }
+
+  std::cout << "\n=== Directional Beam Search Benchmark (k=" << k << ", block_size=64, tile_size=16) ===" << std::endl;
+  std::cout << "Warmup..." << std::endl;
+  run_directional_round<GraphCfg, DataT, 64, 16>(
+    graph, globals, d_queries, n_queries, dim, k,
+    warmup_bw, warmup_limit, nullptr, false);
+
+  for (auto& [bw, lim] : beam_limit_pairs) {
+    run_directional_round<GraphCfg, DataT, 64, 16>(
+      graph, globals, d_queries, n_queries, dim, k,
+      bw, lim, has_gt ? &gt : nullptr, true);
+  }
+
+  std::cout << "\n=== Directional Beam Search Benchmark (k=" << k << ", block_size=64, tile_size=32) ===" << std::endl;
+  std::cout << "Warmup..." << std::endl;
+  run_directional_round<GraphCfg, DataT, 64, 32>(
+    graph, globals, d_queries, n_queries, dim, k,
+    warmup_bw, warmup_limit, nullptr, false);
+
+  for (auto& [bw, lim] : beam_limit_pairs) {
+    run_directional_round<GraphCfg, DataT, 64, 32>(
       graph, globals, d_queries, n_queries, dim, k,
       bw, lim, has_gt ? &gt : nullptr, true);
   }

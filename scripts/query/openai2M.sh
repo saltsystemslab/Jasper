@@ -25,9 +25,7 @@ optional_args=()
 
 [[ -n "$GROUNDTRUTH" ]] && optional_args+=(--groundtruth "$GROUNDTRUTH")
 
-for bl in $BEAM_LIMITS; do
-    optional_args+=(--beam_limits "$bl")
-done
+optional_args+=(--beam_limits $BEAM_LIMITS)
 
 for K in 1 10 50 100; do
     LOG_FILE="${LOG_BASE}_k${K}.log"
@@ -46,4 +44,20 @@ for K in 1 10 50 100; do
         --k            "$K" \
         "${optional_args[@]}" \
         2>&1 | tee -a "$LOG_FILE"
+
+    # echo "========================================" | tee -a "$LOG_FILE"
+    # echo "Running with K=$K (LSH)" | tee -a "$LOG_FILE"
+    # echo "========================================" | tee -a "$LOG_FILE"
+
+    # "$BINARY" \
+    #     --index        "$INDEX" \
+    #     --queries      "$QUERIES" \
+    #     --datatype     "$DATATYPE" \
+    #     --dim          "$DIM" \
+    #     --distance     "$DISTANCE" \
+    #     --n_neighbors  "$N_NEIGHBORS" \
+    #     --k            "$K" \
+    #     --lsh \
+    #     "${optional_args[@]}" \
+    #     2>&1 | tee -a "$LOG_FILE"
 done

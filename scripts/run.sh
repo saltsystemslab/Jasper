@@ -17,3 +17,7 @@ $SCRIPT_DIR/scripts/query/deep100M.sh
 $SCRIPT_DIR/scripts/query/gist1M.sh
 $SCRIPT_DIR/scripts/query/openai2M.sh
 $SCRIPT_DIR/scripts/query/text2image10M.sh
+
+# Block tuning
+$SCRIPT_DIR/scripts/block_tuning/bigann100M.sh
+$SCRIPT_DIR/scripts/block_tuning/openai2M.sh
