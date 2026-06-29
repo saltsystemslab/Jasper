@@ -52,18 +52,18 @@ void construct_and_save(const std::string& filename,
   std::cout << "  Loaded " << h_vecs.n_vectors << " vectors, dim=" << dim << std::endl;
 
   // Upload padded buffer to device
-  auto d_vecs = h_vecs.to_device();
-  cudaFreeHost(h_vecs.data);
+  // auto d_vecs = h_vecs.to_device();
+  // cudaFreeHost(h_vecs.data);
 
   // Set up construction params
   jasper::graph_construct_params<ConstructCfg> params;
   jasper::graph_construct_workspace<ConstructCfg> ws;
   uint32_t max_batch_size = min(
     ws.max_batch_size_for_budget(workspace_budget_bytes),
-    d_vecs.n_vectors / 50
+    h_vecs.n_vectors / 50
   );
 
-  params.data_vectors   = d_vecs;
+  params.data_vectors   = h_vecs;
   params.alpha          = alpha;
   params.max_batch_size = max_batch_size;
   params.on_host        = false;
@@ -77,7 +77,7 @@ void construct_and_save(const std::string& filename,
   jasper::save_graph_to_file(graph, index_out);
 
   // Cleanup
-  cudaFree(d_vecs.data);
+  cudaFreeHost(h_vecs.data);
   graph.deallocate();
 }
 

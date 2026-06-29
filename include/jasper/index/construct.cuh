@@ -1081,7 +1081,7 @@ __host__ graph<typename CONSTRUCT_GRAPH_CONFIG::graph_cfg_t> construct_graph(
 
   // workspace
   auto ws = graph_construct_workspace<CONSTRUCT_GRAPH_CONFIG>::allocate(params.max_batch_size);
-  // ws.print_space_usage();
+  ws.print_space_usage();
 
   constexpr uint32_t beam_search_tile_size = 4;
   constexpr uint32_t beam_search_block_size = 64;
