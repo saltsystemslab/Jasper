@@ -472,10 +472,16 @@ struct graph {
 
     const uint32_t required_segments = static_cast<uint32_t>(
         (end + vectors_per_segment - 1) / vectors_per_segment);
-    for (uint32_t s = n_segments; s < required_segments; s++) {
-      h_segments.push_back(segment_t::allocate(dim, on_host));
+    // Only ever grow the segment array — never shrink. When the graph was
+    // pre-allocated with enough capacity (required_segments <= n_segments),
+    // this allocates nothing. Unconditionally assigning n_segments here would
+    // wrongly drop already-allocated segments and leak them on the next grow.
+    if (required_segments > n_segments) {
+      for (uint32_t s = n_segments; s < required_segments; s++) {
+        h_segments.push_back(segment_t::allocate(dim, on_host));
+      }
+      n_segments = required_segments;
     }
-    n_segments = required_segments;
 
     // Memcpy direction inferred from where the source data and segments live.
     const cudaMemcpyKind copy_kind = [&]{

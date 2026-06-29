@@ -9,7 +9,7 @@ DISTANCE="l2"
 N_NEIGHBORS=64
 ALPHA=1.2
 PIECES=10
-WORKSPACE_BUDGET="5GB"
+WORKSPACE_BUDGET="10GB"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && cd ../.. && pwd)"
 BINARY="$SCRIPT_DIR/build/bin/incremental_construction"
