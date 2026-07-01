@@ -899,11 +899,11 @@ struct graph {
     static_assert(graph_cfg::use_lsh,
                   "generate_lsh_globals requires graph_cfg::use_lsh");
 
-    if (on_host) {
-      throw std::runtime_error(
-          "generate_lsh_globals requires graph on device — "
-          "call move_to(false) first");
-    }
+    // if (on_host) {
+    //   throw std::runtime_error(
+    //       "generate_lsh_globals requires graph on device — "
+    //       "call move_to(false) first");
+    // }
     if (n_vectors == 0) {
       throw std::runtime_error("generate_lsh_globals: graph is empty");
     }

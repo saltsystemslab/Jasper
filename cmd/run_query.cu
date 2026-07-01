@@ -52,6 +52,9 @@ JASPER_FOR_EACH_CONFIG(DECLARE_CONFIGS_)
 // query time. K_RANKS and PACKED_T mirror create_lsh_index.
 // (CONFIG_ID, INDEX_T, N_NEIGHBORS, DATA_T, DISTANCE_T, DIST_FUNC, K_RANKS, PACKED_T)
 #define JASPER_FOR_EACH_LSH_CONFIG(X)                                          \
+  X(lsh_f16_r32_l2_k4_d128,  uint32_t, 32, __half, float, jasper::distance_func::L2,  4, uint8_t)  \
+  X(lsh_f16_r32_l2_k8_d128,  uint32_t, 32, __half, float, jasper::distance_func::L2,  8, uint8_t)  \
+  X(lsh_f16_r32_l2_k16_d128, uint32_t, 32, __half, float, jasper::distance_func::L2, 16, uint8_t)  \
   X(lsh_f16_r64_l2_k4_d128,  uint32_t, 64, __half, float, jasper::distance_func::L2,  4, uint8_t)  \
   X(lsh_f16_r64_l2_k8_d128,  uint32_t, 64, __half, float, jasper::distance_func::L2,  8, uint8_t)  \
   X(lsh_f16_r64_l2_k16_d128, uint32_t, 64, __half, float, jasper::distance_func::L2, 16, uint8_t)  \
@@ -373,19 +376,19 @@ static void rotate_device_vectors(__half* d_vectors,
   cudaFree(d_P);
 }
 
-// Rotate every stored vector of a (device-resident) graph in place. Orthogonal
-// rotation preserves L2/inner-product, so the graph topology is unchanged; this
-// only decorrelates dimensions so the axis-aligned LSH hashing matches what
-// create_lsh_index produces via prerotate. Must run before generate_lsh_globals
-// / populate_edge_lsh, and the queries must be rotated with the same seed.
+// Rotate every stored vector of a graph in place. Orthogonal rotation preserves
+// L2/inner-product, so the graph topology is unchanged; this only decorrelates
+// dimensions so the axis-aligned LSH hashing matches what create_lsh_index
+// produces via prerotate. Must run before generate_lsh_globals /
+// populate_edge_lsh, and the queries must be rotated with the same seed. Works
+// on host- or device-resident graphs (host segments are staged to device for
+// the cuBLAS GEMM, then copied back).
 template <typename GraphCfg>
 void rotate_graph_vectors(jasper::graph<GraphCfg>& g, uint32_t seed) {
   using data_t    = typename GraphCfg::data_t;
   using segment_t = jasper::graph_segment<GraphCfg>;
   static_assert(std::is_same<data_t, __half>::value,
                 "rotate_graph_vectors requires __half (f16) data_t");
-  if (g.on_host)
-    throw std::runtime_error("rotate_graph_vectors requires graph on device");
 
   const uint32_t dim        = g.dim;
   const uint32_t padded_dim = g.get_padded_dim();
@@ -395,9 +398,22 @@ void rotate_graph_vectors(jasper::graph<GraphCfg>& g, uint32_t seed) {
 
   std::vector<segment_t> h_segs(g.segments.begin(), g.segments.end());
   for (auto& seg : h_segs) {
-    rotate_device_vectors(seg.vectors.data,
-                          static_cast<uint32_t>(seg.n_vectors),
-                          dim, padded_dim, seed, handle);
+    uint32_t n = static_cast<uint32_t>(seg.n_vectors);
+    if (n == 0) continue;
+
+    if (g.on_host) {
+      // Stage this segment's vectors on device, rotate, then copy back to the
+      // (pinned) host buffer that seg.vectors.data points into.
+      size_t bytes = sizeof(__half) * static_cast<size_t>(n) * padded_dim;
+      __half* d_vecs = nullptr;
+      CUDA_CHECK(cudaMalloc(&d_vecs, bytes));
+      CUDA_CHECK(cudaMemcpy(d_vecs, seg.vectors.data, bytes, cudaMemcpyHostToDevice));
+      rotate_device_vectors(d_vecs, n, dim, padded_dim, seed, handle);
+      CUDA_CHECK(cudaMemcpy(seg.vectors.data, d_vecs, bytes, cudaMemcpyDeviceToHost));
+      cudaFree(d_vecs);
+    } else {
+      rotate_device_vectors(seg.vectors.data, n, dim, padded_dim, seed, handle);
+    }
   }
   cublasDestroy(handle);
 }
@@ -412,11 +428,14 @@ void load_and_bench_lsh(const std::string& index_path,
                         uint32_t k,
                         uint32_t rotate_seed,
                         bool do_rotate,
+                        bool on_host,
                         const std::vector<std::pair<uint32_t, uint32_t>>& beam_limit_pairs) {
 
   // Load graph (LSH config; edge_lsh storage is allocated lazily below).
+  // Rotation, generate_lsh_globals and populate_edge_lsh all work on host now,
+  // so honor --on_host directly at load time.
   std::cout << "Loading index..." << std::endl;
-  auto graph = jasper::load_graph_from_file<GraphCfg>(index_path, dim);
+  auto graph = jasper::load_graph_from_file<GraphCfg>(index_path, dim, on_host);
   std::cout << "  " << graph.n_vectors << " vectors, dim=" << graph.dim << std::endl;
 
   // Rotate stored vectors so the LSH hashing matches create_lsh_index's
@@ -516,11 +535,12 @@ void load_and_bench(const std::string& index_path,
                     const std::string& src_dtype,
                     uint32_t dim,
                     uint32_t k,
+                    bool on_host,
                     const std::vector<std::pair<uint32_t, uint32_t>>& beam_limit_pairs) {
 
-  // Load graph
+  // Load graph (optionally directly into host memory).
   std::cout << "Loading index..." << std::endl;
-  auto graph = jasper::load_graph_from_file<GraphCfg>(index_path, dim);
+  auto graph = jasper::load_graph_from_file<GraphCfg>(index_path, dim, on_host);
   std::cout << "  " << graph.n_vectors << " vectors, dim=" << graph.dim << std::endl;
 
   // Load queries, casting src_dtype -> DataT (__half)
@@ -655,6 +675,11 @@ int main(int argc, char** argv) {
     .choices(4u, 8u, 16u)
     .help("LSH k_ranks (4, 8, or 16). Only used with --lsh.");
 
+  program.add_argument("--on_host")
+    .default_value(false)
+    .implicit_value(true)
+    .help("Move the loaded graph to host before querying.");
+
   program.add_argument("--no_rotate")
     .default_value(false)
     .implicit_value(true)
@@ -684,6 +709,7 @@ int main(int argc, char** argv) {
   auto k            = program.get<uint32_t>("--k");
   auto beam_args    = program.get<std::vector<std::string>>("--beam_limits");
   auto use_lsh      = program.get<bool>("--lsh");
+  auto on_host      = program.get<bool>("--on_host");
   auto k_ranks      = program.get<uint32_t>("--k_ranks");
   auto no_rotate    = program.get<bool>("--no_rotate");
   auto rotate_seed  = program.get<uint32_t>("--rotate_seed");
@@ -710,6 +736,7 @@ int main(int argc, char** argv) {
     std::cout << bw << ":" << lim << " ";
   std::cout << std::endl;
   std::cout << "  lsh:          " << (use_lsh ? "true" : "false") << std::endl;
+  std::cout << "  on_host:      " << (on_host ? "true" : "false") << std::endl;
   if (use_lsh) {
     std::cout << "  k_ranks:      " << k_ranks << std::endl;
     std::cout << "  rotate:       " << (no_rotate ? "false" : "true") << std::endl;
@@ -728,7 +755,7 @@ int main(int argc, char** argv) {
           std::cout << "  Config: " #id << std::endl;                          \
           load_and_bench_lsh<cfg_##id, DAT>(                                   \
               index_path, query_path, gt_path, datatype,                       \
-              dim, k, rotate_seed, !no_rotate, beam_limit_pairs);             \
+              dim, k, rotate_seed, !no_rotate, on_host, beam_limit_pairs);    \
           dispatched = true;                                                   \
         }
 
@@ -749,7 +776,7 @@ int main(int argc, char** argv) {
           std::cout << "  Config: " #id << std::endl;                           \
           load_and_bench<cfg_##id, DAT>(                                        \
               index_path, query_path, gt_path, datatype,                        \
-              dim, k, beam_limit_pairs);                                        \
+              dim, k, on_host, beam_limit_pairs);                              \
           dispatched = true;                                                     \
         }
 
