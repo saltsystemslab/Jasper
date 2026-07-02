@@ -35,6 +35,42 @@ cmake --build build
 cd build && ctest --output-on-failure
 ```
 
+## API Examples
+
+All Python APIs can be found under the `example/` folder, where we provides python scripts to construct and query vector index in jasper. 
+
+The snippet below shows a minimal workflow: build an index from a set of vectors, then run a top-k search for a batch of queries.
+
+```python
+import jasper
+
+# Load base vectors and query vectors from .bin files.
+vectors = jasper.read_bin("vectors.bin", "f32")
+queries = jasper.read_bin("queries.bin", "f32").to(device="cuda")
+
+# Build the graph index on the GPU.
+g = jasper.Graph.build(
+    vectors,
+    n_neighbors=64,       # graph degree
+    distance="l2",        # "l2" or "ip"
+    alpha=1.2,            # pruning parameter
+    workspace_budget="10GB",
+)
+
+# (Optional) persist the index and reload it later.
+g.save("index.bin")
+# g = jasper.Graph.load("index.bin", dim=128, n_neighbors=64,
+#                       data_type="f16", distance="l2")
+
+# Query the index: returns neighbor indices and their distances.
+indices, distances = g.search(queries, k=10, beam_width=64)
+print(indices, distances)
+
+g.free()
+```
+
+See `example/graph.py` for building and searching in one pass, `example/query.py` for loading a saved index and running queries, and `example/groundtruth.py` for generating exact k-NN ground truth to measure recall.
+
 ## Citation
 
 ```
