@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   gate:
-    name: Has main moved?
+    name: Has deletion-procedure moved?
     runs-on: ubuntu-22.04
     permissions:
       actions: read
@@ -30,10 +30,10 @@ jobs:
             echo "should_run=true" >> "$GITHUB_OUTPUT"; exit 0
           fi
           LAST=$(gh run list --repo "${{ github.repository }}" --workflow=neu-ci \
-            --branch=main --status=success --limit=1 --json headSha \
+            --branch=deletion-procedure --status=success --limit=1 --json headSha \
             --jq '.[0].headSha // empty')
           if [[ -n "$LAST" && "$LAST" == "${{ github.sha }}" ]]; then
-            echo "::notice::main unchanged since last green run; skipping."
+            echo "::notice::deletion-procedure unchanged since last green run; skipping."
             echo "should_run=false" >> "$GITHUB_OUTPUT"
           else
             echo "should_run=true" >> "$GITHUB_OUTPUT"

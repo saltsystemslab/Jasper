@@ -9,12 +9,12 @@ version: 1
 
 repo:
   slug: saltsystemslab/jasperpy
-  default_branch: main
+  default_branch: deletion-procedure   # TEMP: testing branch. Flip to `main` when promoting.
 
 cluster:
   host: login.explorer.northeastern.edu
   user: mccoy.hu
-  workdir: /projects/SaltSystemsLab/hunter/jasperpy
+  workdir: /projects/SaltSystemsLab/hunter/ci/jasperpy   # dedicated CI clone (never your working copy)
   sbatch:
     partition: SaltSystemsLab
     nodelist: d4067
