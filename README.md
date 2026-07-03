@@ -35,6 +35,20 @@ cmake --build build
 cd build && ctest --output-on-failure
 ```
 
+## Benchmarks
+
+Updated automatically by neu-ci after each nightly cluster run.
+
+### QPS vs. recall
+
+<!--neu-ci:qps_recall start-->
+<!--neu-ci:qps_recall end-->
+
+### Latest results
+
+<!--neu-ci:results start-->
+<!--neu-ci:results end-->
+
 ## Citation
 
 ```

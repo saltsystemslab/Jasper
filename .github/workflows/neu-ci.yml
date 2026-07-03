@@ -1,0 +1,62 @@
+name: neu-ci
+
+# SECURITY: schedule + manual only, against your own branch. There is NO
+# `pull_request` trigger, so untrusted fork code never sees the SSH secret and
+# never runs on the cluster.
+on:
+  schedule:
+    - cron: '0 7 * * *'   # nightly ~03:00 ET
+  workflow_dispatch:
+
+concurrency:
+  group: neu-ci-${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    name: Has main moved?
+    runs-on: ubuntu-22.04
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      should_run: ${{ steps.g.outputs.should_run }}
+    steps:
+      - id: g
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          LAST=$(gh run list --repo "${{ github.repository }}" --workflow=neu-ci \
+            --branch=main --status=success --limit=1 --json headSha \
+            --jq '.[0].headSha // empty')
+          if [[ -n "$LAST" && "$LAST" == "${{ github.sha }}" ]]; then
+            echo "::notice::main unchanged since last green run; skipping."
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  dispatch:
+    name: Dispatch cluster CI
+    needs: gate
+    if: needs.gate.outputs.should_run == 'true'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    steps:
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CLUSTER_CI_SSH_KEY }}
+      - name: Trust cluster host key
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          ssh-keyscan -H login.explorer.northeastern.edu >> ~/.ssh/known_hosts 2>/dev/null
+      - name: Dispatch (mode=all)
+        run: |
+          # The remote command string is the ONLY thing we control; the key is
+          # pinned to a forced command on the cluster, so this is all it can do.
+          ssh -o BatchMode=yes -o PreferredAuthentications=publickey \
+              -o ConnectTimeout=30 mccoy.hu@login.explorer.northeastern.edu \
+              "mode=all ref=${{ github.sha }}"
