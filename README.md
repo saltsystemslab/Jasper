@@ -71,6 +71,20 @@ g.free()
 
 See `example/graph.py` for building and searching in one pass, `example/query.py` for loading a saved index and running queries, and `example/groundtruth.py` for generating exact k-NN ground truth to measure recall.
 
+## Benchmarks
+
+Updated automatically by neu-ci after each nightly cluster run.
+
+### QPS vs. recall
+
+<!--neu-ci:qps_recall start-->
+<!--neu-ci:qps_recall end-->
+
+### Latest results
+
+<!--neu-ci:results start-->
+<!--neu-ci:results end-->
+
 ## Citation
 
 ```

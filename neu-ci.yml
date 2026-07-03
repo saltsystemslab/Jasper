@@ -1,0 +1,49 @@
+# neu-ci.yml for jasperpy — GPU CI on the SaltSystemsLab cluster.
+#
+# SECURITY: only the jobs below can run, and their commands are read from THIS
+# file on `main` (never from the ref under test). The CI SSH key is pinned to a
+# forced command on the cluster, and the workflow triggers only on schedule /
+# manual dispatch against main — never on pull_request from forks.
+
+version: 1
+
+repo:
+  slug: saltsystemslab/jasperpy
+  default_branch: neu-ci-test   # TEMP: testing branch. Flip to `main` when promoting.
+
+cluster:
+  host: login.explorer.northeastern.edu
+  user: mccoy.hu
+  workdir: /projects/SaltSystemsLab/hunter/ci/jasperpy   # dedicated CI clone (never your working copy)
+  sbatch:
+    partition: SaltSystemsLab
+    nodelist: d4067
+    gres: gpu:rtx6000:1
+    cpus_per_task: 8
+    mem: 64G
+    time: "01:00:00"
+    modules: [cuda, cmake]
+
+jobs:
+  compile:
+    run: cmake -B build -DJASPER_BUILD_TESTS=ON && cmake --build build -j
+    status: cluster/compile
+    parser: build
+  tests:
+    run: ctest --test-dir build --output-on-failure
+    status: cluster/tests
+    parser: ctest
+
+# Benchmark artifacts injected into README between neu-ci markers. These are
+# produced by the `bench` job (add it once your bench harness writes these
+# files); until then the markers just stay empty.
+outputs:
+  store: results-branch
+  branch: ci-results
+  items:
+    - name: qps_recall
+      produces: bench/qps_recall.png
+      kind: image
+    - name: results
+      produces: bench/results.csv
+      kind: csv-table
