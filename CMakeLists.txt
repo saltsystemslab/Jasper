@@ -95,6 +95,17 @@ if(JASPER_BUILD_CMD)
     CUDA_SEPARABLE_COMPILATION ON
   )
 
+  add_executable(create_diskann_index cmd/create_diskann_index.cu)
+  target_link_libraries(create_diskann_index PRIVATE jasper)
+  set_target_properties(create_diskann_index PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+  )
+  set_target_properties(create_diskann_index PROPERTIES
+    CUDA_ARCHITECTURES "89;90;120"
+    CUDA_SEPARABLE_COMPILATION ON
+  )
+
   add_executable(create_lsh_index cmd/create_lsh_index.cu)
   target_link_libraries(create_lsh_index PRIVATE jasper)
   set_target_properties(create_lsh_index PROPERTIES
