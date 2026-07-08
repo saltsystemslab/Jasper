@@ -60,7 +60,16 @@ JASPER_FOR_EACH_CONFIG(DECLARE_CONFIGS_)
   X(lsh_f16_r64_l2_k16_d128, uint32_t, 64, __half, float, jasper::distance_func::L2, 16, uint8_t)  \
   X(lsh_f16_r64_l2_k4_d32678,  uint32_t, 64, __half, float, jasper::distance_func::L2,  4, uint16_t)  \
   X(lsh_f16_r64_l2_k8_d32678,  uint32_t, 64, __half, float, jasper::distance_func::L2,  8, uint16_t)  \
-  X(lsh_f16_r64_l2_k16_d32678, uint32_t, 64, __half, float, jasper::distance_func::L2, 16, uint16_t)
+  X(lsh_f16_r64_l2_k16_d32678, uint32_t, 64, __half, float, jasper::distance_func::L2, 16, uint16_t)  \
+  X(lsh_f16_r32_ip_k4_d128,  uint32_t, 32, __half, float, jasper::distance_func::INNER_PRODUCT,  4, uint8_t)  \
+  X(lsh_f16_r32_ip_k8_d128,  uint32_t, 32, __half, float, jasper::distance_func::INNER_PRODUCT,  8, uint8_t)  \
+  X(lsh_f16_r32_ip_k16_d128, uint32_t, 32, __half, float, jasper::distance_func::INNER_PRODUCT, 16, uint8_t)  \
+  X(lsh_f16_r64_ip_k4_d128,  uint32_t, 64, __half, float, jasper::distance_func::INNER_PRODUCT,  4, uint8_t)  \
+  X(lsh_f16_r64_ip_k8_d128,  uint32_t, 64, __half, float, jasper::distance_func::INNER_PRODUCT,  8, uint8_t)  \
+  X(lsh_f16_r64_ip_k16_d128, uint32_t, 64, __half, float, jasper::distance_func::INNER_PRODUCT, 16, uint8_t)  \
+  X(lsh_f16_r64_ip_k4_d32678,  uint32_t, 64, __half, float, jasper::distance_func::INNER_PRODUCT,  4, uint16_t)  \
+  X(lsh_f16_r64_ip_k8_d32678,  uint32_t, 64, __half, float, jasper::distance_func::INNER_PRODUCT,  8, uint16_t)  \
+  X(lsh_f16_r64_ip_k16_d32678, uint32_t, 64, __half, float, jasper::distance_func::INNER_PRODUCT, 16, uint16_t)
 
 #define DECLARE_LSH_CONFIGS_(id, IDX, R, DAT, DIST, FUNC, KR, PACKEDT)         \
   using cfg_##id = jasper::graph_config<IDX, R, DAT, DIST, FUNC, true, KR, PACKEDT>;
@@ -667,7 +676,7 @@ int main(int argc, char** argv) {
     .default_value(false)
     .implicit_value(true)
     .help("Populate LSH on the loaded index and run directional search "
-          "(L2 only). Index file needs no LSH data; it is generated at load.");
+          "(L2 or IP). Index file needs no LSH data; it is generated at load.");
 
   program.add_argument("--k_ranks", "-r")
     .default_value(uint32_t{4})
@@ -767,8 +776,7 @@ int main(int argc, char** argv) {
           "Unsupported LSH config: datatype=" + datatype +
           ", n_neighbors=" + std::to_string(n_neighbors) +
           ", distance=" + distance +
-          ", k_ranks=" + std::to_string(k_ranks) +
-          " (LSH supports L2 + n_neighbors=64 only)");
+          ", k_ranks=" + std::to_string(k_ranks));
       }
     } else {
       #define TRY_DISPATCH(id, IDX, R, DAT, DIST, FUNC)                         \

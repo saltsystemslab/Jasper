@@ -39,6 +39,13 @@ __device__ uint64_t g_phase_clocks[PHASE_COUNT];
   X(f16_r64_l2_k4_d32678,  uint32_t, 64, __half, float, jasper::distance_func::L2,  4, uint16_t)  \
   X(f16_r64_l2_k8_d32678,  uint32_t, 64, __half, float, jasper::distance_func::L2,  8, uint16_t)  \
   X(f16_r64_l2_k16_d32678, uint32_t, 64, __half, float, jasper::distance_func::L2, 16, uint16_t)  \
+  X(f16_r64_ip_k4_d128,  uint32_t, 64, __half, float, jasper::distance_func::INNER_PRODUCT,  4, uint8_t)  \
+  X(f16_r64_ip_k8_d128,  uint32_t, 64, __half, float, jasper::distance_func::INNER_PRODUCT,  8, uint8_t)  \
+  X(f16_r64_ip_k16_d128, uint32_t, 64, __half, float, jasper::distance_func::INNER_PRODUCT, 16, uint8_t)  \
+  X(f16_r64_ip_k4_d32678,  uint32_t, 64, __half, float, jasper::distance_func::INNER_PRODUCT,  4, uint16_t)  \
+  X(f16_r64_ip_k8_d32678,  uint32_t, 64, __half, float, jasper::distance_func::INNER_PRODUCT,  8, uint16_t)  \
+  X(f16_r64_ip_k16_d32678, uint32_t, 64, __half, float, jasper::distance_func::INNER_PRODUCT, 16, uint16_t)
+
 
 // Graph + construct config types. K_RANKS is now a macro parameter.
 #define DECLARE_CONFIGS(id, IDX, R, DAT, DIST, FUNC, KR, PACKEDT)                       \

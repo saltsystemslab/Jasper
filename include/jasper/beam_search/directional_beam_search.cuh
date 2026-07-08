@@ -4,6 +4,7 @@
 #include <cub/cub.cuh>
 #include <cooperative_groups.h>
 
+#include "jasper/distance/distance.cuh"
 #include "jasper/index/vector.cuh"
 #include "jasper/index/graph.cuh"
 #include "jasper/beam_search/config.cuh"
@@ -77,19 +78,23 @@ inline void print_phase_clocks(double = 1.98) {}
 inline void reset_phase_clocks() {}
 #endif  // JASPER_PROFILE_CLOCKS
 
-// ===== Helper: ||q - u||^2 (exact) + store (q - u) in smem, single pass =====
+// ===== Helper: exact base scalar for u + (for L2) store (q - u) in smem =====
+// Single pass over u's vector. Returns, depending on DISTANCE_FUNC:
+//   L2            → ||q - u||²          and stores (q - u) into qu_diff
+//   INNER_PRODUCT → ⟨q, u⟩ (raw dot)    and leaves qu_diff untouched
+// (the IP estimator dots against q directly, so no residual is needed).
 // Requires DATA_T == __half and padded_dim divisible by 8.
 // vector_view::pad already rounds padded_dim up to ≥16, so the divisibility
 // requirement is satisfied for typical configurations.
-template <typename DATA_T, uint32_t BLOCK_SIZE>
-__device__ __forceinline__ float compute_qu_diff_and_l2sq(
+template <typename DATA_T, uint32_t BLOCK_SIZE, distance_func DISTANCE_FUNC>
+__device__ __forceinline__ float compute_qu_diff_and_exact(
     const DATA_T* __restrict__ query_vec,
     const DATA_T* __restrict__ u_vec,
     DATA_T*       __restrict__ qu_diff,
     uint32_t                   padded_dim)
 {
   static_assert(std::is_same_v<DATA_T, __half>,
-                "compute_qu_diff_and_l2sq is specialized for __half");
+                "compute_qu_diff_and_exact is specialized for __half");
   const uint4* __restrict__ u_v4 = reinterpret_cast<const uint4*>(u_vec);
   const uint4* __restrict__ q_v4 = reinterpret_cast<const uint4*>(query_vec);
   uint4*       __restrict__ d_v4 = reinterpret_cast<uint4*>(qu_diff);
@@ -107,15 +112,24 @@ __device__ __forceinline__ float compute_qu_diff_and_l2sq(
       const uint32_t uw = reinterpret_cast<const uint32_t*>(&u)[j];
       const __half2  q2 = *reinterpret_cast<const __half2*>(&qw);
       const __half2  u2 = *reinterpret_cast<const __half2*>(&uw);
-      const __half2  dh = __hsub2(q2, u2);
-      reinterpret_cast<uint32_t*>(&d)[j] =
-          *reinterpret_cast<const uint32_t*>(&dh);
 
-      const float f0 = __half2float(__low2half (dh));
-      const float f1 = __half2float(__high2half(dh));
-      local += f0 * f0 + f1 * f1;
+      if constexpr (DISTANCE_FUNC == distance_func::L2) {
+        const __half2  dh = __hsub2(q2, u2);
+        reinterpret_cast<uint32_t*>(&d)[j] =
+            *reinterpret_cast<const uint32_t*>(&dh);
+
+        const float f0 = __half2float(__low2half (dh));
+        const float f1 = __half2float(__high2half(dh));
+        local += f0 * f0 + f1 * f1;
+      } else {  // INNER_PRODUCT: accumulate ⟨q, u⟩
+        const __half2 p2 = __hmul2(q2, u2);
+        local += __half2float(__low2half (p2))
+               + __half2float(__high2half(p2));
+      }
     }
-    d_v4[i] = d;
+    if constexpr (DISTANCE_FUNC == distance_func::L2) {
+      d_v4[i] = d;
+    }
   }
 
   // Intra-warp reduction.
@@ -191,14 +205,19 @@ __device__ void radix_sort(ENTRY_T *result_buffer,
   __syncthreads();
 }
 
-// ===== Helper: estimated ||q - v||^2 for each new neighbor v of u =====
-// Implements the estimator from sec. "Query Phase":
-//   <q-u, r̂> ≈ ( Σ_r c[r] · sign[r] · (q-u)[coord[r]] ) / norm_denom
-//   ||q-v||² ≈ ||q-u||² + mag² − 2 · mag · <q-u, r̂>     where mag = ||v-u||
-template <typename GRAPH_CFG>
+// ===== Helper: estimated distance for each new neighbor v of u =====
+// Implements the estimator from sec. "Query Phase". With mag = ||v-u|| and r̂
+// the (unit) residual direction v = u + mag·r̂, the estimated projection is
+//   îp(x, r̂) ≈ ( Σ_r c[r] · sign[r] · x[coord[r]] ) / norm_denom
+// where `smem_est_vec` supplies x:
+//   L2            → x = (q - u):   ||q-v||² ≈ ||q-u||² + mag² − 2·mag·îp(q-u, r̂)
+//   INNER_PRODUCT → x = q:         ⟨q,v⟩   ≈ ⟨q,u⟩ + mag·îp(q, r̂),
+//                                  and the stored distance is −⟨q,v⟩ (as in
+//                                  inner_product_distance) so smaller == closer.
+template <typename GRAPH_CFG, distance_func DISTANCE_FUNC>
 __device__ __forceinline__ void populate_estimated_distances(
-    const typename GRAPH_CFG::data_t* __restrict__ smem_qu_diff,
-    float                                          exact_dist_u_sq,
+    const typename GRAPH_CFG::data_t* __restrict__ smem_est_vec,
+    float                                          exact_u,
     typename graph<GRAPH_CFG>::device_view&        graph,
     typename GRAPH_CFG::index_t                    u_gid,
     const lsh_globals<GRAPH_CFG::k_ranks>&         globals,
@@ -285,14 +304,23 @@ __device__ __forceinline__ void populate_estimated_distances(
       const PACKED_T word  = p[r];
       const uint32_t coord = static_cast<uint32_t>(word & COORD_MASK);
       const float    sgn   = (word & SIGN_MASK) ? -1.0f : +1.0f;
-      const float    diff  = static_cast<float>(smem_qu_diff[coord]);
-      dot_acc += c_reg[r] * sgn * diff;
+      const float    x     = static_cast<float>(smem_est_vec[coord]);
+      dot_acc += c_reg[r] * sgn * x;
     }
-    const float dot_est = dot_acc * inv_norm_denom;
+    const float dot_est = dot_acc * inv_norm_denom;   // îp(x, r̂)
     const float mag     = sqrtf(mag_sq);
-    const float est_sq  = exact_dist_u_sq + mag_sq - 2.0f * mag * dot_est;
 
-    result_buffer[offset + e] = set_distance(entry, est_sq);
+    float est_dist;
+    if constexpr (DISTANCE_FUNC == distance_func::L2) {
+      // ||q-v||² ≈ ||q-u||² + mag² − 2·mag·⟨q-u, r̂⟩
+      est_dist = exact_u + mag_sq - 2.0f * mag * dot_est;
+    } else {  // INNER_PRODUCT
+      // ⟨q,v⟩ ≈ ⟨q,u⟩ + mag·⟨q, r̂⟩; distance is negated (smaller == closer).
+      const float ip = exact_u + mag * dot_est;
+      est_dist = -ip;
+    }
+
+    result_buffer[offset + e] = set_distance(entry, est_dist);
   }
   __syncthreads();
 }
@@ -329,7 +357,7 @@ __device__ __forceinline__ void frontier_insert_sorted(
 }
 
 // ===== The kernel =====
-template <typename GRAPH_CFG, uint32_t BLOCK_SIZE,
+template <typename GRAPH_CFG, uint32_t BLOCK_SIZE, distance_func DISTANCE_FUNC,
           uint32_t MAX_SEARCH_WIDTH, bool GET_VISITED,
           uint32_t TILE_SIZE = 4, uint32_t MAX_RESULT_SIZE = 1024>
 __global__ void directional_beam_search_kernel(
@@ -473,23 +501,32 @@ __global__ void directional_beam_search_kernel(
     //    one pass. This is the ONE I/O per explored node referenced in the paper.
     CLOCK_START(t_exact);
     DATA_T* u_vec = graph.get_vector(u_gid);
-    const float exact_dist_u_sq =
-        compute_qu_diff_and_l2sq<DATA_T, BLOCK_SIZE>(
+    // exact_u is ||q-u||² (L2) or the raw dot ⟨q,u⟩ (INNER_PRODUCT).
+    const float exact_u =
+        compute_qu_diff_and_exact<DATA_T, BLOCK_SIZE, DISTANCE_FUNC>(
             smem_query_vec, u_vec, smem_qu_diff, padded_dim);
+    // Distance stored for u: identity for L2, negated dot for INNER_PRODUCT
+    // (so that smaller == closer, matching inner_product_distance).
+    float exact_dist_u;
+    if constexpr (DISTANCE_FUNC == distance_func::L2) {
+      exact_dist_u = exact_u;
+    } else {
+      exact_dist_u = -exact_u;
+    }
     CLOCK_ACCUM(t_exact, PHASE_EXACT);
 
     // 4) Add u to frontier (top-k explored by EXACT dist) and visited log.
     CLOCK_START(t_frontier);
     if (threadIdx.x == 0) {
       ENTRY_T u_entry =
-          set_distance(set_index(empty_entry(), u_gid), exact_dist_u_sq);
-      frontier_insert_sorted(u_entry, exact_dist_u_sq,
+          set_distance(set_index(empty_entry(), u_gid), exact_dist_u);
+      frontier_insert_sorted(u_entry, exact_dist_u,
                              frontier_buffer, frontier_buffer_count, k);
 
       if (GET_VISITED) {
         visited_results[query_id * MAX_RESULT_SIZE + visited_counter].first  = u_gid;
         visited_results[query_id * MAX_RESULT_SIZE + visited_counter].second =
-            static_cast<DISTANCE_T>(exact_dist_u_sq);
+            static_cast<DISTANCE_T>(exact_dist_u);
       }
     }
     ++visited_counter;
@@ -510,8 +547,11 @@ __global__ void directional_beam_search_kernel(
     //    stored on edges (u, v) — no fetch of v's vector required.
     CLOCK_START(t_estimate);
     const uint8_t n_edges = graph.get_edge_count(u_gid);
-    populate_estimated_distances<GRAPH_CFG>(
-        smem_qu_diff, exact_dist_u_sq, graph, u_gid, globals, inv_norm_denom,
+    // L2 dots the residual (q-u) against r̂; IP dots the query q directly.
+    const DATA_T* __restrict__ smem_est_vec =
+        (DISTANCE_FUNC == distance_func::L2) ? smem_qu_diff : smem_query_vec;
+    populate_estimated_distances<GRAPH_CFG, DISTANCE_FUNC>(
+        smem_est_vec, exact_u, graph, u_gid, globals, inv_norm_denom,
         result_buffer, offset, n_edges);
     CLOCK_ACCUM(t_estimate, PHASE_ESTIMATE);
 
@@ -610,7 +650,7 @@ directional_beam_search(
   }
 
   auto kernel = directional_beam_search_kernel<
-      graph_cfg_t, Cfg::block_size,
+      graph_cfg_t, Cfg::block_size, Cfg::dist_func,
       Cfg::max_search_width, Cfg::get_visited,
       Cfg::tile_size, Cfg::max_result_size>;
 
@@ -657,7 +697,7 @@ __host__ void directional_beam_search(
       p.beam_width, p.k, padded_dim);
 
   auto kernel = directional_beam_search_kernel<
-      graph_cfg_t, Cfg::block_size,
+      graph_cfg_t, Cfg::block_size, Cfg::dist_func,
       Cfg::max_search_width, Cfg::get_visited,
       Cfg::tile_size, Cfg::max_result_size>;
 
