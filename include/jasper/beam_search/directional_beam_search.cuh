@@ -227,7 +227,6 @@ __device__ __forceinline__ void populate_estimated_distances(
     uint8_t                                        n_edges)
 {
   using INDEX_T  = typename GRAPH_CFG::index_t;
-  using row_t    = typename GRAPH_CFG::edge_lsh_list_t::row_t;
   using PACKED_T = typename GRAPH_CFG::packed_t;
   constexpr uint8_t  K_RANKS       = GRAPH_CFG::k_ranks;
   constexpr INDEX_T  INVALID_INDEX = static_cast<INDEX_T>(0x7FFFFFFFu);
@@ -237,8 +236,6 @@ __device__ __forceinline__ void populate_estimated_distances(
   constexpr PACKED_T SIGN_MASK    = static_cast<PACKED_T>(PACKED_T{1} << (sizeof(PACKED_T) * 8 - 1));
   constexpr PACKED_T COORD_MASK   = static_cast<PACKED_T>(~SIGN_MASK);
   constexpr uint32_t PACKED_BYTES = static_cast<uint32_t>(K_RANKS) * sizeof(PACKED_T);
-  // mag_sq follows the packed array, aligned up to alignof(bf16) == 2.
-  constexpr uint32_t MAG_OFFSET   = (PACKED_BYTES + 1u) & ~1u;
 
   // Hoist u-side segment lookup.
   const INDEX_T  u_lid    = u_gid - graph.global_offset;
@@ -246,12 +243,14 @@ __device__ __forceinline__ void populate_estimated_distances(
   const uint32_t u_locidx = static_cast<uint32_t>(u_lid % GRAPH_CFG::vectors_per_segment);
   const auto&    u_segment = graph.segments[u_segid];
 
-  // Row stride in bytes. row_t = packed_t packed[K_RANKS] + bf16 mag_sq, with
-  // __align__(4) padding up to a 4-byte multiple.
-  //   u8/K=4: 4 + 2 → 8 bytes.   u16/K=8: 16 + 2 → 20 bytes.
-  const uint8_t* __restrict__ row_base =
-      reinterpret_cast<const uint8_t*>(&u_segment.edge_lshs[u_locidx].rows[0]);
-  constexpr uint32_t ROW_BYTES = sizeof(row_t);
+  // SoA edge-LSH layout: all edges' packed words, then a parallel bf16 mag_sq
+  // array. Edge e's K_RANKS words start at packed_base + e*K_RANKS; that offset
+  // is 4-byte aligned (K_RANKS*sizeof(PACKED_T) is a multiple of 4 for supported
+  // configs and edge_lsh_list is alignas(4)), so the vectorized 32-bit loads
+  // below stay valid.
+  const auto& u_lsh = u_segment.edge_lshs[u_locidx];
+  const PACKED_T*      __restrict__ packed_base = u_lsh.packed;
+  const __nv_bfloat16* __restrict__ mag_base    = u_lsh.mag_sq;
 
   // c_per_rank in registers.
   float c_reg[K_RANKS];
@@ -263,15 +262,15 @@ __device__ __forceinline__ void populate_estimated_distances(
     INDEX_T v     = static_cast<INDEX_T>(get_index(entry));
     if (v == INVALID_INDEX) continue;
 
-    const uint8_t* row_ptr = row_base + e * ROW_BYTES;
+    const PACKED_T* __restrict__ row = packed_base + static_cast<uint32_t>(e) * K_RANKS;
 
-    // ─── Load K_RANKS packed words + mag_sq from the same row ──
+    // ─── Load K_RANKS packed words for this edge ──
     PACKED_T p[K_RANKS];
     if constexpr (PACKED_BYTES % 4u == 0u) {
-      // Packed array is a whole number of 32-bit words → vectorize the loads
-      // (row_ptr is 4-byte aligned via row_t's __align__(4)).
+      // Packed group is a whole number of 32-bit words → vectorize the loads
+      // (row is 4-byte aligned via edge_lsh_list's alignas(4)).
       constexpr uint32_t N_WORDS = PACKED_BYTES / 4u;
-      const uint32_t* __restrict__ p32 = reinterpret_cast<const uint32_t*>(row_ptr);
+      const uint32_t* __restrict__ p32 = reinterpret_cast<const uint32_t*>(row);
       uint32_t words[N_WORDS];
       #pragma unroll
       for (uint32_t w = 0; w < N_WORDS; ++w) words[w] = __ldg(p32 + w);
@@ -286,16 +285,12 @@ __device__ __forceinline__ void populate_estimated_distances(
     } else {
       // Odd packed size (e.g. uint8_t with K_RANKS not a multiple of 4): load
       // each packed word directly.
-      const PACKED_T* __restrict__ pp = reinterpret_cast<const PACKED_T*>(row_ptr);
       #pragma unroll
-      for (uint8_t r = 0; r < K_RANKS; ++r) p[r] = __ldg(pp + r);
+      for (uint8_t r = 0; r < K_RANKS; ++r) p[r] = __ldg(row + r);
     }
 
-    // mag_sq sits after the packed array (MAG_OFFSET accounts for sizeof(packed_t)
-    // and bf16 alignment padding).
-    const __nv_bfloat16 mag_sq_bf = __ldg(
-        reinterpret_cast<const __nv_bfloat16*>(row_ptr + MAG_OFFSET));
-    const float mag_sq = __bfloat162float(mag_sq_bf);
+    // mag_sq lives in the parallel bf16 array, indexed by edge.
+    const float mag_sq = __bfloat162float(__ldg(mag_base + e));
 
     // ─── Estimator ───
     float dot_acc = 0.0f;

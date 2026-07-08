@@ -759,7 +759,7 @@ struct graph {
         assert(coord <= COORD_MASK && "coord does not fit in packed_t coord bits");
         packed_t& slot = segments[segment_of(local_idx)]
             .edge_lshs[local_of(local_idx)]
-            .rows[edge_idx].packed[rank];
+            .packed[static_cast<uint32_t>(edge_idx) * k_ranks + rank];
         slot = static_cast<packed_t>((slot & SIGN_MASK) | (static_cast<packed_t>(coord) & COORD_MASK));
       } else {
         assert(false && "set_lsh_coord called with use_lsh=false");
@@ -775,7 +775,7 @@ struct graph {
         assert(local_idx < n_vectors && "global_idx out of bounds");
         segments[segment_of(local_idx)]
             .edge_lshs[local_of(local_idx)]
-            .rows[edge_idx].packed[rank] = word;
+            .packed[static_cast<uint32_t>(edge_idx) * k_ranks + rank] = word;
       } else {
         assert(false && "set_lsh_packed called with use_lsh=false");
       }
@@ -804,7 +804,7 @@ struct graph {
         assert(local_idx < n_vectors && "global_idx out of bounds");
         packed_t& slot = segments[segment_of(local_idx)]
             .edge_lshs[local_of(local_idx)]
-            .rows[edge_idx].packed[rank];
+            .packed[static_cast<uint32_t>(edge_idx) * k_ranks + rank];
         if (is_positive) slot &= COORD_MASK;
         else             slot |= SIGN_MASK;
       } else {
@@ -819,7 +819,7 @@ struct graph {
         assert(local_idx < n_vectors && "global_idx out of bounds");
         segments[segment_of(local_idx)]
             .edge_lshs[local_of(local_idx)]
-            .rows[edge_idx].mag_sq = mag_sq;
+            .mag_sq[edge_idx] = mag_sq;
       } else {
         assert(false && "set_lsh_mag_sq called with use_lsh=false");
       }

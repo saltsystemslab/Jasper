@@ -39,12 +39,14 @@ __device__ uint64_t g_phase_clocks[PHASE_COUNT];
   X(f16_r64_l2_k4_d32678,  uint32_t, 64, __half, float, jasper::distance_func::L2,  4, uint16_t)  \
   X(f16_r64_l2_k8_d32678,  uint32_t, 64, __half, float, jasper::distance_func::L2,  8, uint16_t)  \
   X(f16_r64_l2_k16_d32678, uint32_t, 64, __half, float, jasper::distance_func::L2, 16, uint16_t)  \
-  X(f16_r64_ip_k4_d128,  uint32_t, 64, __half, float, jasper::distance_func::INNER_PRODUCT,  4, uint8_t)  \
-  X(f16_r64_ip_k8_d128,  uint32_t, 64, __half, float, jasper::distance_func::INNER_PRODUCT,  8, uint8_t)  \
-  X(f16_r64_ip_k16_d128, uint32_t, 64, __half, float, jasper::distance_func::INNER_PRODUCT, 16, uint8_t)  \
+  X(f16_r32_ip_k4_d32678,  uint32_t, 32, __half, float, jasper::distance_func::INNER_PRODUCT,  4, uint16_t)  \
+  X(f16_r32_ip_k8_d32678,  uint32_t, 32, __half, float, jasper::distance_func::INNER_PRODUCT,  8, uint16_t)  \
+  X(f16_r32_ip_k16_d32678, uint32_t, 32, __half, float, jasper::distance_func::INNER_PRODUCT, 16, uint16_t)  \
+  X(f16_r32_ip_k32_d32678, uint32_t, 32, __half, float, jasper::distance_func::INNER_PRODUCT, 32, uint16_t)  \
   X(f16_r64_ip_k4_d32678,  uint32_t, 64, __half, float, jasper::distance_func::INNER_PRODUCT,  4, uint16_t)  \
   X(f16_r64_ip_k8_d32678,  uint32_t, 64, __half, float, jasper::distance_func::INNER_PRODUCT,  8, uint16_t)  \
-  X(f16_r64_ip_k16_d32678, uint32_t, 64, __half, float, jasper::distance_func::INNER_PRODUCT, 16, uint16_t)
+  X(f16_r64_ip_k16_d32678, uint32_t, 64, __half, float, jasper::distance_func::INNER_PRODUCT, 16, uint16_t)  \
+  X(f16_r64_ip_k32_d32678, uint32_t, 64, __half, float, jasper::distance_func::INNER_PRODUCT, 32, uint16_t)  
 
 
 // Graph + construct config types. K_RANKS is now a macro parameter.
@@ -624,8 +626,8 @@ int main(int argc, char** argv) {
   program.add_argument("--k_ranks", "-r")
     .default_value(uint32_t{4})
     .scan<'u', uint32_t>()
-    .choices(4u, 8u, 16u)
-    .help("LSH k_ranks (4, 8, or 16)");
+    .choices(4u, 8u, 16u, 32u)
+    .help("LSH k_ranks (4, 8, 16 or 32)");
 
   try {
     program.parse_args(argc, argv);
