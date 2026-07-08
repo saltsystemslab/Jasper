@@ -44,7 +44,7 @@ Updated automatically by neu-ci after each nightly cluster run.
 <!--neu-ci:qps_recall start-->
 ![qps_recall](https://raw.githubusercontent.com/saltsystemslab/jasperpy/ci-results/qps_recall.png)
 
-_updated 2026-07-08 15:37 UTC_
+_updated 2026-07-08 19:27 UTC_
 <!--neu-ci:qps_recall end-->
 
 ### Latest results
@@ -52,12 +52,12 @@ _updated 2026-07-08 15:37 UTC_
 <!--neu-ci:results start-->
 | dataset | insert_vps | query_qps | recall | delete_ms | live_recall | viol | consolidate_ms | append_vps |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| bigann10M | 548969.0 | 2033724.0 | 0.9569 | 1.5 | 0.957 | 0 | 3233.2 | 257150.0 |
-| deep10M | 649083.0 | 2322609.0 | 0.9491 | 1.7 | 0.9495 | 0 | 2810.2 | 294327.0 |
-| gist | 170374.0 | 272217.0 | 0.8474 | 1.0 | 0.847 | 0 | 918.8 | 161264.0 |
-| openai | 50709.0 | 139181.0 | 0.8937 | 0.9 | 0.8937 | 0 | 13954.5 | 35116.0 |
+| bigann10M | 551107.0 | 2024042.0 | 0.9569 | 1.6 | 0.957 | 0 | 3233.1 | 257087.0 |
+| deep10M | 649253.0 | 2266496.0 | 0.949 | 1.7 | 0.9495 | 0 | 2824.8 | 296652.0 |
+| gist | 171157.0 | 273169.0 | 0.8472 | 1.0 | 0.8468 | 0 | 917.6 | 160378.0 |
+| openai | 50670.0 | 139171.0 | 0.8936 | 0.9 | 0.8936 | 0 | 13946.8 | 35270.0 |
 
-_updated 2026-07-08 15:37 UTC_
+_updated 2026-07-08 19:27 UTC_
 <!--neu-ci:results end-->
 
 ## Citation
