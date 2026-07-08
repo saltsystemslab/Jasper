@@ -21,22 +21,40 @@ cluster:
     gres: gpu:rtx6000:1
     cpus_per_task: 8
     mem: 64G
-    time: "01:00:00"
+    time: "04:00:00"        # bench builds + runs 4 large datasets (insert/query/delete/append)
     modules: [cuda, cmake]
+  # Runs once after checkout, before jobs. Activates the group's conda env
+  # (cuda toolchain + Thrust/RAPIDS) and points cmake + the bench harness at it.
+  setup: |
+    set +u
+    module unload cuda cmake 2>/dev/null || true
+    source ~/.bashrc 2>/dev/null || true
+    conda activate /projects/SaltSystemsLab/zikun/env
+    export THRUST_DIR=/projects/SaltSystemsLab/zikun/env/lib/rapids/cmake/thrust
+    export CMAKE_PREFIX_PATH="$CONDA_PREFIX"
+    export ANN_DATA=/projects/SaltSystemsLab/ann_data
+    export ANN_GT=/projects/SaltSystemsLab/ann_gt
+    set -u
 
 jobs:
   compile:
-    run: cmake -B build -DJASPER_BUILD_TESTS=ON && cmake --build build -j
+    run: cmake -B build -DJASPER_BUILD_TESTS=ON -DThrust_DIR="$THRUST_DIR" -DCMAKE_PREFIX_PATH="$CONDA_PREFIX" && cmake --build build -j
     status: cluster/compile
     parser: build
   tests:
     run: ctest --test-dir build --output-on-failure
     status: cluster/tests
     parser: ctest
+  # Regression / performance testing across bigann10M, deep10M, gist, openai.
+  # bench.py builds bench_all, runs each dataset, writes bench/results.csv +
+  # bench/qps_recall.png, and fails if a gated metric regresses vs baseline.csv.
+  bench:
+    run: python scripts/ci/bench.py
+    status: cluster/bench
+    parser: build          # exit 0 = no regression; nonzero = regression/error
 
-# Benchmark artifacts injected into README between neu-ci markers. These are
-# produced by the `bench` job (add it once your bench harness writes these
-# files); until then the markers just stay empty.
+# Benchmark artifacts injected into README between neu-ci markers, produced by
+# the `bench` job above.
 outputs:
   store: results-branch
   branch: ci-results
