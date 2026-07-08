@@ -10,6 +10,29 @@
 
 namespace jasper {
 
+// ─── Center a chunk in place: v[i] -= mean ───────────────────────────────────
+//
+// Cross-polytope LSH assumes data centered at the origin. Datasets with a large
+// non-zero mean (e.g. all-positive uint8) otherwise have one dominant direction
+// shared by every vector, collapsing the argmax onto a single bucket. Applied to
+// a temporary hashing copy only; the stored vectors are never modified.
+template <typename DATA_T>
+__global__ void subtract_mean_kernel(
+    DATA_T* v,                            // [n * padded_dim], modified in place
+    const DATA_T* __restrict__ mean,      // [dim]
+    uint32_t n,
+    uint32_t dim,
+    uint32_t padded_dim
+) {
+  const size_t total = static_cast<size_t>(n) * dim;
+  for (size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       tid < total; tid += static_cast<size_t>(gridDim.x) * blockDim.x) {
+    const uint32_t d   = static_cast<uint32_t>(tid % dim);
+    const size_t   row = tid / dim;
+    v[row * padded_dim + d] = v[row * padded_dim + d] - mean[d];
+  }
+}
+
 // ─── Polytope (cross-polytope) LSH shard assignment ──────────────────────────
 //
 // Cross-polytope LSH hashes a vector to the nearest vertex of the scaled

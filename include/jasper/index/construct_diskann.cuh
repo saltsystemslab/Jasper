@@ -33,6 +33,18 @@
 #include <limits>
 #include <algorithm>
 #include <stdexcept>
+#include <thread>
+#include <future>
+#include <atomic>
+#include <tuple>
+#include <deque>
+#include <mutex>
+#include <condition_variable>
+#include <chrono>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #include "jasper/index/construct.cuh"
 #include "jasper/index/construct_diskann_kernels.cuh"
@@ -125,6 +137,33 @@ struct diskann_intermediate_graph {
                                  + cudaGetErrorString(err));
     };
 
+    // Mean vector (sampled) in the original space, used to center each chunk
+    // before rotation so cross-polytope LSH is not dominated by the data's DC
+    // component. Sampled over up to ~2M vectors for speed.
+    std::vector<__half> h_mean(dim);
+    {
+      const uint32_t target = std::min<uint32_t>(n_vectors, 2000000u);
+      const uint32_t stride = std::max<uint32_t>(1u, n_vectors / target);
+      std::vector<double> acc(dim, 0.0);
+      uint32_t sampled = 0;
+      for (uint32_t i = 0; i < n_vectors; i += stride) {
+        const data_t* vp = data.data + static_cast<size_t>(i) * padded_dim;
+        for (uint32_t d = 0; d < dim; d++) acc[d] += __half2float(vp[d]);
+        sampled++;
+      }
+      for (uint32_t d = 0; d < dim; d++)
+        h_mean[d] = static_cast<__half>(acc[d] / std::max<uint32_t>(1u, sampled));
+    }
+    __half* d_mean = nullptr;
+    auto check_mean = [](cudaError_t err, const char* what) {
+      if (err != cudaSuccess)
+        throw std::runtime_error(std::string("[construct_diskann] ") + what + ": "
+                                 + cudaGetErrorString(err));
+    };
+    check_mean(cudaMalloc(&d_mean, static_cast<size_t>(dim) * sizeof(__half)), "cudaMalloc d_mean");
+    check_mean(cudaMemcpy(d_mean, h_mean.data(), static_cast<size_t>(dim) * sizeof(__half),
+                          cudaMemcpyHostToDevice), "cudaMemcpy d_mean");
+
     // Random orthogonal rotation matrix (dim x dim), generated once.
     std::vector<float> h_P_f(static_cast<size_t>(dim) * dim);
     std::vector<float> h_Pt_f(static_cast<size_t>(dim) * dim);
@@ -170,6 +209,16 @@ struct diskann_intermediate_graph {
                  static_cast<size_t>(cnt) * padded_dim * sizeof(data_t),
                  kind);
 
+      // Center the chunk (v -= mean) before rotating.
+      {
+        const size_t total = static_cast<size_t>(cnt) * dim;
+        const uint32_t sblock = 256;
+        const uint32_t sgrid = static_cast<uint32_t>(
+            std::min<size_t>((total + sblock - 1) / sblock, 65535u));
+        subtract_mean_kernel<data_t><<<sgrid, sblock>>>(d_chunk, d_mean, cnt, dim, padded_dim);
+        check(cudaGetLastError(), "subtract_mean_kernel launch");
+      }
+
       // Rotate the chunk into d_rot: d_rot = Pᵀ · d_chunk (per column/vector).
       // Leading dims are padded_dim; only the first `dim` output rows are
       // written, matching the kernel which reads coordinates [0, dim).
@@ -208,6 +257,7 @@ struct diskann_intermediate_graph {
     std::printf("\n");
 
     cublasDestroy(handle);
+    cudaFree(d_mean);
     cudaFree(d_P);
     cudaFree(d_chunk);
     cudaFree(d_rot);
@@ -297,14 +347,29 @@ struct diskann_intermediate_graph {
     ig.n_dup     = n_dup;
     ig.alpha     = params.alpha;
 
+    using clk = std::chrono::steady_clock;
+    auto secs = [](clk::time_point a, clk::time_point b) {
+      return std::chrono::duration<double>(b - a).count();
+    };
+
     std::cout << "[construct_diskann] assigning " << N
               << " vectors to " << n_parts << " shards (n_dup=" << n_dup << ")\n";
+    auto t_assign0 = clk::now();
     auto shard_ids = assign_shards(data, n_parts, n_dup, seed);
+    const double t_assign = secs(t_assign0, clk::now());
 
     // Host-resident final edge lists (no vectors), zero-initialized.
     std::cout << "[construct_diskann] allocating final edge lists on host\n";
+    auto t_alloc0 = clk::now();
     ig.edges.assign(static_cast<size_t>(N), fin_edge_list_t{});
     ig.counts.assign(static_cast<size_t>(N), 0);
+    const double t_alloc = secs(t_alloc0, clk::now());
+
+    // Per-phase wall-clock accumulators (see the summary printed at the end).
+    // gather runs on a background thread, so it is timed in atomic microseconds;
+    // the rest run on the main thread.
+    std::atomic<long long> gather_us{0};
+    double t_construct = 0, t_post = 0, t_merge_wait = 0;
 
     uint32_t batch_cap =
         graph_construct_workspace<INT_CFG>::max_batch_size_for_budget(workspace_budget);
@@ -316,37 +381,107 @@ struct diskann_intermediate_graph {
                                  + cudaGetErrorString(err));
     };
 
-    for (uint32_t p = 0; p < n_parts; p++) {
-      std::vector<index_t>& ids = shard_ids[p];
-      const uint32_t count = static_cast<uint32_t>(ids.size());
-      std::printf("[construct_diskann] shard %u / %u (%u vectors)\n",
-                  p + 1, n_parts, count);
-      if (count == 0) continue;
+    // Largest shard we can build on the device: the shard graph needs
+    // per_vec bytes per vector, and we must leave room for the construction
+    // workspace (~workspace_budget) plus slack. Shards exceeding this are split
+    // into sub-shards so an imbalanced LSH partition can never OOM the device.
+    const size_t per_vec = static_cast<size_t>(padded_dim) * sizeof(data_t)
+                         + sizeof(int_edge_list_t) + sizeof(uint8_t);
+    size_t free_b = 0, total_b = 0;
+    cudaMemGetInfo(&free_b, &total_b);
+    const size_t reserve = workspace_budget + (size_t{4} << 30);  // 4 GB slack
+    const size_t avail   = (free_b > reserve) ? (free_b - reserve) : (free_b / 2);
+    const uint32_t max_shard = static_cast<uint32_t>(
+        std::min<size_t>(std::max<size_t>(avail / per_vec, 1), 0xFFFFFFFFull));
+    std::printf("[construct_diskann] max shard build size = %u vectors "
+                "(device free %.1f GB)\n",
+                max_shard, free_b / (1024.0 * 1024.0 * 1024.0));
 
-      // Gather this shard's vectors into a contiguous pageable host buffer.
-      // Pageable malloc + an OpenMP copy avoids a multi-GB cudaMallocHost, whose
-      // page-locking cost otherwise stalls the transition between shards.
+    // Allocate the shard graph and workspace ONCE, sized for the largest shard,
+    // and reuse them for every (sub-)shard via construct_graph_into. This avoids
+    // reallocating multi-GB graph/workspace buffers on each shard.
+    int_graph_t g = int_graph_t::allocate(dim, max_shard, /*on_host=*/false);
+    auto ws = graph_construct_workspace<INT_CFG>::allocate(batch_cap);
+
+    // Enumerate the build tasks: split each oversized shard into equal sub-shards
+    // that fit `max_shard`. Sorting largest-first means the one merge that cannot
+    // overlap anything — the final one after the loop — lands on the smallest task.
+    struct task_t { uint32_t part; size_t begin; size_t len; };
+    std::vector<task_t> tasks;
+    for (uint32_t p = 0; p < n_parts; p++) {
+      const size_t total = shard_ids[p].size();
+      if (total == 0) continue;
+      const size_t n_sub    = (total + max_shard - 1) / max_shard;
+      const size_t sub_size = (total + n_sub - 1) / n_sub;
+      for (size_t s = 0; s < n_sub; s++) {
+        const size_t begin = s * sub_size;
+        const size_t len   = std::min(sub_size, total - begin);
+        if (len == 0) break;
+        tasks.push_back({p, begin, len});
+      }
+    }
+    std::sort(tasks.begin(), tasks.end(),
+              [](const task_t& a, const task_t& b) { return a.len > b.len; });
+
+    // The prefetch gather and the background merge both open OpenMP teams while
+    // the GPU builds; leaving both uncapped oversubscribes the cores and starves
+    // the merge, which is on the critical path (merge_wait). Gather is a
+    // bandwidth-bound copy that a handful of threads already saturate, and it has
+    // slack (it hides behind the much longer construct), so cap it and leave the
+    // rest of the cores to the merge.
+#ifdef _OPENMP
+    const int omp_total = omp_get_max_threads();
+#else
+    const int omp_total = 1;
+#endif
+    const int gather_nthreads = std::max(1, std::min(8, omp_total / 4));
+
+    auto make_ids = [&](const task_t& t) {
+      const auto& v = shard_ids[t.part];
+      return std::vector<index_t>(v.begin() + t.begin, v.begin() + t.begin + t.len);
+    };
+
+    // Gather a task's vectors into a fresh pageable host buffer (returned; the
+    // caller frees it). Runs on a background thread so it overlaps the GPU build
+    // of the current task. Pageable malloc + an OpenMP copy avoids a multi-GB
+    // cudaMallocHost whose page-locking cost would otherwise stall the pipeline.
+    auto gather = [&](const std::vector<index_t>& ids) -> data_t* {
+      const auto tg0 = clk::now();
+      const uint32_t count = static_cast<uint32_t>(ids.size());
       const size_t buf_elems = static_cast<size_t>(count) * padded_dim;
       data_t* buf = static_cast<data_t*>(std::malloc(buf_elems * sizeof(data_t)));
       if (!buf) throw std::runtime_error("[construct_diskann] shard gather malloc failed");
-      #pragma omp parallel for schedule(static)
+      #pragma omp parallel for schedule(static) num_threads(gather_nthreads)
       for (uint32_t k = 0; k < count; k++) {
         std::memcpy(buf + static_cast<size_t>(k) * padded_dim,
                     data[static_cast<uint32_t>(ids[k])],
                     static_cast<size_t>(padded_dim) * sizeof(data_t));
       }
+      gather_us += std::chrono::duration_cast<std::chrono::microseconds>(
+                       clk::now() - tg0).count();
+      return buf;
+    };
+
+    // Build one task from an already-gathered buffer into the reused graph `g`,
+    // returning its edges + counts on host. Frees `buf`.
+    auto build_from_buf = [&](data_t* buf, const std::vector<index_t>& ids,
+                              std::vector<int_edge_list_t>& se,
+                              std::vector<uint8_t>& sc) {
+      const uint32_t count = static_cast<uint32_t>(ids.size());
+      const auto tb1 = clk::now();
       vector_view_t shard_vecs(buf, dim, count, /*on_host=*/true);
 
-      // Build the intermediate Vamana graph on device at degree R_int.
       graph_construct_params<INT_CFG> sp;
       sp.data_vectors   = shard_vecs;
       sp.alpha          = params.alpha;
       sp.max_batch_size = std::max<uint32_t>(1, std::min(batch_cap, count));
-      sp.on_host        = false;   // build on device
+      sp.on_host        = false;
       sp.prerotate      = false;   // shards must share one space; no per-shard rotation
 
-      int_graph_t g = construct_graph<INT_CFG>(sp);
+      construct_graph_into<INT_CFG>(g, ws, sp);
       std::free(buf);              // vectors are on device now; drop the gather buffer
+      const auto tb2 = clk::now();
+      t_construct += secs(tb1, tb2);
 
       // Remap neighbor ids shard-local -> global on the device.
       index_t* d_idmap = nullptr;
@@ -363,14 +498,15 @@ struct diskann_intermediate_graph {
       cudaFree(d_idmap);
 
       // Copy this shard's edges + counts back to host (vectors stay on device).
-      std::vector<int_edge_list_t> se(count);
-      std::vector<uint8_t>         sc(count);
+      se.resize(count);
+      sc.resize(count);
       using seg_t = graph_segment<int_graph_cfg>;
       std::vector<seg_t> segs(g.segments.begin(), g.segments.end());
       uint32_t off = 0;
       for (uint32_t s = 0; s < g.n_segments; s++) {
         const seg_t& seg = segs[s];
         const uint32_t seg_count = static_cast<uint32_t>(seg.n_vectors);
+        if (seg_count == 0) continue;
         cudaMemcpy(se.data() + off, seg.edges,
                    static_cast<size_t>(seg_count) * sizeof(int_edge_list_t),
                    cudaMemcpyDeviceToHost);
@@ -380,23 +516,105 @@ struct diskann_intermediate_graph {
         off += seg_count;
       }
       cudaDeviceSynchronize();
-      g.deallocate();
+      t_post += secs(tb2, clk::now());
+    };
 
-      // Distance-only merge into the final edge lists. Each global id is unique
-      // within a shard, so nodes can be merged in parallel without races.
-      #pragma omp parallel for schedule(static)
-      for (uint32_t i = 0; i < count; i++) {
-        const index_t gid = ids[i];
-        merge_row(ig.edges[gid], ig.counts[gid], se[i], sc[i]);
+    // Distance-only merges must be serialized (a global id can appear in several
+    // shards, so two concurrent merges could write the same final row). Rather
+    // than join the previous merge before starting the next — which blocks the
+    // main/GPU thread and idles the GPU between shards — run all merges on one
+    // persistent worker fed by a bounded queue. The main thread enqueues a
+    // finished shard and immediately proceeds to the next GPU build; it blocks
+    // only when the queue is full (MERGE_QCAP bounds host memory). Truncating to
+    // R_final each step is associative in distance, so merge order is irrelevant.
+    struct merge_job_t {
+      std::vector<int_edge_list_t> se;
+      std::vector<uint8_t>         sc;
+      std::vector<index_t>         ids;
+    };
+    std::deque<merge_job_t> merge_q;
+    std::mutex              merge_mtx;
+    std::condition_variable merge_cv_push, merge_cv_pop;
+    bool                    merge_done = false;
+    constexpr size_t        MERGE_QCAP = 2;  // in-flight shards; lower if host OOM
+
+    std::thread merge_worker([&]() {
+      for (;;) {
+        merge_job_t job;
+        {
+          std::unique_lock<std::mutex> lk(merge_mtx);
+          merge_cv_pop.wait(lk, [&] { return merge_done || !merge_q.empty(); });
+          if (merge_q.empty()) break;  // merge_done and drained
+          job = std::move(merge_q.front());
+          merge_q.pop_front();
+          merge_cv_push.notify_one();
+        }
+        const uint32_t cnt = static_cast<uint32_t>(job.ids.size());
+        #pragma omp parallel for schedule(static)
+        for (uint32_t i = 0; i < cnt; i++) {
+          const index_t gid = job.ids[i];
+          merge_row(ig.edges[gid], ig.counts[gid], job.se[i], job.sc[i]);
+        }
+      }
+    });
+
+    auto enqueue_merge = [&](std::vector<int_edge_list_t>&& se,
+                             std::vector<uint8_t>&& sc,
+                             std::vector<index_t>&& ids) {
+      const auto tw0 = clk::now();
+      std::unique_lock<std::mutex> lk(merge_mtx);
+      merge_cv_push.wait(lk, [&] { return merge_q.size() < MERGE_QCAP; });
+      t_merge_wait += secs(tw0, clk::now());
+      merge_q.push_back(merge_job_t{std::move(se), std::move(sc), std::move(ids)});
+      merge_cv_pop.notify_one();
+    };
+
+    // Pipeline: prefetch task t+1's gather (background) while task t builds on the
+    // GPU and task t-1 merges on the CPU. GPU, gather, and merge run concurrently.
+    std::future<data_t*> pending_buf;
+    std::vector<index_t>  pending_ids;
+    if (!tasks.empty()) {
+      pending_ids = make_ids(tasks[0]);
+      pending_buf = std::async(std::launch::async, gather, std::cref(pending_ids));
+    }
+
+    for (size_t i = 0; i < tasks.size(); i++) {
+      std::printf("[construct_diskann] task %zu / %zu (part %u, %zu vectors)\n",
+                  i + 1, tasks.size(), tasks[i].part, tasks[i].len);
+
+      data_t* buf = pending_buf.get();          // gather(i) result
+      std::vector<index_t> ids = std::move(pending_ids);
+
+      if (i + 1 < tasks.size()) {               // prefetch gather(i+1) during build(i)
+        pending_ids = make_ids(tasks[i + 1]);
+        pending_buf = std::async(std::launch::async, gather, std::cref(pending_ids));
       }
 
-      // Release this shard's storage before moving to the next.
-      ids.clear();  ids.shrink_to_fit();
-      se.clear();   se.shrink_to_fit();
-      sc.clear();   sc.shrink_to_fit();
-
-      std::printf("[construct_diskann] merged shard %u / %u\n", p + 1, n_parts);
+      std::vector<int_edge_list_t> se;
+      std::vector<uint8_t>         sc;
+      build_from_buf(buf, ids, se, sc);
+      enqueue_merge(std::move(se), std::move(sc), std::move(ids));
     }
+
+    // Drain: signal the worker and wait for the last queued merges to finish.
+    const auto t_tail0 = clk::now();
+    {
+      std::unique_lock<std::mutex> lk(merge_mtx);
+      merge_done = true;
+      merge_cv_pop.notify_all();
+    }
+    merge_worker.join();
+    const double t_merge_tail = secs(t_tail0, clk::now());
+
+    g.deallocate();
+    ws.free();
+
+    std::printf(
+        "[construct_diskann] phase totals (s): assign=%.1f  alloc_edges=%.1f  "
+        "gather=%.1f  construct=%.1f  remap+copy=%.1f  merge_wait=%.1f  "
+        "merge_tail=%.1f\n",
+        t_assign, t_alloc, gather_us.load() / 1e6, t_construct, t_post,
+        t_merge_wait, t_merge_tail);
 
     return ig;
   }

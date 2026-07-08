@@ -453,6 +453,58 @@ struct graph {
     return g;
   }
 
+  // Reuse this graph's already-allocated storage for a new (smaller-or-equal)
+  // vector set: overwrite the vectors, reset edge counts to 0, and reset
+  // medoid / global_offset. Requires the current capacity
+  // (n_segments * vectors_per_segment) >= data.n_vectors and matching dim.
+  // Lets a caller build many shards without reallocating the graph each time.
+  __host__ void reload(vector_view_t data) {
+    const uint64_t capacity =
+        static_cast<uint64_t>(n_segments) * vectors_per_segment;
+    if (static_cast<uint64_t>(data.n_vectors) > capacity)
+      throw std::runtime_error("graph::reload: data.n_vectors exceeds capacity");
+    if (data.dim != dim)
+      throw std::runtime_error("graph::reload: dim mismatch");
+
+    const uint32_t padded_dim = vector_view_t::pad(dim);
+    n_vectors     = static_cast<index_t>(data.n_vectors);
+    medoid        = 0;
+    global_offset = 0;
+
+    std::vector<segment_t> h_segments(segments.begin(), segments.end());
+
+    const cudaMemcpyKind copy_kind =
+        data.on_host ? cudaMemcpyHostToDevice : cudaMemcpyDeviceToDevice;
+
+    cudaStream_t stream;
+    cudaStreamCreate(&stream);
+
+    for (uint32_t s = 0; s < n_segments; s++) {
+      const uint64_t seg_begin = static_cast<uint64_t>(s) * vectors_per_segment;
+      const uint32_t seg_count = (seg_begin < static_cast<uint64_t>(n_vectors))
+          ? static_cast<uint32_t>(std::min<uint64_t>(
+                vectors_per_segment, static_cast<uint64_t>(n_vectors) - seg_begin))
+          : 0u;
+
+      h_segments[s].n_vectors = static_cast<index_t>(seg_count);
+      if (seg_count > 0) {
+        cudaMemcpyAsync(h_segments[s].vectors.data,
+                        data.data + seg_begin * padded_dim,
+                        static_cast<size_t>(seg_count) * padded_dim * sizeof(data_t),
+                        copy_kind, stream);
+        cudaMemsetAsync(h_segments[s].edge_counts, 0,
+                        static_cast<size_t>(seg_count) * sizeof(uint8_t), stream);
+      }
+    }
+
+    cudaStreamSynchronize(stream);
+    cudaStreamDestroy(stream);
+
+    // Re-upload segment structs so device-side views see the updated n_vectors.
+    segments = thrust::device_vector<segment_t>(h_segments.begin(), h_segments.end());
+    cudaDeviceSynchronize();
+  }
+
   // load the range of vectors with index [start, end) to a vector view
   // useful for graph construction
   __host__ void load_vectors_to_view(vector_view_t target, index_t start, index_t end) {
