@@ -42,11 +42,22 @@ Updated automatically by neu-ci after each nightly cluster run.
 ### QPS vs. recall
 
 <!--neu-ci:qps_recall start-->
+![qps_recall](https://raw.githubusercontent.com/saltsystemslab/jasperpy/ci-results/qps_recall.png)
+
+_updated 2026-07-08 15:37 UTC_
 <!--neu-ci:qps_recall end-->
 
 ### Latest results
 
 <!--neu-ci:results start-->
+| dataset | insert_vps | query_qps | recall | delete_ms | live_recall | viol | consolidate_ms | append_vps |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| bigann10M | 548969.0 | 2033724.0 | 0.9569 | 1.5 | 0.957 | 0 | 3233.2 | 257150.0 |
+| deep10M | 649083.0 | 2322609.0 | 0.9491 | 1.7 | 0.9495 | 0 | 2810.2 | 294327.0 |
+| gist | 170374.0 | 272217.0 | 0.8474 | 1.0 | 0.847 | 0 | 918.8 | 161264.0 |
+| openai | 50709.0 | 139181.0 | 0.8937 | 0.9 | 0.8937 | 0 | 13954.5 | 35116.0 |
+
+_updated 2026-07-08 15:37 UTC_
 <!--neu-ci:results end-->
 
 ## Citation
