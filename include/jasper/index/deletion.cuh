@@ -15,11 +15,10 @@ namespace jasper {
 // == 0 for the graphs these kernels run on, so global index == local index.
 // ─────────────────────────────────────────────────────────────────────────
 
-// Mark a batch of vertex IDs as soft-deleted. CUDA has no byte-granularity
-// atomics, so we atomicOr the aligned 4-byte word containing the target byte
-// (within that vertex's segment deleted[] array) and inspect the old byte to
-// count entries newly marked (previously 0). This makes duplicate IDs in the
-// batch race-safe and counted once.
+// Mark a batch of vertex IDs as soft-deleted. Deletion state is a packed
+// bitmask (1 bit/slot); we atomicOr the target bit into its 32-bit word and
+// inspect the old word to count entries newly marked (bit previously 0). This
+// makes duplicate IDs in the batch race-safe and counted once.
 template <typename GRAPH_CFG>
 __global__ void mark_deleted_batch_kernel(
     typename graph<GRAPH_CFG>::device_view g,
@@ -35,17 +34,10 @@ __global__ void mark_deleted_batch_kernel(
   index_t local_idx = g.to_local(id);
   uint32_t seg_id   = graph<GRAPH_CFG>::segment_of(local_idx);
   uint32_t loc      = graph<GRAPH_CFG>::local_of(local_idx);
-  uint8_t* seg_deleted = g.segments[seg_id].deleted;
-
-  uint32_t* word_ptr =
-      reinterpret_cast<uint32_t*>(reinterpret_cast<uintptr_t>(&seg_deleted[loc]) &
-                                  ~static_cast<uintptr_t>(3));
-  uint32_t byte_shift =
-      (static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&seg_deleted[loc]) & 3)) * 8;
-  uint32_t mask = static_cast<uint32_t>(0xFF) << byte_shift;
-
-  uint32_t old_word = atomicOr(word_ptr, mask);
-  if (((old_word >> byte_shift) & 0xFF) == 0) {
+  uint32_t* bits = g.segments[seg_id].deleted_bits;
+  uint32_t  mask = 1u << (loc & 31u);
+  uint32_t  old_word = atomicOr(&bits[loc >> 5], mask);
+  if ((old_word & mask) == 0) {   // bit was unset -> this ID is newly deleted
     atomicAdd(out_new_count, (index_t)1);
   }
 }
