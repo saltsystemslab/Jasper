@@ -339,6 +339,89 @@ void run_directional_round(jasper::graph<GraphCfg>& graph,
   cudaFree(result.frontier);
 }
 
+// ── Single PQ directional-search round (ADC) ───────────────────
+template <typename GraphCfg, typename DataT>
+void run_pq_round(jasper::graph<GraphCfg>& graph,
+                  jasper::pq_codebooks_view<GraphCfg::pq_m, GraphCfg::pq_k> codebooks,
+                  DataT* d_queries,
+                  uint32_t n_queries,
+                  uint32_t dim,
+                  uint32_t k,
+                  uint32_t beam_width,
+                  uint32_t limit,
+                  const GroundTruth* gt,
+                  bool print_throughput) {
+
+  jasper::vector_view<DataT> query_view(d_queries, dim, n_queries, false);
+
+  jasper::search_params params{
+    .k          = k,
+    .beam_width = beam_width,
+    .limit      = limit,
+    .get_visited = false,
+  };
+
+  cudaEvent_t e0, e1;
+  cudaEventCreate(&e0);
+  cudaEventCreate(&e1);
+
+  cudaDeviceSynchronize();
+  CUDA_CHECK(cudaGetLastError());
+
+  jasper::reset_phase_clocks();
+
+  cudaEventRecord(e0);
+  auto result = jasper::pq_search(graph, codebooks, query_view, params);
+  CUDA_CHECK(cudaGetLastError());
+  cudaDeviceSynchronize();
+  CUDA_CHECK(cudaGetLastError());
+  cudaEventRecord(e1);
+  cudaEventSynchronize(e1);
+
+  float duration_ms = 0;
+  cudaEventElapsedTime(&duration_ms, e0, e1);
+  cudaEventDestroy(e0);
+  cudaEventDestroy(e1);
+
+  if (print_throughput) {
+    float throughput = (n_queries * 1000.0f) / duration_ms;
+    std::cout << "  beam_width=" << beam_width
+              << " limit=" << limit
+              << " duration=" << std::fixed << std::setprecision(2) << duration_ms << "ms"
+              << " throughput=" << std::setprecision(0) << throughput << " QPS"
+              << std::endl;
+  }
+
+  // Unpack results
+  uint32_t total = n_queries * k;
+  int32_t* d_indices = nullptr;
+  float* d_distances = nullptr;
+  CUDA_CHECK(cudaMalloc(&d_indices, total * sizeof(int32_t)));
+  CUDA_CHECK(cudaMalloc(&d_distances, total * sizeof(float)));
+
+  uint32_t threads = 256;
+  uint32_t blocks = (total + threads - 1) / threads;
+  unpack_results_kernel<<<blocks, threads>>>(
+    result.frontier, d_indices, d_distances, total);
+  CUDA_CHECK(cudaGetLastError());
+  CUDA_CHECK(cudaDeviceSynchronize());
+
+  std::vector<int32_t> h_indices(total);
+  std::vector<float> h_distances(total);
+  CUDA_CHECK(cudaMemcpy(h_indices.data(), d_indices, total * sizeof(int32_t), cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(h_distances.data(), d_distances, total * sizeof(float), cudaMemcpyDeviceToHost));
+
+  if (gt) {
+    get_recall(*gt, h_indices.data(), k, n_queries);
+  }
+
+  if (print_throughput) jasper::print_phase_clocks();
+
+  cudaFree(d_indices);
+  cudaFree(d_distances);
+  cudaFree(result.frontier);
+}
+
 // Rotate a batch of vectors in place on device by the orthogonal matrix seeded
 // with `seed`. Rows are [n_vectors, padded_dim] row-major __half; only the
 // first `dim` columns are populated, pad lanes stay zero.
@@ -536,6 +619,115 @@ void load_and_bench_lsh(const std::string& index_path,
   graph.deallocate();
 }
 
+// ── Load graph + train PQ + run PQ directional benchmark ───────
+template <typename GraphCfg, typename DataT>
+void load_and_bench_pq(const std::string& index_path,
+                       const std::string& query_path,
+                       const std::string& gt_path,
+                       const std::string& src_dtype,
+                       uint32_t dim,
+                       uint32_t k,
+                       uint32_t rotate_seed,
+                       bool do_rotate,
+                       uint32_t pq_train,
+                       bool on_host,
+                       const std::vector<std::pair<uint32_t, uint32_t>>& beam_limit_pairs) {
+
+  // Load graph (LSH config; edge_pqs storage is allocated lazily below).
+  std::cout << "Loading index..." << std::endl;
+  auto graph = jasper::load_graph_from_file<GraphCfg>(index_path, dim, on_host);
+  std::cout << "  " << graph.n_vectors << " vectors, dim=" << graph.dim << std::endl;
+
+  // Rotate stored vectors so the PQ residuals match create_lsh_index's
+  // prerotate. Distance-preserving, so graph edges are unaffected.
+  if (do_rotate) {
+    std::cout << "Rotating stored vectors (seed=" << rotate_seed << ")..." << std::endl;
+    rotate_graph_vectors<GraphCfg>(graph, rotate_seed);
+    cudaDeviceSynchronize();
+  }
+
+  // Train PQ codebooks on sampled edge residuals, then encode every edge.
+  std::cout << "Training PQ codebooks..." << std::endl;
+  auto t0 = std::chrono::steady_clock::now();
+  auto pq_codebooks = graph.generate_pq_codebooks(pq_train);
+  cudaDeviceSynchronize();
+  auto t1 = std::chrono::steady_clock::now();
+
+  std::cout << "Populating edge PQ codes..." << std::endl;
+  graph.populate_edge_pq(pq_codebooks);
+  cudaDeviceSynchronize();
+  auto t2 = std::chrono::steady_clock::now();
+
+  std::cout << "  generate_pq_codebooks: "
+            << std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count() << " ms\n";
+  std::cout << "  populate_edge_pq:      "
+            << std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count() << " ms\n";
+
+  // Load queries, casting src_dtype -> DataT (__half)
+  std::cout << "Loading queries..." << std::endl;
+  jasper::vector_view<DataT> h_queries_view;
+  if (src_dtype == "float") {
+    h_queries_view = jasper::load_vectors_from_file_cast<DataT, float>(query_path);
+  } else if (src_dtype == "uint8") {
+    h_queries_view = jasper::load_vectors_from_file_cast<DataT, uint8_t>(query_path);
+  } else {
+    throw std::runtime_error("Unsupported source dtype: " + src_dtype);
+  }
+  if (!h_queries_view.data)
+    throw std::runtime_error("Failed to load queries from: " + query_path);
+
+  if (h_queries_view.dim != dim)
+    throw std::runtime_error(
+      "Query file dim=" + std::to_string(h_queries_view.dim) +
+      " does not match --dim=" + std::to_string(dim));
+
+  uint32_t n_queries = h_queries_view.n_vectors;
+  std::cout << "  " << n_queries << " queries, dim=" << h_queries_view.dim << std::endl;
+
+  auto d_queries_view = h_queries_view.to_device();
+  cudaFreeHost(h_queries_view.data);
+  DataT* d_queries = d_queries_view.data;
+
+  // Rotate queries with the same seed used for the stored vectors.
+  if (do_rotate) {
+    cublasHandle_t handle;
+    cublasCreate(&handle);
+    rotate_device_vectors(d_queries, n_queries, dim,
+                          d_queries_view.padded_dim, rotate_seed, handle);
+    cublasDestroy(handle);
+  }
+
+  // Load ground truth
+  GroundTruth gt;
+  bool has_gt = !gt_path.empty();
+  if (has_gt) {
+    std::cout << "Loading ground truth..." << std::endl;
+    gt = read_groundtruth(gt_path, k);
+    std::cout << "  " << gt.n_queries << " queries, k=" << gt.gt_k << std::endl;
+    if (gt.n_queries != n_queries)
+      throw std::runtime_error("Ground truth query count mismatch");
+  }
+
+  // Warmup
+  std::cout << "\nWarmup..." << std::endl;
+  auto [warmup_bw, warmup_limit] = beam_limit_pairs.front();
+  run_pq_round<GraphCfg, DataT>(
+    graph, pq_codebooks.view(), d_queries, n_queries, dim, k,
+    warmup_bw, warmup_limit, nullptr, false);
+
+  // Benchmark rounds
+  std::cout << "\n=== PQ Directional Beam Search Benchmark (k=" << k << ") ===" << std::endl;
+  for (auto& [bw, lim] : beam_limit_pairs) {
+    run_pq_round<GraphCfg, DataT>(
+      graph, pq_codebooks.view(), d_queries, n_queries, dim, k,
+      bw, lim, has_gt ? &gt : nullptr, true);
+  }
+
+  cudaFree(d_queries);
+  pq_codebooks.free();
+  graph.deallocate();
+}
+
 // ── Load graph + run all beam widths ───────────────────────────
 template <typename GraphCfg, typename DataT>
 void load_and_bench(const std::string& index_path,
@@ -678,11 +870,25 @@ int main(int argc, char** argv) {
     .help("Populate LSH on the loaded index and run directional search "
           "(L2 or IP). Index file needs no LSH data; it is generated at load.");
 
+  program.add_argument("--pq")
+    .default_value(false)
+    .implicit_value(true)
+    .help("Train PQ codebooks on the loaded index and run PQ directional "
+          "search (ADC). Index file needs no PQ data; it is generated at load. "
+          "Mutually exclusive with --lsh.");
+
+  program.add_argument("--pq_train")
+    .default_value(uint32_t{40000})
+    .scan<'u', uint32_t>()
+    .help("Number of sampled edge residuals for PQ k-means training. "
+          "Only used with --pq. Default 40000.");
+
   program.add_argument("--k_ranks", "-r")
     .default_value(uint32_t{4})
     .scan<'u', uint32_t>()
     .choices(4u, 8u, 16u)
-    .help("LSH k_ranks (4, 8, or 16). Only used with --lsh.");
+    .help("LSH k_ranks / PQ subquantizers M (4, 8, or 16). "
+          "Used with --lsh or --pq.");
 
   program.add_argument("--on_host")
     .default_value(false)
@@ -718,10 +924,17 @@ int main(int argc, char** argv) {
   auto k            = program.get<uint32_t>("--k");
   auto beam_args    = program.get<std::vector<std::string>>("--beam_limits");
   auto use_lsh      = program.get<bool>("--lsh");
+  auto use_pq       = program.get<bool>("--pq");
   auto on_host      = program.get<bool>("--on_host");
   auto k_ranks      = program.get<uint32_t>("--k_ranks");
+  auto pq_train     = program.get<uint32_t>("--pq_train");
   auto no_rotate    = program.get<bool>("--no_rotate");
   auto rotate_seed  = program.get<uint32_t>("--rotate_seed");
+
+  if (use_lsh && use_pq) {
+    std::cerr << "Error: --lsh and --pq are mutually exclusive" << std::endl;
+    return 1;
+  }
 
   std::vector<std::pair<uint32_t, uint32_t>> beam_limit_pairs;
   try {
@@ -745,9 +958,12 @@ int main(int argc, char** argv) {
     std::cout << bw << ":" << lim << " ";
   std::cout << std::endl;
   std::cout << "  lsh:          " << (use_lsh ? "true" : "false") << std::endl;
+  std::cout << "  pq:           " << (use_pq ? "true" : "false") << std::endl;
   std::cout << "  on_host:      " << (on_host ? "true" : "false") << std::endl;
-  if (use_lsh) {
+  if (use_lsh || use_pq) {
     std::cout << "  k_ranks:      " << k_ranks << std::endl;
+    if (use_pq)
+      std::cout << "  pq_train:     " << pq_train << std::endl;
     std::cout << "  rotate:       " << (no_rotate ? "false" : "true") << std::endl;
     if (!no_rotate)
       std::cout << "  rotate_seed:  " << rotate_seed << std::endl;
@@ -756,7 +972,32 @@ int main(int argc, char** argv) {
   try {
     bool dispatched = false;
 
-    if (use_lsh) {
+    if (use_pq) {
+      // PQ requires directional (use_lsh) storage, so it dispatches over the
+      // same config table; k_ranks selects the number of PQ subquantizers M.
+      #define TRY_DISPATCH_PQ(id, IDX, R, DAT, DIST, FUNC, KR, PACKEDT)        \
+        if (!dispatched &&                                                     \
+            lsh_config_matches<FUNC, KR, PACKEDT>(                             \
+                datatype, n_neighbors, distance, R, k_ranks, dim)) {          \
+          std::cout << "  Config: " #id << std::endl;                          \
+          load_and_bench_pq<cfg_##id, DAT>(                                    \
+              index_path, query_path, gt_path, datatype,                       \
+              dim, k, rotate_seed, !no_rotate, pq_train, on_host,             \
+              beam_limit_pairs);                                               \
+          dispatched = true;                                                   \
+        }
+
+      JASPER_FOR_EACH_LSH_CONFIG(TRY_DISPATCH_PQ)
+      #undef TRY_DISPATCH_PQ
+
+      if (!dispatched) {
+        throw std::runtime_error(
+          "Unsupported PQ config: datatype=" + datatype +
+          ", n_neighbors=" + std::to_string(n_neighbors) +
+          ", distance=" + distance +
+          ", k_ranks=" + std::to_string(k_ranks));
+      }
+    } else if (use_lsh) {
       #define TRY_DISPATCH_LSH(id, IDX, R, DAT, DIST, FUNC, KR, PACKEDT)       \
         if (!dispatched &&                                                     \
             lsh_config_matches<FUNC, KR, PACKEDT>(                             \

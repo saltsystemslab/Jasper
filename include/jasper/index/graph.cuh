@@ -10,6 +10,9 @@
 #include "jasper/lsh/edge_lsh.cuh"
 #include "jasper/lsh/lsh_globals.cuh"
 #include "jasper/lsh/lsh_kernels.cuh"
+#include "jasper/pq/edge_pq.cuh"
+#include "jasper/pq/pq_codebooks.cuh"
+#include "jasper/pq/pq_kernels.cuh"
 
 #include "assert.h"
 #include "stdio.h"
@@ -50,7 +53,15 @@ struct graph_config {
   using edge_lsh_list_t = edge_lsh_list<INDEX_T, N_NEIGHBORS, K_RANKS, PACKED_T>;
   using packed_t = PACKED_T;
   using vector_view_t = vector_view<DATA_T>;
-  
+
+  // Product-Quantization (directional PQ path). Reuses K_RANKS as the number of
+  // subquantizers M; K is fixed at 256 (uint8 codes). Shares the use_lsh gate
+  // (all directional configs enable it) and lives alongside the LSH storage so
+  // the two estimators can be benchmarked on the same graph.
+  static constexpr uint32_t pq_m = K_RANKS;
+  static constexpr uint32_t pq_k = 256;
+  using edge_pq_list_t = edge_pq_list<INDEX_T, N_NEIGHBORS, pq_m>;
+
   static constexpr uint8_t n_neighbors = N_NEIGHBORS;
   static constexpr distance_func dist_func = DIST_FUNC;
   static constexpr index_t vectors_per_segment = 1u << 20;
@@ -66,6 +77,7 @@ struct graph_segment {
   using index_t     = typename graph_cfg::index_t;
   using edge_list_t = typename graph_cfg::edge_list_t;
   using edge_lsh_list_t = typename graph_cfg::edge_lsh_list_t;
+  using edge_pq_list_t  = typename graph_cfg::edge_pq_list_t;
   using vector_view_t    = typename graph_cfg::vector_view_t;
 
   static constexpr uint32_t max_vectors = graph_cfg::vectors_per_segment;
@@ -78,6 +90,7 @@ struct graph_segment {
   uint8_t *edge_counts;
   vector_view_t vectors;
   edge_lsh_list_t* edge_lshs; // only enabled if USE_LSH
+  edge_pq_list_t*  edge_pqs;  // PQ codes; only enabled if USE_LSH (directional)
 
   // if on_host is true, the data is allocated on cpu pinned memory
   bool on_host = false;
@@ -104,10 +117,33 @@ struct graph_segment {
 
     seg.vectors = vector_view_t::allocate(dim, max_vectors, on_host);
 
-    // edge_lshs is allocated lazily on the first populate_edge_lsh() call.
+    // edge_lshs / edge_pqs are allocated lazily on the first
+    // populate_edge_lsh() / populate_edge_pq() call.
     seg.edge_lshs = nullptr;
+    seg.edge_pqs  = nullptr;
 
     return seg;
+  }
+
+  // Lazily allocate the PQ code storage. No-op if already allocated or if
+  // use_lsh (directional storage) is disabled. Matches this segment's on_host.
+  void allocate_edge_pq() {
+    if constexpr (graph_cfg::use_lsh) {
+      if (edge_pqs != nullptr) return;
+
+      auto check = [](cudaError_t err, const char* name) {
+        if (err != cudaSuccess)
+          throw std::runtime_error(std::string(name) + " failed: " + cudaGetErrorString(err));
+      };
+
+      if (on_host) {
+        check(cudaMallocHost(&edge_pqs, max_vectors * sizeof(edge_pq_list_t)),
+              "cudaMallocHost(edge_pqs)");
+      } else {
+        check(cudaMalloc(&edge_pqs, max_vectors * sizeof(edge_pq_list_t)),
+              "cudaMalloc(edge_pqs)");
+      }
+    }
   }
 
   // Lazily allocate the edge_lsh storage. No-op if already allocated or if
@@ -143,6 +179,8 @@ struct graph_segment {
     if constexpr (graph_cfg::use_lsh) {
       if (on_host) cudaFreeHost(edge_lshs); else cudaFree(edge_lshs);
       edge_lshs = nullptr;
+      if (on_host) cudaFreeHost(edge_pqs); else cudaFree(edge_pqs);
+      edge_pqs = nullptr;
     }
     vectors.deallocate();
     edges = nullptr;
@@ -165,6 +203,7 @@ struct graph_segment {
     edge_list_t* new_edges       = nullptr;
     uint8_t*     new_edge_counts = nullptr;
     edge_lsh_list_t* new_edge_lshs = nullptr;
+    edge_pq_list_t*  new_edge_pqs  = nullptr;
 
     if (target_on_host) {
       cudaMallocHost(&new_edges,       max_vectors * sizeof(edge_list_t));
@@ -173,6 +212,8 @@ struct graph_segment {
       if constexpr (graph_cfg::use_lsh) {
         if (edge_lshs != nullptr)
           cudaMallocHost(&new_edge_lshs, max_vectors * sizeof(edge_lsh_list_t));
+        if (edge_pqs != nullptr)
+          cudaMallocHost(&new_edge_pqs, max_vectors * sizeof(edge_pq_list_t));
       }
     } else {
       cudaMalloc(&new_edges,       max_vectors * sizeof(edge_list_t));
@@ -182,6 +223,8 @@ struct graph_segment {
       if constexpr (graph_cfg::use_lsh) {
         if (edge_lshs != nullptr)
           cudaMalloc(&new_edge_lshs, max_vectors * sizeof(edge_lsh_list_t));
+        if (edge_pqs != nullptr)
+          cudaMalloc(&new_edge_pqs, max_vectors * sizeof(edge_pq_list_t));
       }
     }
     vector_view_t new_vectors =
@@ -200,6 +243,10 @@ struct graph_segment {
           cudaMemcpyAsync(new_edge_lshs, edge_lshs,
                           static_cast<size_t>(n_vectors) * sizeof(edge_lsh_list_t),
                           copy_kind, stream);
+        if (edge_pqs != nullptr)
+          cudaMemcpyAsync(new_edge_pqs, edge_pqs,
+                          static_cast<size_t>(n_vectors) * sizeof(edge_pq_list_t),
+                          copy_kind, stream);
       }
       cudaMemcpyAsync(new_vectors.data, vectors.data,
                       static_cast<size_t>(n_vectors) * padded_dim * sizeof(data_t),
@@ -211,18 +258,18 @@ struct graph_segment {
     if (on_host) {
       cudaFreeHost(edges);
       cudaFreeHost(edge_counts);
-      if constexpr (graph_cfg::use_lsh) cudaFreeHost(edge_lshs);
+      if constexpr (graph_cfg::use_lsh) { cudaFreeHost(edge_lshs); cudaFreeHost(edge_pqs); }
     } else {
       cudaFree(edges);
       cudaFree(edge_counts);
-      if constexpr (graph_cfg::use_lsh) cudaFree(edge_lshs);
+      if constexpr (graph_cfg::use_lsh) { cudaFree(edge_lshs); cudaFree(edge_pqs); }
     }
     vectors.deallocate();
 
     // Install new buffers.
     edges       = new_edges;
     edge_counts = new_edge_counts;
-    if constexpr (graph_cfg::use_lsh) edge_lshs = new_edge_lshs;
+    if constexpr (graph_cfg::use_lsh) { edge_lshs = new_edge_lshs; edge_pqs = new_edge_pqs; }
     vectors     = new_vectors;
     on_host     = target_on_host;
   }
@@ -348,6 +395,7 @@ struct graph {
   using segment_t   = graph_segment<graph_cfg>;
   using edge_list_t = typename graph_cfg::edge_list_t;
   using edge_lsh_list_t = typename graph_cfg::edge_lsh_list_t;
+  using edge_pq_list_t  = typename graph_cfg::edge_pq_list_t;
   using packed_t = typename graph_cfg::packed_t;
   using vector_view_t    = typename graph_cfg::vector_view_t;
 
@@ -355,6 +403,8 @@ struct graph {
   static constexpr uint32_t vectors_per_segment = graph_cfg::vectors_per_segment;
   static constexpr bool use_lsh = graph_cfg::use_lsh;
   static constexpr uint8_t k_ranks = graph_cfg::k_ranks;
+  static constexpr uint32_t pq_m = graph_cfg::pq_m;
+  static constexpr uint32_t pq_k = graph_cfg::pq_k;
 
   uint32_t dim;
   index_t n_vectors;
@@ -824,6 +874,33 @@ struct graph {
         assert(false && "set_lsh_mag_sq called with use_lsh=false");
       }
     }
+
+    __device__ __forceinline__
+    void set_pq_code(index_t global_idx, uint8_t edge_idx, uint32_t sub, uint8_t c) {
+      if constexpr (use_lsh) {
+        index_t local_idx = to_local(global_idx);
+        assert(local_idx < n_vectors && "global_idx out of bounds");
+        segments[segment_of(local_idx)]
+            .edge_pqs[local_of(local_idx)]
+            .set_code(edge_idx, sub, c);
+      } else {
+        assert(false && "set_pq_code called with use_lsh=false");
+      }
+    }
+
+    __device__ __forceinline__
+    uint8_t get_pq_code(index_t global_idx, uint8_t edge_idx, uint32_t sub) const {
+      if constexpr (use_lsh) {
+        index_t local_idx = to_local(global_idx);
+        assert(local_idx < n_vectors && "global_idx out of bounds");
+        return segments[segment_of(local_idx)]
+            .edge_pqs[local_of(local_idx)]
+            .get_code(edge_idx, sub);
+      } else {
+        assert(false && "get_pq_code called with use_lsh=false");
+        return 0;
+      }
+    }
   };
 
   __host__ double avg_degree() const {
@@ -942,6 +1019,115 @@ struct graph {
 
     const dim3 grid(static_cast<uint32_t>(n_vectors));
     populate_lsh<graph_cfg><<<grid, block_threads, smem_bytes>>>(view());
+  }
+
+  // ── Product Quantization (directional PQ path) ───────────────────────────
+
+  // Train the PQ codebooks on a sample of the graph's edge residuals via
+  // per-subspace k-means (Lloyd's). Returns device-resident codebooks; caller
+  // owns them and must call .free(). Mirrors generate_lsh_globals: run while
+  // the graph vectors are accessible (device or host-pinned zero-copy).
+  pq_codebooks<graph_cfg::pq_m, graph_cfg::pq_k> generate_pq_codebooks(
+      uint32_t n_train      = 40000,
+      uint32_t kmeans_iter  = 12,
+      uint64_t seed         = 123) const {
+    static_assert(graph_cfg::use_lsh,
+                  "generate_pq_codebooks requires graph_cfg::use_lsh");
+    if (n_vectors == 0)
+      throw std::runtime_error("generate_pq_codebooks: graph is empty");
+
+    constexpr uint32_t M = graph_cfg::pq_m;
+    constexpr uint32_t K = graph_cfg::pq_k;   // 256
+    const uint32_t padded_dim = get_padded_dim();
+    if (padded_dim % M != 0)
+      throw std::runtime_error(
+          "generate_pq_codebooks: padded_dim (" + std::to_string(padded_dim) +
+          ") must be divisible by M=" + std::to_string(M));
+    const uint32_t dsub = padded_dim / M;
+    if (n_train < K) n_train = K;   // need enough points to seed K centroids
+
+    // ── Sample training residuals ──
+    __half* d_X = nullptr;
+    if (cudaMalloc(&d_X, static_cast<size_t>(n_train) * padded_dim * sizeof(__half))
+        != cudaSuccess)
+      throw std::runtime_error("generate_pq_codebooks: cudaMalloc(d_X) failed");
+    pq_sample_residuals<graph_cfg><<<n_train, 128>>>(view(), d_X, n_train, seed);
+
+    // ── Allocate codebooks + k-means scratch ──
+    auto cb = pq_codebooks<M, K>::allocate(dsub);
+    uint8_t*  d_labels = nullptr;
+    float*    d_sum    = nullptr;
+    uint32_t* d_count  = nullptr;
+    cudaMalloc(&d_labels, static_cast<size_t>(n_train) * M * sizeof(uint8_t));
+    cudaMalloc(&d_sum,    static_cast<size_t>(M) * K * dsub * sizeof(float));
+    cudaMalloc(&d_count,  static_cast<size_t>(M) * K * sizeof(uint32_t));
+
+    const uint64_t init_seed = seed ^ 0xA5A5A5A5ull;
+    pq_kmeans_init<M, K><<<M * K, 128>>>(
+        d_X, n_train, padded_dim, cb.d_centroids, init_seed);
+
+    // assign uses one thread per centroid (blockDim == K).
+    const size_t assign_smem =
+        static_cast<size_t>(padded_dim) * sizeof(float)
+        + (K / 32) * sizeof(float) + (K / 32) * sizeof(int);
+    auto assign_kernel = pq_kmeans_assign<M, K>;
+    if (assign_smem > 48 * 1024)
+      cudaFuncSetAttribute(assign_kernel,
+          cudaFuncAttributeMaxDynamicSharedMemorySize,
+          static_cast<int>(assign_smem));
+
+    for (uint32_t it = 0; it < kmeans_iter; ++it) {
+      cudaMemsetAsync(d_sum, 0, static_cast<size_t>(M) * K * dsub * sizeof(float));
+      cudaMemsetAsync(d_count, 0, static_cast<size_t>(M) * K * sizeof(uint32_t));
+      assign_kernel<<<n_train, K, assign_smem>>>(
+          d_X, n_train, padded_dim, cb.d_centroids, d_labels);
+      pq_kmeans_accumulate<M, K><<<n_train, 128>>>(
+          d_X, n_train, padded_dim, d_labels, d_sum, d_count);
+      pq_kmeans_finalize<M, K><<<M * K, 128>>>(
+          d_X, n_train, padded_dim, d_sum, d_count, cb.d_centroids, init_seed, it);
+    }
+
+    pq_compute_cnorm<M, K><<<M * K, 128>>>(padded_dim, cb.d_centroids, cb.d_cnorm);
+    cudaDeviceSynchronize();
+
+    cudaFree(d_labels);
+    cudaFree(d_sum);
+    cudaFree(d_count);
+    cudaFree(d_X);
+    return cb;
+  }
+
+  // Encode every graph edge into its M-byte PQ code using trained codebooks.
+  // Lazily allocates edge_pqs, mirroring populate_edge_lsh.
+  void populate_edge_pq(const pq_codebooks<graph_cfg::pq_m, graph_cfg::pq_k>& cb) {
+    static_assert(graph_cfg::use_lsh,
+                  "populate_edge_pq requires graph_cfg::use_lsh");
+
+    {
+      std::vector<segment_t> h_segs(segments.begin(), segments.end());
+      bool any_allocated = false;
+      for (auto& seg : h_segs) {
+        if (seg.edge_pqs == nullptr) { seg.allocate_edge_pq(); any_allocated = true; }
+      }
+      if (any_allocated)
+        segments = thrust::device_vector<segment_t>(h_segs.begin(), h_segs.end());
+    }
+
+    constexpr uint32_t M = graph_cfg::pq_m;
+    constexpr uint32_t K = graph_cfg::pq_k;
+    const uint32_t padded_dim = get_padded_dim();
+    const size_t smem_bytes =
+        static_cast<size_t>(padded_dim) * sizeof(float)
+        + (K / 32) * sizeof(float) + (K / 32) * sizeof(int);
+
+    auto kernel = pq_populate<graph_cfg, device_view, M, K>;
+    if (smem_bytes > 48 * 1024)
+      cudaFuncSetAttribute(kernel,
+          cudaFuncAttributeMaxDynamicSharedMemorySize,
+          static_cast<int>(smem_bytes));
+
+    const dim3 grid(static_cast<uint32_t>(n_vectors));
+    kernel<<<grid, K, smem_bytes>>>(view(), cb.d_centroids);
   }
 
   lsh_globals<graph_cfg::k_ranks> generate_lsh_globals(
