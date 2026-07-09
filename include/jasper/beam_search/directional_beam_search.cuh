@@ -537,16 +537,22 @@ __global__ void directional_beam_search_kernel(
     CLOCK_ACCUM(t_clip,  PHASE_CLIP);
   }
 
-  // ---- Write top-k from frontier_buffer (already sorted ascending) ----
+  // ---- Write top-k from frontier_buffer (already sorted ascending),
+  //      skipping any soft-deleted vertices. ----
   __syncthreads();
-  const uint32_t fc = frontier_buffer_count[0];
-  for (uint32_t i = threadIdx.x; i < k; i += BLOCK_SIZE) {
-    if (i < fc) {
-      frontier_results[query_id * k + i].first  =
-          static_cast<INDEX_T>(get_index(frontier_buffer[i]));
-      frontier_results[query_id * k + i].second =
+  if (threadIdx.x == 0) {
+    const uint32_t fc = frontier_buffer_count[0];
+    uint32_t out = 0;
+    for (uint32_t i = 0; i < fc && out < k; i++) {
+      uint32_t idx = get_index(frontier_buffer[i]);
+      if (!graph.is_valid(idx)) continue;
+      if (graph.is_deleted(idx)) continue;
+      frontier_results[query_id * k + out].first  = static_cast<INDEX_T>(idx);
+      frontier_results[query_id * k + out].second =
           static_cast<DISTANCE_T>(get_distance(frontier_buffer[i]));
-    } else {
+      out++;
+    }
+    for (uint32_t i = out; i < k; i++) {
       frontier_results[query_id * k + i].first  = INVALID_INDEX;
       frontier_results[query_id * k + i].second =
           std::numeric_limits<DISTANCE_T>::max();

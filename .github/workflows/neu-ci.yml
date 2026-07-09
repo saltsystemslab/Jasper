@@ -1,0 +1,32 @@
+name: neu-ci
+
+# Manual, on-demand only: launch from the Actions tab -> "neu-ci" -> Run
+# workflow (pick the branch). No schedule. And NO `pull_request` trigger, so
+# fork code never sees the SSH secret or runs on the cluster.
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: neu-ci-${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  dispatch:
+    name: Dispatch cluster CI
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    steps:
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CLUSTER_CI_SSH_KEY }}
+      - name: Trust cluster host key
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          ssh-keyscan -H login.explorer.northeastern.edu >> ~/.ssh/known_hosts 2>/dev/null
+      - name: Dispatch (mode=all)
+        run: |
+          # The remote command string is the ONLY thing we control; the key is
+          # pinned to a forced command on the cluster, so this is all it can do.
+          ssh -o BatchMode=yes -o PreferredAuthentications=publickey \
+              -o ConnectTimeout=30 mccoy.hu@login.explorer.northeastern.edu \
+              "mode=all ref=${{ github.sha }}"

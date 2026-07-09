@@ -2,7 +2,7 @@
 #include <cmath>
 #include <vector>
 
-#include "jasper/rabitq/rotation.cuh"
+#include "jasper/rotation/rotation.cuh"
 
 namespace jasper::test {
 

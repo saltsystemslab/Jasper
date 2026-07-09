@@ -59,6 +59,9 @@ _fn_cache: dict[str, tuple] = {}
 
 _free_graph_fn = _mod.jasper_free_graph
 _get_n_vectors_fn = _mod.jasper_get_n_vectors
+_get_n_tombstoned_fn = _mod.jasper_get_n_tombstoned
+_get_n_live_fn = _mod.jasper_get_n_live
+_reserve_ids_fn = _mod.jasper_reserve_ids
 _get_dim_fn = _mod.jasper_get_dim
 
 
@@ -70,6 +73,10 @@ def _get_fns(config_id: str):
             getattr(_mod, f"jasper_search_{config_id}"),
             getattr(_mod, f"jasper_save_{config_id}"),
             getattr(_mod, f"jasper_get_vector_{config_id}"),
+            getattr(_mod, f"jasper_mark_deleted_{config_id}"),
+            getattr(_mod, f"jasper_consolidate_{config_id}"),
+            getattr(_mod, f"jasper_compact_{config_id}"),
+            getattr(_mod, f"jasper_append_{config_id}"),
         )
     return _fn_cache[config_id]
 
@@ -128,7 +135,9 @@ class Graph:
         self._n_neighbors = n_neighbors
         self._dim = dim
         self._torch_dtype = _DTYPE_MAP[data_type]
-        _, _, self._search_fn, self._save_fn, self._get_vector_fn = _get_fns(config_id)
+        (_, _, self._search_fn, self._save_fn, self._get_vector_fn,
+         self._mark_deleted_fn, self._consolidate_fn,
+         self._compact_fn, self._append_fn) = _get_fns(config_id)
 
     @classmethod
     def load(
@@ -157,7 +166,7 @@ class Graph:
             distance = DistanceFunc(distance)
 
         config_id = _resolve_config(data_type, n_neighbors, distance)
-        load_fn, _, _, _, _ = _get_fns(config_id)
+        load_fn = _get_fns(config_id)[0]
         handle = load_fn(path, dim, on_host)
 
         return cls(handle, config_id, data_type, distance, n_neighbors, dim)
@@ -223,7 +232,7 @@ class Graph:
             )
 
         config_id = _resolve_config(data_type, n_neighbors, distance)
-        _, construct_fn, _, _, _ = _get_fns(config_id)
+        construct_fn = _get_fns(config_id)[1]
         handle = construct_fn(vectors, dim, alpha, workspace_budget_bytes, on_host)
 
         return cls(handle, config_id, data_type, distance, n_neighbors, dim)
@@ -264,7 +273,7 @@ class Graph:
             k:          Number of nearest neighbors to return.
             beam_width: Search beam width.
         Returns:
-            indices:   int32  tensor [n_queries, k]
+            indices:   int32  tensor [n_queries, k] of **stable ids**
             distances: float32 tensor [n_queries, k]
         """
         self._check_alive()
@@ -302,24 +311,123 @@ class Graph:
 
         return out_indices, out_distances
     
-    def get_vector(self, index: int) -> torch.Tensor:
+    def get_vector(self, stable_id: int) -> torch.Tensor:
         """
-        Return the *index*-th vector stored in this graph.
+        Return the vector with the given **stable id**.
+
+        Stable ids are assigned in monotonic order as vectors are added and are
+        unchanged by ``consolidate``/``compact`` — they are not bounded by
+        ``n_vectors``. Raises if the id is not present (deleted or never assigned).
 
         Args:
-            index: Zero-based vector index.
+            stable_id: The vector's stable id (as returned by ``search``).
 
         Returns:
             A 1-D CUDA tensor of shape [dim] with the graph's data type.
         """
         self._check_alive()
-        if index < 0 or index >= self.n_vectors:
-            raise IndexError(
-                f"Index {index} out of range [0, {self.n_vectors})"
-            )
+        if stable_id < 0:
+            raise IndexError(f"stable_id must be non-negative, got {stable_id}")
         out = torch.empty(self._dim, dtype=self._torch_dtype, device="cuda")
-        self._get_vector_fn(self._handle, index, out)
+        self._get_vector_fn(self._handle, stable_id, out)
         return out
+
+    @property
+    def n_tombstoned(self) -> int:
+        """Number of soft-deleted vectors not yet consolidated away."""
+        self._check_alive()
+        return _get_n_tombstoned_fn(self._handle)
+
+    @property
+    def n_live(self) -> int:
+        """Number of vectors still live (n_vectors - n_tombstoned)."""
+        self._check_alive()
+        return _get_n_live_fn(self._handle)
+
+    def reserve_ids(self, count: int) -> torch.Tensor:
+        """
+        Reserve ``count`` fresh stable ids, returning them as an int32 CPU
+        tensor of shape [count]. Advances the monotonic id counter; ids are
+        never reused. This is the id half of a live append — the caller writes
+        the corresponding vectors into the graph and registers each (id, slot).
+
+        Returns:
+            int32 tensor [count] of newly assigned stable ids.
+        """
+        self._check_alive()
+        if count <= 0:
+            return torch.empty(0, dtype=torch.int32)
+        out = torch.empty(count, dtype=torch.int32)
+        _reserve_ids_fn(self._handle, out, count)
+        return out
+
+    def append(self, vectors: torch.Tensor, alpha: float = 1.2) -> torch.Tensor:
+        """
+        Append a batch of vectors to the live graph, wiring their edges into the
+        existing graph (beam-search + robust-prune, same as construction) and
+        assigning each a fresh monotonic stable id.
+
+        Args:
+            vectors: CUDA tensor [n, dim] of the graph's data type (float16).
+            alpha:   Robust-pruning factor for the new vectors' edges.
+
+        Returns:
+            int32 tensor [n] of the assigned stable ids, in input order.
+        """
+        self._check_alive()
+        if not vectors.is_cuda:
+            raise ValueError("vectors must be a CUDA tensor")
+        if vectors.dtype != self._torch_dtype:
+            raise ValueError(f"vectors must be {self._torch_dtype}, got {vectors.dtype}")
+        if vectors.ndim != 2 or vectors.size(1) != self._dim:
+            raise ValueError(f"vectors must be [n, {self._dim}]")
+        vectors = vectors.contiguous()
+        n = vectors.size(0)
+        out_ids = torch.empty(n, dtype=torch.int32)
+        self._append_fn(self._handle, vectors, float(alpha), out_ids)
+        return out_ids
+
+    def mark_deleted(self, ids: torch.Tensor) -> None:
+        """
+        Soft-delete a batch of vectors by id.
+
+        Deleted vectors are immediately excluded from ``search`` results.
+        Their graph edges are repaired lazily by ``consolidate`` and their
+        slots reclaimed by ``compact``. Out-of-range ids are ignored.
+
+        Args:
+            ids: 1-D integer tensor of vector ids to delete.
+        """
+        self._check_alive()
+        if ids.ndim != 1:
+            raise ValueError(f"ids must be 1D, got {ids.ndim}D")
+        # FFI reads ids as a contiguous CPU int32 array.
+        ids = ids.detach().to(device="cpu", dtype=torch.int32).contiguous()
+        if ids.numel() == 0:
+            return
+        self._mark_deleted_fn(self._handle, ids)
+
+    def consolidate(self, alpha: float = 1.2) -> None:
+        """
+        Repair graph edges that route through deleted vertices and clear all
+        tombstones. After this call ``n_tombstoned`` is 0; ids are unchanged.
+
+        Args:
+            alpha: Robust-pruning factor used when re-selecting edges.
+        """
+        self._check_alive()
+        self._consolidate_fn(self._handle, float(alpha))
+
+    def compact(self) -> None:
+        """
+        Reclaim space by compacting live vectors into internal slots
+        ``[0, n_live)``. Consolidates first if there are pending deletions.
+
+        Stable ids are preserved: a vector keeps the same id across ``compact``
+        (only internal slots are renumbered, transparently via the id map).
+        """
+        self._check_alive()
+        self._compact_fn(self._handle)
 
     def free(self):
         if self._handle is not None:

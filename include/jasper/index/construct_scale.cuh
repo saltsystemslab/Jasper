@@ -510,12 +510,24 @@ struct intermediate_graph {
           std::memcpy(r_segs[rs].edge_counts + dst_off,
                       pseg.edge_counts       + src_off,
                       count * sizeof(uint8_t));
+          std::memcpy(r_segs[rs].deleted     + dst_off,
+                      pseg.deleted           + src_off,
+                      count * sizeof(uint8_t));
           std::memcpy(r_segs[rs].vectors.data + static_cast<size_t>(dst_off) * padded_dim,
                       pseg.vectors.data       + static_cast<size_t>(src_off) * padded_dim,
                       static_cast<size_t>(count) * padded_dim * sizeof(data_t));
         }
       }
     }
+
+    // Assign identity stable ids (slot global index) host-side; the forward
+    // table is built later on device (e.g. at load).
+    for (uint32_t s = 0; s < result.n_segments; s++) {
+      index_t base = static_cast<index_t>(s) * VPS;
+      for (uint32_t i = 0; i < static_cast<uint32_t>(r_segs[s].n_vectors); i++)
+        r_segs[s].slot_to_id[i] = base + i;
+    }
+    result.next_id = total_vectors;
 
     result.segments = thrust::device_vector<segment_t>(r_segs.begin(), r_segs.end());
     return result;
