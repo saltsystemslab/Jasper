@@ -56,7 +56,7 @@ jobs:
 # Benchmark artifacts injected into README between neu-ci markers, produced by
 # the `bench` job above.
 outputs:
-  store: results-branch
+  store: main
   branch: ci-results
   items:
     - name: qps_recall

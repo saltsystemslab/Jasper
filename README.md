@@ -42,9 +42,9 @@ Updated automatically by neu-ci after each nightly cluster run.
 ### QPS vs. recall
 
 <!--neu-ci:qps_recall start-->
-![qps_recall](https://raw.githubusercontent.com/saltsystemslab/jasperpy/ci-results/qps_recall.png)
+![qps_recall](results/qps_recall.png)
 
-_updated 2026-07-08 19:27 UTC_
+_updated 2026-07-09 01:35 UTC_
 <!--neu-ci:qps_recall end-->
 
 ### Latest results
@@ -57,7 +57,7 @@ _updated 2026-07-08 19:27 UTC_
 | gist | 171157.0 | 273169.0 | 0.8472 | 1.0 | 0.8468 | 0 | 917.6 | 160378.0 |
 | openai | 50670.0 | 139171.0 | 0.8936 | 0.9 | 0.8936 | 0 | 13946.8 | 35270.0 |
 
-_updated 2026-07-08 19:27 UTC_
+_updated 2026-07-09 01:35 UTC_
 <!--neu-ci:results end-->
 
 ## Citation
