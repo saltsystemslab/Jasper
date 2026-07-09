@@ -272,13 +272,13 @@ struct graph_segment {
     if (on_host) {
       cudaFreeHost(edges);
       cudaFreeHost(edge_counts);
-      cudaFreeHost(deleted);
+      cudaFreeHost(deleted_bits);
       cudaFreeHost(slot_to_id);
       if constexpr (graph_cfg::use_lsh) cudaFreeHost(edge_lshs);
     } else {
       cudaFree(edges);
       cudaFree(edge_counts);
-      cudaFree(deleted);
+      cudaFree(deleted_bits);
       cudaFree(slot_to_id);
       if constexpr (graph_cfg::use_lsh) cudaFree(edge_lshs);
     }
