@@ -55,15 +55,17 @@ __host__ void update_medoid_if_deleted(typename CONSTRUCT_GRAPH_CONFIG::graph_t&
 
   if (g.n_vectors == 0) return;
 
-  // Read deleted[medoid] off the device.
+  // Read medoid's deletion bit off the device.
   uint32_t seg_id = graph_t::segment_of(g.medoid);
   uint32_t loc    = graph_t::local_of(g.medoid);
   segment_t h_seg;
   cudaMemcpy(&h_seg, thrust::raw_pointer_cast(g.segments.data()) + seg_id,
              sizeof(segment_t), cudaMemcpyDeviceToHost);
-  uint8_t medoid_deleted = 0;
-  cudaMemcpy(&medoid_deleted, h_seg.deleted + loc, sizeof(uint8_t),
+  // Copy the 32-bit word holding medoid's deletion bit and test it.
+  uint32_t medoid_word = 0;
+  cudaMemcpy(&medoid_word, h_seg.deleted_bits + (loc >> 5), sizeof(uint32_t),
              cudaMemcpyDeviceToHost);
+  bool medoid_deleted = (medoid_word >> (loc & 31u)) & 1u;
   if (!medoid_deleted) return;
 
   index_t* d_out;
@@ -131,15 +133,16 @@ __host__ void mark_deleted(typename CONSTRUCT_GRAPH_CONFIG::graph_t& g,
   update_medoid_if_deleted<CONSTRUCT_GRAPH_CONFIG>(g);
 }
 
-// Zero every segment's deleted[] array (whole capacity).
+// Zero every segment's deletion bitmask (whole capacity).
 template <typename CONSTRUCT_GRAPH_CONFIG>
 __host__ void clear_deleted_flags(typename CONSTRUCT_GRAPH_CONFIG::graph_t& g) {
   using segment_t = graph_segment<typename CONSTRUCT_GRAPH_CONFIG::graph_cfg_t>;
   constexpr uint32_t VPS = CONSTRUCT_GRAPH_CONFIG::graph_t::vectors_per_segment;
+  const size_t nbytes = segment_t::deleted_words(VPS) * sizeof(uint32_t);
   std::vector<segment_t> h_segs(g.segments.begin(), g.segments.end());
   for (auto& seg : h_segs) {
-    if (seg.on_host) std::memset(seg.deleted, 0, VPS * sizeof(uint8_t));
-    else             cudaMemset(seg.deleted, 0, VPS * sizeof(uint8_t));
+    if (seg.on_host) std::memset(seg.deleted_bits, 0, nbytes);
+    else             cudaMemset(seg.deleted_bits, 0, nbytes);
   }
   cudaDeviceSynchronize();
 }

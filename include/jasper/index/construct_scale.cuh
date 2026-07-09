@@ -510,9 +510,15 @@ struct intermediate_graph {
           std::memcpy(r_segs[rs].edge_counts + dst_off,
                       pseg.edge_counts       + src_off,
                       count * sizeof(uint8_t));
-          std::memcpy(r_segs[rs].deleted     + dst_off,
-                      pseg.deleted           + src_off,
-                      count * sizeof(uint8_t));
+          // Deletion is a packed bitmask; src/dst offsets aren't byte-aligned,
+          // so copy bit-by-bit (host, single-threaded -> no atomics needed).
+          for (uint32_t k = 0; k < count; k++) {
+            uint32_t si = src_off + k, di = dst_off + k;
+            bool v = (pseg.deleted_bits[si >> 5] >> (si & 31u)) & 1u;
+            uint32_t* w = &r_segs[rs].deleted_bits[di >> 5];
+            uint32_t  m = 1u << (di & 31u);
+            if (v) *w |= m; else *w &= ~m;
+          }
           std::memcpy(r_segs[rs].vectors.data + static_cast<size_t>(dst_off) * padded_dim,
                       pseg.vectors.data       + static_cast<size_t>(src_off) * padded_dim,
                       static_cast<size_t>(count) * padded_dim * sizeof(data_t));
