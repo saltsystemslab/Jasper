@@ -196,6 +196,11 @@ _updated 2026-07-09 01:35 UTC_
 _updated 2026-07-09 01:35 UTC_
 <!--neu-ci:results end-->
 
+### Throughput vs. recall tradeoff (bigann10M)
+
+<!--neu-ci:tradeoff start-->
+<!--neu-ci:tradeoff end-->
+
 ## Citation
 
 ```

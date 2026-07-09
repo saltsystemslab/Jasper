@@ -52,9 +52,15 @@ jobs:
     run: python scripts/ci/bench.py
     status: cluster/bench
     parser: build          # exit 0 = no regression; nonzero = regression/error
+  # Throughput/recall tradeoff (Pareto) curve for bigann10M: build one index,
+  # sweep the search beam width, plot QPS vs recall@10.
+  tradeoff:
+    run: python scripts/ci/tradeoff.py
+    status: cluster/tradeoff
+    parser: build
 
 # Benchmark artifacts injected into README between neu-ci markers, produced by
-# the `bench` job above.
+# the jobs above.
 outputs:
   store: main
   branch: ci-results
@@ -65,3 +71,6 @@ outputs:
     - name: results
       produces: bench/results.csv
       kind: csv-table
+    - name: tradeoff
+      produces: bench/tradeoff_bigann10m.png
+      kind: image
