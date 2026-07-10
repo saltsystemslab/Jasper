@@ -101,6 +101,61 @@ g.save(
 # returns: None
 ```
 
+### Insert vectors
+
+Append new vectors to a live graph without rebuilding. Their edges are wired
+into the existing graph (beam-search + robust-prune, same as construction) and
+each vector is assigned a fresh, monotonically increasing **stable id**.
+
+```python
+new_vectors = torch.randn(10_000, 128, dtype=torch.float16, device="cuda")
+# new_vectors: torch.Tensor, [n, dim], dtype=torch.float16, CUDA
+
+ids = g.append(
+    new_vectors,   # torch.Tensor, [n, dim], dtype=torch.float16, CUDA
+    alpha=1.2,      # float — robust-pruning factor for the new vectors' edges
+)
+# ids: torch.Tensor, int32, shape [n] — assigned stable ids, in input order
+```
+
+Stable ids are the ids returned by `search`; they are never reused and are
+unchanged by `consolidate`/`compact`. To reserve ids up front (e.g. to write
+vectors yourself), use `g.reserve_ids(count)`, which returns an int32 CPU
+tensor of `count` fresh ids and advances the id counter.
+
+### Delete vectors
+
+Deletion is a two-phase process: a cheap **soft-delete** that immediately hides
+vectors from search, followed by an occasional **consolidate**/**compact** to
+repair the graph and reclaim space.
+
+```python
+g.mark_deleted(
+    ids,   # torch.Tensor, 1-D integer — vector (stable) ids to delete
+)
+# returns: None
+# Deleted vectors are excluded from search immediately. Out-of-range ids are ignored.
+
+g.consolidate(
+    alpha=1.2,   # float — robust-pruning factor when re-selecting edges
+)
+# returns: None
+# Repairs edges routing through deleted vertices and clears all tombstones
+# (afterwards g.n_tombstoned == 0). Stable ids are unchanged.
+
+g.compact()
+# returns: None
+# Reclaims space by packing live vectors into slots [0, n_live).
+# Consolidates first if there are pending deletions. Stable ids are preserved.
+```
+
+Inspect deletion state:
+
+```python
+print(g.n_live)         # int — vectors still live (n_vectors - n_tombstoned)
+print(g.n_tombstoned)   # int — soft-deleted vectors not yet consolidated away
+```
+
 ### Read vectors from a binary file
 
 ```python
