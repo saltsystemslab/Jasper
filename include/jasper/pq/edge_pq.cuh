@@ -11,26 +11,31 @@ namespace jasper {
 // contiguous subspaces of size D/M. Each subspace has its own codebook of
 // K = 256 centroids, so a residual is encoded as M uint8 centroid ids — M
 // bytes per edge. Unlike the cross-polytope edge_lsh_list there is NO separate
-// magnitude field: ||e||² is reconstructed at search time as the sum of the
-// chosen centroids' squared norms (see pq_codebooks::cnorm).
+// magnitude field: the PQ codes capture only the residual direction, and the
+// L2 estimator recovers ||q-v||² using each vector's exact stored ||v||²
+// (see graph::d_vector_norms).
 //
-// SoA layout mirrors edge_lsh_list: all edges' M-byte codes are laid out
-// contiguously, edge e's code starting at code[e * M].
+// Subspace-major SoA layout: all edges' codes for a given subspace are laid
+// out contiguously, so code[sub * N_NEIGHBORS + edge]. This lets the ADC
+// scoring loop read one subspace across a warp of edges as a single coalesced
+// transaction (thread e reads consecutive byte e), rather than the strided
+// (edge * M + sub) access an edge-major layout would force.
 template <typename INDEX_T, uint32_t N_NEIGHBORS, uint32_t M>
 struct alignas(4) edge_pq_list {
   static_assert(M > 0, "PQ requires M > 0 subquantizers");
 
-  // code[edge * M + sub] — centroid id (0..255) for subspace `sub` of `edge`.
+  // code[sub * N_NEIGHBORS + edge] — centroid id (0..255) for subspace `sub`
+  // of `edge`. Subspace-major so consecutive edges are adjacent in memory.
   uint8_t code[N_NEIGHBORS * M];
 
   __host__ __device__ __forceinline__
   uint8_t get_code(uint8_t edge_idx, uint32_t sub) const {
-    return code[static_cast<uint32_t>(edge_idx) * M + sub];
+    return code[sub * N_NEIGHBORS + static_cast<uint32_t>(edge_idx)];
   }
 
   __host__ __device__ __forceinline__
   void set_code(uint8_t edge_idx, uint32_t sub, uint8_t c) {
-    code[static_cast<uint32_t>(edge_idx) * M + sub] = c;
+    code[sub * N_NEIGHBORS + static_cast<uint32_t>(edge_idx)] = c;
   }
 
   __host__ void print(std::ostream& out = std::cout, uint32_t len = 0) const {

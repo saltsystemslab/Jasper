@@ -210,18 +210,22 @@ __global__ void pq_kmeans_finalize(
   }
 }
 
-// Precompute cnorm[j*K+c] = ||C_j[c]||². grid = M*K blocks, block-reduce dsub.
-template <uint32_t M, uint32_t K>
-__global__ void pq_compute_cnorm(
-    uint32_t padded_dim, const float* __restrict__ centroids,
-    float* __restrict__ cnorm) {
-  const uint32_t dsub = padded_dim / M;
-  const uint32_t jc   = blockIdx.x;
-  const float* __restrict__ Cjc = centroids + static_cast<size_t>(jc) * dsub;
+// Precompute per-vector squared L2 norm ||x||² for every graph vector, indexed
+// by local id (gid - global_offset). grid = n_vectors blocks; block-reduce over
+// padded_dim (padding coords are zero, so they don't affect the sum). Used by
+// the PQ L2 estimator, which reconstructs ||q-v||² with the EXACT ||v||² rather
+// than rebuilding a residual LUT per popped node.
+template <typename graph_cfg, typename graph_t>
+__global__ void pq_compute_vector_norms(graph_t g, float* __restrict__ norms) {
+  using index_t = typename graph_cfg::index_t;
+  const index_t  lid        = static_cast<index_t>(blockIdx.x);
+  const index_t  gid        = lid + g.global_offset;
+  const uint32_t padded_dim = g.get_padded_dim();
+  const auto* __restrict__ x = g.get_vector(gid);
 
   float local = 0.0f;
-  for (uint32_t t = threadIdx.x; t < dsub; t += blockDim.x) {
-    const float v = Cjc[t]; local += v * v;
+  for (uint32_t i = threadIdx.x; i < padded_dim; i += blockDim.x) {
+    const float v = __half2float(x[i]); local += v * v;
   }
   #pragma unroll
   for (int o = 16; o > 0; o >>= 1)
@@ -238,7 +242,7 @@ __global__ void pq_compute_cnorm(
     #pragma unroll
     for (int o = 16; o > 0; o >>= 1)
       v += __shfl_xor_sync(0xFFFFFFFFu, v, o);
-    if (lane == 0) cnorm[jc] = v;
+    if (lane == 0) norms[lid] = v;
   }
 }
 

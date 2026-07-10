@@ -20,12 +20,16 @@
 
 namespace jasper {
 
-// ===== Build the per-expansion ADC lookup table =====
-// LUT[j*K + c] = <δ_j, C_j[c]>, where δ = est_vec (q-u for L2, q for IP).
-// Computed once per popped node and reused for all of its neighbors.
+// ===== Build the query ADC lookup table (once per search) =====
+// LUT[j*K + c] = <q_j, C_j[c]>, the projection of the query onto every centroid.
+// δ = q (the query) for BOTH distance functions, so the table is constant across
+// the whole search and is built exactly once — the popped node u enters the
+// estimate only through the scalars <q,u> and ||v||² (see the scorer below),
+// never through the LUT. This removes the per-node codebook re-read that used to
+// dominate the L2 path.
 template <typename DATA_T, uint32_t M, uint32_t K>
 __device__ __forceinline__ void pq_build_lut(
-    const DATA_T* __restrict__ est_vec,
+    const DATA_T* __restrict__ query_vec,
     const float*  __restrict__ centroids,
     uint32_t                   dsub,
     float*        __restrict__ lut)
@@ -34,26 +38,28 @@ __device__ __forceinline__ void pq_build_lut(
   for (uint32_t e = threadIdx.x; e < total; e += blockDim.x) {
     const uint32_t j  = e / K;                       // subspace
     const float*  Cj = centroids + static_cast<size_t>(e) * dsub;  // (j*K+c)*dsub
-    const DATA_T* dj = est_vec  + static_cast<size_t>(j) * dsub;
+    const DATA_T* qj = query_vec + static_cast<size_t>(j) * dsub;
     float acc = 0.0f;
     for (uint32_t t = 0; t < dsub; ++t)
-      acc += static_cast<float>(dj[t]) * Cj[t];
+      acc += static_cast<float>(qj[t]) * Cj[t];
     lut[e] = acc;
   }
   __syncthreads();
 }
 
 // ===== Score each new neighbor v of u via ADC table lookups =====
-// With ê the PQ reconstruction of the residual e = v - u:
-//   <δ, e> ≈ Σ_j LUT[j, code_j],   ||e||² ≈ Σ_j cnorm[j, code_j].
-//   L2            → ||q-v||² ≈ ||q-u||² - 2·<q-u, ê> + ||ê||²
-//   INNER_PRODUCT → <q,v>    ≈ <q,u> + <q, ê>   (stored negated, smaller==closer)
+// The query LUT gives <q, ê> = Σ_j LUT[j, code_j] with ê the PQ reconstruction
+// of the residual e = v - u, so <q,v> ≈ <q,u> + <q,ê>. From that:
+//   INNER_PRODUCT → <q,v> ≈ qu_dot + Σ_j LUT[j,code_j]      (negated: smaller==closer)
+//   L2            → ||q-v||² ≈ ||q||² - 2·<q,v> + ||v||²,
+//                   using the EXACT stored ||v||² (graph.get_vector_norm) rather
+//                   than a reconstructed norm — both faster and more accurate.
 template <typename GRAPH_CFG, distance_func DISTANCE_FUNC, uint32_t M, uint32_t K>
 __device__ __forceinline__ void pq_populate_estimated_distances(
-    float                                   exact_u,
+    float                                   q_sq,      // ||q||²  (L2 only)
+    float                                   qu_dot,    // <q,u>
     typename graph<GRAPH_CFG>::device_view& graph,
     typename GRAPH_CFG::index_t             u_gid,
-    const float* __restrict__               cnorm,
     const float* __restrict__               lut,
     ENTRY_T*     __restrict__               result_buffer,
     uint32_t                                offset,
@@ -74,20 +80,19 @@ __device__ __forceinline__ void pq_populate_estimated_distances(
     INDEX_T v     = static_cast<INDEX_T>(get_index(entry));
     if (v == INVALID_INDEX) continue;
 
-    const uint8_t* __restrict__ code = code_base + static_cast<size_t>(e) * M;
-    float dot = 0.0f, norm = 0.0f;
+    // Subspace-major codes: code_base[j * N_NEIGHBORS + e]. For a fixed j the
+    // warp's edges read consecutive bytes -> one coalesced transaction.
+    constexpr uint32_t N = GRAPH_CFG::n_neighbors;
+    float acc = qu_dot;                       // <q,u> + Σ_j <q, C_j[code_j]>
     #pragma unroll
-    for (uint32_t j = 0; j < M; ++j) {
-      const uint32_t c = code[j];
-      dot  += lut[j * K + c];
-      norm += cnorm[j * K + c];
-    }
+    for (uint32_t j = 0; j < M; ++j)
+      acc += lut[j * K + code_base[j * N + e]];
 
     float est_dist;
     if constexpr (DISTANCE_FUNC == distance_func::L2) {
-      est_dist = exact_u - 2.0f * dot + norm;
+      est_dist = q_sq - 2.0f * acc + graph.get_vector_norm(v);
     } else {  // INNER_PRODUCT
-      est_dist = -(exact_u + dot);
+      est_dist = -acc;
     }
     result_buffer[offset + e] = set_distance(entry, est_dist);
   }
@@ -134,8 +139,7 @@ __global__ void pq_beam_search_kernel(
   //   frontier_buffer_count                  uint32_t
   //   merge_scratch[n_neighbors]             ENTRY_T
   //   smem_query_vec[padded_dim]             DATA_T
-  //   smem_qu_diff[padded_dim]               DATA_T
-  //   smem_lut[M*K]                          float   (PQ ADC table)
+  //   smem_lut[M*K]                          float   (query ADC table)
   const uint32_t result_buffer_size = beam_width + GRAPH_CFG::n_neighbors;
   extern __shared__ __align__(16) unsigned char smem_raw[];
   unsigned char* p = smem_raw;
@@ -160,8 +164,6 @@ __global__ void pq_beam_search_kernel(
   p = reinterpret_cast<unsigned char*>(
         (reinterpret_cast<uintptr_t>(p) + 15) & ~uintptr_t(15));
   DATA_T* __restrict__ smem_query_vec = reinterpret_cast<DATA_T*>(p);
-  p += padded_dim * sizeof(DATA_T);
-  DATA_T* __restrict__ smem_qu_diff   = reinterpret_cast<DATA_T*>(p);
   p += padded_dim * sizeof(DATA_T);
 
   p = reinterpret_cast<unsigned char*>(
@@ -198,12 +200,39 @@ __global__ void pq_beam_search_kernel(
   uint32_t visited_counter = 0;
   uint32_t loop_count      = 0;
 
-  // For INNER_PRODUCT the ADC LUT uses δ = q (the query), which is constant for
-  // the whole search, so build it once here. For L2, δ = q-u depends on the
-  // popped node and is rebuilt inside the loop (step 6).
-  if constexpr (DISTANCE_FUNC == distance_func::INNER_PRODUCT) {
-    pq_build_lut<DATA_T, M, K>(
-        smem_query_vec, codebooks.centroids, codebooks.dsub, smem_lut);
+  // The ADC LUT projects the query onto every centroid (δ = q) and is constant
+  // for the whole search, so build it ONCE here for both distance functions.
+  pq_build_lut<DATA_T, M, K>(
+      smem_query_vec, codebooks.centroids, codebooks.dsub, smem_lut);
+
+  // ||q||² (L2 only) — reused every iteration to form ||q-v||² from <q,v>.
+  // Plain block reduction over the shared query vector (compute_qu_diff_and_exact
+  // can't be reused here: it __ldg's its second arg, which is illegal on smem).
+  float q_sq = 0.0f;
+  if constexpr (DISTANCE_FUNC == distance_func::L2) {
+    float local = 0.0f;
+    for (uint32_t i = threadIdx.x; i < padded_dim; i += BLOCK_SIZE) {
+      const float x = static_cast<float>(smem_query_vec[i]);
+      local += x * x;
+    }
+    #pragma unroll
+    for (int d = 16; d > 0; d >>= 1)
+      local += __shfl_xor_sync(0xFFFFFFFFu, local, d);
+    constexpr uint32_t N_WARPS = BLOCK_SIZE / 32;
+    __shared__ float s_qsq[N_WARPS > 0 ? N_WARPS : 1];
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t wid  = threadIdx.x >> 5;
+    if (lane == 0) s_qsq[wid] = local;
+    __syncthreads();
+    if (wid == 0) {
+      float v = (lane < N_WARPS) ? s_qsq[lane] : 0.0f;
+      #pragma unroll
+      for (int d = 16; d > 0; d >>= 1)
+        v += __shfl_xor_sync(0xFFFFFFFFu, v, d);
+      if (lane == 0) s_qsq[0] = v;
+    }
+    __syncthreads();
+    q_sq = s_qsq[0];
   }
 
   // ---- Main loop ----
@@ -232,17 +261,19 @@ __global__ void pq_beam_search_kernel(
     const INDEX_T u_gid =
         static_cast<INDEX_T>(get_index(result_buffer[frontierIdx]));
 
-    // 3) Fetch u's vector; compute (q-u) into smem and exact base in one pass.
+    // 3) Fetch u's vector; compute <q,u> in one pass. The estimate now needs
+    //    only this scalar from u (not the full q-u vector). For L2 the exact
+    //    ||q-u||² for the frontier is recovered as ||q||² - 2<q,u> + ||u||².
     CLOCK_START(t_exact);
     DATA_T* u_vec = graph.get_vector(u_gid);
-    const float exact_u =
-        compute_qu_diff_and_exact<DATA_T, BLOCK_SIZE, DISTANCE_FUNC>(
-            smem_query_vec, u_vec, smem_qu_diff, padded_dim);
+    const float qu_dot =
+        compute_qu_diff_and_exact<DATA_T, BLOCK_SIZE, distance_func::INNER_PRODUCT>(
+            smem_query_vec, u_vec, /*qu_diff=*/nullptr, padded_dim);
     float exact_dist_u;
     if constexpr (DISTANCE_FUNC == distance_func::L2) {
-      exact_dist_u = exact_u;
+      exact_dist_u = q_sq - 2.0f * qu_dot + graph.get_vector_norm(u_gid);
     } else {
-      exact_dist_u = -exact_u;
+      exact_dist_u = -qu_dot;
     }
     CLOCK_ACCUM(t_exact, PHASE_EXACT);
 
@@ -273,17 +304,12 @@ __global__ void pq_beam_search_kernel(
     __syncthreads();
     CLOCK_ACCUM(t_expand, PHASE_EXPAND);
 
-    // 6) ESTIMATE ||q-v||² via PQ ADC: build the LUT, then score edges.
-    // L2's δ = q-u changes each iteration, so its LUT is (re)built here; the
-    // IP LUT (δ = q) is constant and was built once before the loop.
+    // 6) ESTIMATE distances via PQ ADC using the once-built query LUT. No
+    //    per-node table rebuild: u enters only through the scalar <q,u>.
     CLOCK_START(t_estimate);
     const uint8_t n_edges = graph.get_edge_count(u_gid);
-    if constexpr (DISTANCE_FUNC == distance_func::L2) {
-      pq_build_lut<DATA_T, M, K>(
-          smem_qu_diff, codebooks.centroids, codebooks.dsub, smem_lut);
-    }
     pq_populate_estimated_distances<GRAPH_CFG, DISTANCE_FUNC, M, K>(
-        exact_u, graph, u_gid, codebooks.cnorm, smem_lut,
+        q_sq, qu_dot, graph, u_gid, smem_lut,
         result_buffer, offset, n_edges);
     CLOCK_ACCUM(t_estimate, PHASE_ESTIMATE);
 
@@ -341,7 +367,6 @@ __host__ inline uint32_t get_pq_smem_size(
   s += sizeof(ENTRY_T) * GRAPH_CFG::n_neighbors;                 // merge_scratch
   s = (s + 15) & ~15u;
   s += sizeof(DATA_T) * padded_dim;                              // smem_query_vec
-  s += sizeof(DATA_T) * padded_dim;                              // smem_qu_diff
   s = (s + 15) & ~15u;
   s += sizeof(float) * GRAPH_CFG::pq_m * GRAPH_CFG::pq_k;        // smem_lut
   return s;

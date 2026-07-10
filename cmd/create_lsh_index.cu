@@ -529,6 +529,7 @@ void construct_and_save(const std::string& filename,
 
   std::cout << "  Populating edge PQ codes..." << std::endl;
   g.populate_edge_pq(pq_codebooks);
+  g.compute_vector_norms();  // exact ||v||² for the PQ L2 estimator
   cudaDeviceSynchronize();
   auto t5 = std::chrono::steady_clock::now();
 

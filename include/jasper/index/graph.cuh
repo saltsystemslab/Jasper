@@ -413,6 +413,11 @@ struct graph {
   index_t global_offset = 0;
   bool on_host;
 
+  // Per-vector squared L2 norm ||x||², indexed by local id (gid - global_offset).
+  // Device array, computed post-build via compute_vector_norms(); used by the PQ
+  // L2 estimator to reconstruct ||q-v||² with the exact ||v||². nullptr until set.
+  float* d_vector_norms = nullptr;
+
   thrust::device_vector<segment_t> segments;
 
   static graph allocate(uint32_t dim, index_t n_vector_slots, bool on_host) {
@@ -598,6 +603,7 @@ struct graph {
     }
     segments.clear();
     segments.shrink_to_fit();
+    if (d_vector_norms) { cudaFree(d_vector_norms); d_vector_norms = nullptr; }
     n_vectors  = 0;
     n_segments = 0;
   }
@@ -706,10 +712,17 @@ struct graph {
     uint32_t   n_segments;
     index_t    medoid;
     index_t    global_offset;
+    const float* __restrict__ vector_norms;  // per-local-id ||x||² (may be null)
 
     __device__ __forceinline__
     index_t to_local(index_t global_idx) const {
       return global_idx - global_offset;
+    }
+
+    // Exact ||x||² for the vector with this global id (see graph::d_vector_norms).
+    __device__ __forceinline__
+    float get_vector_norm(index_t global_idx) const {
+      return vector_norms[to_local(global_idx)];
     }
 
     __device__ __forceinline__
@@ -969,8 +982,22 @@ struct graph {
       n_vectors,
       n_segments,
       medoid,
-      global_offset
+      global_offset,
+      d_vector_norms
     };
+  }
+
+  // Compute exact per-vector ||x||² into d_vector_norms (device), indexed by
+  // local id. Cheap one-pass reduction; call once after vectors are loaded and
+  // before a PQ L2 search. Requires the graph on device.
+  void compute_vector_norms() {
+    if (n_vectors == 0) return;
+    if (d_vector_norms == nullptr)
+      cudaMalloc(&d_vector_norms,
+                 static_cast<size_t>(n_vectors) * sizeof(float));
+    pq_compute_vector_norms<graph_cfg, device_view>
+        <<<static_cast<uint32_t>(n_vectors), 128>>>(view(), d_vector_norms);
+    cudaDeviceSynchronize();
   }
 
   // Given a rotated vector, populate the edge lsh.
@@ -1087,7 +1114,6 @@ struct graph {
           d_X, n_train, padded_dim, d_sum, d_count, cb.d_centroids, init_seed, it);
     }
 
-    pq_compute_cnorm<M, K><<<M * K, 128>>>(padded_dim, cb.d_centroids, cb.d_cnorm);
     cudaDeviceSynchronize();
 
     cudaFree(d_labels);

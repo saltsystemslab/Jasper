@@ -655,6 +655,7 @@ void load_and_bench_pq(const std::string& index_path,
 
   std::cout << "Populating edge PQ codes..." << std::endl;
   graph.populate_edge_pq(pq_codebooks);
+  graph.compute_vector_norms();  // exact ||v||² for the PQ L2 estimator
   cudaDeviceSynchronize();
   auto t2 = std::chrono::steady_clock::now();
 
