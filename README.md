@@ -1,6 +1,3 @@
-> [!IMPORTANT]
-> This repository is currently under development. Not all APIs are implemented.
-
 # Jasper: Fast and scalable GPU-native ANNS index
 
 Jasper is a GPU-native approximate nearest neighbor search (ANNS) index designed for speed and scalability. Drawing on the Vamana graph index and RaBitQ quantization, Jasper delivers state-of-the-art construction throughput and query performance entirely on the GPU.
