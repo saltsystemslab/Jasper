@@ -67,7 +67,7 @@ struct graph_config {
   
   static constexpr uint8_t n_neighbors = N_NEIGHBORS;
   static constexpr distance_func dist_func = DIST_FUNC;
-  static constexpr index_t vectors_per_segment = 1u << 20;
+  static constexpr index_t vectors_per_segment = 1u << 15;
   static constexpr bool use_lsh = USE_LSH;
   static constexpr uint8_t k_ranks = K_RANKS;
 
