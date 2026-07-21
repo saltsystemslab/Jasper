@@ -34,15 +34,26 @@ __device__ __forceinline__ void pq_build_lut(
     uint32_t                   dsub,
     float*        __restrict__ lut)
 {
-  const uint32_t total = M * K;
-  for (uint32_t e = threadIdx.x; e < total; e += blockDim.x) {
+  // One WARP per centroid, lanes striding over the dsub coordinates. For a
+  // fixed element the 32 lanes read Cj[0..31] — 32 contiguous global floats,
+  // i.e. one coalesced transaction. (The old thread-per-element mapping had
+  // adjacent lanes stride dsub floats apart, shattering each warp's read into
+  // dsub sectors — the source of the "excessive global load" the profiler saw.)
+  const uint32_t total   = M * K;
+  const uint32_t lane    = threadIdx.x & 31u;
+  const uint32_t warp    = threadIdx.x >> 5;
+  const uint32_t n_warps = blockDim.x >> 5;
+  for (uint32_t e = warp; e < total; e += n_warps) {
     const uint32_t j  = e / K;                       // subspace
     const float*  Cj = centroids + static_cast<size_t>(e) * dsub;  // (j*K+c)*dsub
-    const DATA_T* qj = query_vec + static_cast<size_t>(j) * dsub;
+    const DATA_T* qj = query_vec + static_cast<size_t>(j) * dsub;  // shared mem
     float acc = 0.0f;
-    for (uint32_t t = 0; t < dsub; ++t)
+    for (uint32_t t = lane; t < dsub; t += 32u)
       acc += static_cast<float>(qj[t]) * Cj[t];
-    lut[e] = acc;
+    #pragma unroll
+    for (int d = 16; d > 0; d >>= 1)
+      acc += __shfl_xor_sync(0xFFFFFFFFu, acc, d);
+    if (lane == 0) lut[e] = acc;
   }
   __syncthreads();
 }
