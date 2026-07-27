@@ -115,6 +115,17 @@ if(JASPER_BUILD_CMD)
     CUDA_SEPARABLE_COMPILATION ON
   )
 
+  add_executable(sweep_batch_size cmd/sweep_batch_size.cu)
+  target_link_libraries(sweep_batch_size PRIVATE jasper)
+  set_target_properties(sweep_batch_size PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+  )
+  set_target_properties(sweep_batch_size PROPERTIES
+    CUDA_ARCHITECTURES "80;89;90;120"
+    CUDA_SEPARABLE_COMPILATION ON
+  )
+
   add_executable(create_scale_index cmd/create_scale_index.cu)
   target_link_libraries(create_scale_index PRIVATE jasper)
   set_target_properties(create_scale_index PROPERTIES
@@ -133,7 +144,7 @@ if(JASPER_BUILD_CMD)
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
   )
   set_target_properties(create_lsh_index PROPERTIES
-    CUDA_ARCHITECTURES "120"
+    CUDA_ARCHITECTURES "80;120"
     CUDA_SEPARABLE_COMPILATION ON
   )
   # target_compile_definitions(create_lsh_index PRIVATE JASPER_PROFILE_CLOCKS)

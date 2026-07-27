@@ -2,6 +2,7 @@
 
 #include <cstdlib>
 #include <cstdint>
+#include <chrono>
 #include <iostream>
 #include <type_traits>
 #include <vector>
@@ -926,14 +927,24 @@ __host__ void construction_round(
     batch_size = std::min(batch_size, graph.n_vectors - count);
     batch_size = std::min(batch_size, max_batch_size);
 
+#ifdef JASPER_TIME_BATCH
+    auto batch_t0 = std::chrono::steady_clock::now();
+#endif
+
     process_batch<CONSTRUCT_GRAPH_CONFIG, BEAM_SEARCH_CONFIG>(
         graph, ws, count, batch_size, alpha, timer, stream);
 
     count += batch_size;
 
+#ifdef JASPER_TIME_BATCH
+    auto batch_t1 = std::chrono::steady_clock::now();
+    double batch_ms = std::chrono::duration<double, std::milli>(batch_t1 - batch_t0).count();
+    std::printf("[construct] batch %u vectors constructed in %.3f ms\n", batch_size, batch_ms);
+#else
     std::printf("\r[construct] %u / %u (%.1f%%)", count, graph.n_vectors,
                 100.0f * count / graph.n_vectors);
     std::fflush(stdout);
+#endif
 
     if (batch_size < max_batch_size) {
       batch_size = std::min(max_batch_size, batch_size * 2);
