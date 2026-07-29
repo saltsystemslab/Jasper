@@ -171,6 +171,17 @@ if(JASPER_BUILD_CMD)
     CUDA_SEPARABLE_COMPILATION ON
   )
 
+  add_executable(fused_query cmd/fused_query.cu)
+  target_link_libraries(fused_query PRIVATE jasper)
+  set_target_properties(fused_query PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+  )
+  set_target_properties(fused_query PROPERTIES
+    CUDA_ARCHITECTURES "80;89;90;120"
+    CUDA_SEPARABLE_COMPILATION ON
+  )
+
   add_executable(test_deletion cmd/test_deletion.cu)
   target_link_libraries(test_deletion PRIVATE jasper)
   set_target_properties(test_deletion PROPERTIES

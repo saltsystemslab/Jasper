@@ -1,0 +1,238 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fused PQ-directional — ablation (bigann10M)</title>
+<style>
+  .viz-root{
+    color-scheme:light;
+    --surface-1:#fcfcfb; --page:#f9f9f7;
+    --text-primary:#0b0b0b; --text-secondary:#52514e; --muted:#898781;
+    --grid:#e1e0d9; --axis:#c3c2b7; --border:rgba(11,11,11,.10);
+    --series-1:#2a78d6;  /* baseline */
+    --series-2:#eb6834;  /* + fused  */
+    --series-3:#1baf7a;  /* + fused + cache */
+  }
+  @media (prefers-color-scheme:dark){
+    :root:where(:not([data-theme="light"])) .viz-root{
+      color-scheme:dark;
+      --surface-1:#1a1a19; --page:#0d0d0d;
+      --text-primary:#fff; --text-secondary:#c3c2b7; --muted:#898781;
+      --grid:#2c2c2a; --axis:#383835; --border:rgba(255,255,255,.10);
+      --series-1:#3987e5; --series-2:#d95926; --series-3:#199e70;
+    }
+  }
+  :root[data-theme="dark"] .viz-root{
+    color-scheme:dark;
+    --surface-1:#1a1a19; --page:#0d0d0d;
+    --text-primary:#fff; --text-secondary:#c3c2b7; --muted:#898781;
+    --grid:#2c2c2a; --axis:#383835; --border:rgba(255,255,255,.10);
+    --series-1:#3987e5; --series-2:#d95926; --series-3:#199e70;
+  }
+  html,body{margin:0}
+  .viz-root{
+    background:var(--page); color:var(--text-primary);
+    font-family:system-ui,-apple-system,"Segoe UI",sans-serif;
+    padding:28px 28px 48px; min-height:100vh;
+  }
+  .wrap{max-width:1120px;margin:0 auto}
+  h1{font-size:20px;margin:0 0 4px;font-weight:650}
+  .sub{color:var(--text-secondary);font-size:13.5px;margin:0 0 18px;max-width:70ch;line-height:1.5}
+  .row{display:flex;flex-wrap:wrap;gap:20px}
+  figure{margin:0;background:var(--surface-1);border:1px solid var(--border);
+         border-radius:12px;padding:14px 16px 10px;flex:1 1 460px}
+  figcaption{color:var(--text-secondary);font-size:12.5px;margin-top:6px;line-height:1.45}
+  .ttl{font-size:14px;font-weight:600;margin:2px 2px 8px}
+  svg{display:block;width:100%;height:auto;overflow:visible}
+  .grid line{stroke:var(--grid);stroke-width:1}
+  .axis line{stroke:var(--axis);stroke-width:1}
+  .tick{fill:var(--muted);font-size:11px}
+  .tick.tab{font-variant-numeric:tabular-nums}
+  .axlabel{fill:var(--text-secondary);font-size:12px}
+  .series-line{fill:none;stroke-width:2}
+  .pt{stroke:var(--surface-1);stroke-width:2}
+  .dlabel{font-size:12px;font-weight:600}
+  .refline{stroke:var(--muted);stroke-width:1.5;stroke-dasharray:4 4;fill:none}
+  .legend{display:flex;gap:16px;flex-wrap:wrap;margin:2px 2px 6px;font-size:12.5px;color:var(--text-secondary)}
+  .legend .k{display:inline-flex;align-items:center;gap:7px}
+  .legend .sw{width:22px;height:3px;border-radius:2px;display:inline-block}
+  .toggle{float:right;font:inherit;font-size:12px;color:var(--text-secondary);
+          background:var(--surface-1);border:1px solid var(--border);border-radius:8px;
+          padding:5px 10px;cursor:pointer}
+  details{margin-top:20px;color:var(--text-secondary);font-size:13px}
+  summary{cursor:pointer;font-weight:600;color:var(--text-primary)}
+  table{border-collapse:collapse;margin:12px 0;font-size:12.5px;font-variant-numeric:tabular-nums}
+  th,td{text-align:right;padding:4px 12px;border-bottom:1px solid var(--border)}
+  th:first-child,td:first-child{text-align:left}
+  .note{color:var(--muted)}
+  #tip{position:fixed;pointer-events:none;opacity:0;transform:translate(-50%,-120%);
+       background:var(--surface-1);border:1px solid var(--border);border-radius:8px;
+       padding:6px 9px;font-size:12px;color:var(--text-primary);box-shadow:0 4px 14px rgba(0,0,0,.14);
+       white-space:nowrap;transition:opacity .08s}
+</style>
+</head>
+<body>
+<div class="viz-root">
+<div class="wrap">
+  <button class="toggle" id="themeBtn">◐ theme</button>
+  <h1>Fused device-seeded PQ-directional — ablation</h1>
+  <p class="sub">bigann10M (10M pts, dim 128), k=10, full graph host-pinned, 10% subsample,
+  32 seeds. Each step adds one technique; higher &amp; to the right is better. The device
+  cache changes only <em>cost</em>, not the search path — so <b>fused</b> and <b>fused+cache</b>
+  sit at identical recall, differing only in QPS.</p>
+
+  <div class="row">
+    <figure>
+      <div class="ttl">Recall@10 vs throughput (log QPS)</div>
+      <div class="legend" id="legendA"></div>
+      <svg id="panelA" viewBox="0 0 560 400" role="img"
+           aria-label="Recall vs QPS tradeoff for baseline, fused, and fused+cache"></svg>
+      <figcaption>Each marker is a beam width (16→256, left→right). Fused shifts the curve
+      up (more QPS at equal recall); the cache lifts it a further ~11–15%.</figcaption>
+    </figure>
+
+    <figure>
+      <div class="ttl">Subsample fraction is the coverage lever</div>
+      <div class="legend" id="legendB"></div>
+      <svg id="panelB" viewBox="0 0 560 400" role="img"
+           aria-label="Fused recall vs subsample fraction at beam width 64"></svg>
+      <figcaption>Fused recall@10 at beam 64 climbs monotonically with the device
+      subsample size and hasn’t plateaued by 10%. Seeds, coarse beam/limit, and coarse
+      degree R were all near-flat (not shown).</figcaption>
+    </figure>
+  </div>
+
+  <details>
+    <summary>Data table</summary>
+    <div id="tables"></div>
+    <p class="note">Panel A: SLURM job 8812841. Panel B: job 8810717 (fused, coarse R=64;
+    R=32 was identical). Baseline = single-medoid PQ-directional.</p>
+  </details>
+</div>
+</div>
+<div id="tip"></div>
+
+<script>
+const A = {
+  // recall, QPS(thousands)  — one point per beam width 16/32/64/128/256
+  beams: [16,32,64,128,256],
+  series: [
+    {name:"baseline",     cvar:"--series-1", pts:[[0.3041,371.6],[0.5694,222.4],[0.8284,130.6],[0.9561,73.5],[0.9919,39.3]]},
+    {name:"+ fused",      cvar:"--series-2", pts:[[0.4047,538.1],[0.6534,289.8],[0.8744,153.0],[0.9694,80.8],[0.9939,41.3]]},
+    {name:"+ fused+cache",cvar:"--series-3", pts:[[0.4047,616.2],[0.6534,325.8],[0.8744,170.8],[0.9694,89.7],[0.9939,45.8]]},
+  ]
+};
+const B = {
+  base: 0.8234,
+  pts: [[0.005,0.8368],[0.01,0.8403],[0.02,0.8435],[0.05,0.8551],[0.10,0.8730]]
+};
+
+const cssv = n => getComputedStyle(document.querySelector('.viz-root')).getPropertyValue(n).trim();
+const SVGNS="http://www.w3.org/2000/svg";
+function el(tag,attrs,parent){const e=document.createElementNS(SVGNS,tag);
+  for(const k in attrs)e.setAttribute(k,attrs[k]); if(parent)parent.appendChild(e); return e;}
+const tip=document.getElementById('tip');
+function showTip(evt,html){tip.innerHTML=html;tip.style.left=evt.clientX+'px';
+  tip.style.top=evt.clientY+'px';tip.style.opacity=1;}
+function hideTip(){tip.style.opacity=0;}
+
+const W=560,H=400,M={l:66,r:132,t:14,b:52};
+const px=x=>M.l+x*(W-M.l-M.r), py=y=>M.t+y*(H-M.t-M.b);   // x,y in [0,1]
+
+function drawAxes(svg,xt,yt,xlab,ylab){
+  const g=el('g',{class:'grid'},svg);
+  yt.forEach(t=>{const Y=py(1-t.u); el('line',{x1:M.l,y1:Y,x2:W-M.r,y2:Y},g);
+    el('text',{x:M.l-10,y:Y+4,'text-anchor':'end',class:'tick tab'},svg).textContent=t.l;});
+  xt.forEach(t=>{const X=px(t.u);
+    el('text',{x:X,y:H-M.b+18,'text-anchor':'middle',class:'tick'},svg).textContent=t.l;});
+  const ax=el('g',{class:'axis'},svg);
+  el('line',{x1:M.l,y1:H-M.b,x2:W-M.r,y2:H-M.b},ax);
+  el('text',{x:(M.l+W-M.r)/2,y:H-6,'text-anchor':'middle',class:'axlabel'},svg).textContent=xlab;
+  const yl=el('text',{x:16,y:(M.t+H-M.b)/2,'text-anchor':'middle',class:'axlabel',
+    transform:`rotate(-90 16 ${(M.t+H-M.b)/2})`},svg); yl.textContent=ylab;
+}
+
+function renderA(){
+  const svg=document.getElementById('panelA'); svg.innerHTML='';
+  const xmin=0.28,xmax=1.01;               // recall (linear)
+  const ymin=Math.log10(35),ymax=Math.log10(700); // QPS thousands (log)
+  const ux=r=>(r-xmin)/(xmax-xmin);
+  const uy=q=>(Math.log10(q)-ymin)/(ymax-ymin);
+  const xt=[0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0].map(v=>({u:ux(v),l:v.toFixed(1)}));
+  const yt=[40,60,100,200,400,600].map(v=>({u:uy(v),l:v+'k'}));
+  drawAxes(svg,xt,yt,'recall@10','throughput (QPS)');
+  A.series.forEach(s=>{
+    const col=cssv(s.cvar);
+    const d=s.pts.map((p,i)=>(i?'L':'M')+px(ux(p[0])).toFixed(1)+' '+py(1-uy(p[1])).toFixed(1)).join(' ');
+    el('path',{d,class:'series-line',stroke:col},svg);
+    s.pts.forEach((p,i)=>{const X=px(ux(p[0])),Y=py(1-uy(p[1]));
+      const c=el('circle',{cx:X,cy:Y,r:4.5,class:'pt',fill:col},svg);
+      c.addEventListener('mousemove',e=>showTip(e,
+        `<b>${s.name}</b><br>beam ${A.beams[i]} · recall ${p[0].toFixed(3)} · ${Math.round(p[1])}k QPS`));
+      c.addEventListener('mouseleave',hideTip);});
+  });
+  // identity via legend (below) + table view — the three lines interleave and
+  // fused/+cache share every recall x, so per-line labels would collide.
+  legend('legendA',A.series.map(s=>({name:s.name,cvar:s.cvar})));
+}
+
+function renderB(){
+  const svg=document.getElementById('panelB'); svg.innerHTML='';
+  const xmin=Math.log10(0.004),xmax=Math.log10(0.13);   // fraction (log)
+  const ymin=0.818,ymax=0.882;                          // recall (linear)
+  const ux=f=>(Math.log10(f)-xmin)/(xmax-xmin);
+  const uy=r=>(r-ymin)/(ymax-ymin);
+  const xt=[[0.005,'0.5%'],[0.01,'1%'],[0.02,'2%'],[0.05,'5%'],[0.10,'10%']].map(v=>({u:ux(v[0]),l:v[1]}));
+  const yt=[0.82,0.83,0.84,0.85,0.86,0.87,0.88].map(v=>({u:uy(v),l:v.toFixed(2)}));
+  drawAxes(svg,xt,yt,'subsample fraction (log)','recall@10 (beam 64)');
+  // baseline reference
+  const yb=py(1-uy(B.base));
+  el('line',{x1:M.l,y1:yb,x2:W-M.r,y2:yb,class:'refline'},svg);
+  el('text',{x:W-M.r+8,y:yb+4,class:'dlabel',fill:cssv('--muted')},svg).textContent='baseline';
+  const col=cssv('--series-1');
+  const d=B.pts.map((p,i)=>(i?'L':'M')+px(ux(p[0])).toFixed(1)+' '+py(1-uy(p[1])).toFixed(1)).join(' ');
+  el('path',{d,class:'series-line',stroke:col},svg);
+  B.pts.forEach(p=>{const X=px(ux(p[0])),Y=py(1-uy(p[1]));
+    const c=el('circle',{cx:X,cy:Y,r:4.5,class:'pt',fill:col},svg);
+    c.addEventListener('mousemove',e=>showTip(e,
+      `<b>fused</b><br>${(p[0]*100).toFixed(1)}% subsample · recall ${p[1].toFixed(3)}`));
+    c.addEventListener('mouseleave',hideTip);});
+  const pl=B.pts[B.pts.length-1], X=px(ux(pl[0])), Y=py(1-uy(pl[1]));
+  el('text',{x:X+8,y:Y+4,class:'dlabel',fill:col},svg).textContent='fused';
+  legend('legendB',[{name:'fused (beam 64)',cvar:'--series-1'},{name:'baseline',cvar:'--muted',dash:true}]);
+}
+
+function legend(id,items){
+  const box=document.getElementById(id); box.innerHTML='';
+  items.forEach(it=>{const k=document.createElement('span');k.className='k';
+    const sw=document.createElement('span');sw.className='sw';
+    sw.style.background=cssv(it.cvar);
+    if(it.dash){sw.style.background='transparent';sw.style.borderTop='2px dashed '+cssv(it.cvar);sw.style.height='0';}
+    k.appendChild(sw);k.appendChild(document.createTextNode(it.name));box.appendChild(k);});
+}
+
+function tables(){
+  let h='<table><tr><th>beam</th><th>recall (base)</th><th>QPS base</th>'
+       +'<th>QPS fused</th><th>QPS +cache</th></tr>';
+  A.beams.forEach((b,i)=>{h+=`<tr><td>${b}</td><td>${A.series[0].pts[i][0].toFixed(3)}</td>`
+    +`<td>${Math.round(A.series[0].pts[i][1])}k</td><td>${Math.round(A.series[1].pts[i][1])}k</td>`
+    +`<td>${Math.round(A.series[2].pts[i][1])}k</td></tr>`;});
+  h+='</table><table><tr><th>subsample</th><th>fused recall@10 (bw64)</th></tr>';
+  h+=`<tr><td>baseline</td><td>${B.base.toFixed(3)}</td></tr>`;
+  B.pts.forEach(p=>{h+=`<tr><td>${(p[0]*100).toFixed(1)}%</td><td>${p[1].toFixed(3)}</td></tr>`;});
+  h+='</table>';
+  document.getElementById('tables').innerHTML=h;
+}
+
+function renderAll(){renderA();renderB();tables();}
+document.getElementById('themeBtn').addEventListener('click',()=>{
+  const r=document.documentElement;
+  const cur=r.getAttribute('data-theme');
+  r.setAttribute('data-theme', cur==='dark'?'light':(cur==='light'?'dark':'dark'));
+  renderAll();
+});
+renderAll();
+</script>
+</body>
+</html>

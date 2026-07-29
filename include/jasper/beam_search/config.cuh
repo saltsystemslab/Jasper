@@ -50,6 +50,11 @@ struct beam_search_params {
   uint32_t                    k;
   uint32_t                    beam_width;
   uint32_t                    limit;
+
+  // Adaptive early termination (PQ path): stop once the best remaining candidate's
+  // estimated distance exceeds early_slack * (current k-th exact result). 0 = off
+  // (run to natural convergence / limit). 1.0 = exact bound; <1 trades recall for speed.
+  float                       early_slack = 0.0f;
 };
 
 template <typename GRAPH_CFG>

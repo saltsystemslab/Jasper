@@ -99,16 +99,20 @@ __device__ void add_frontier_out(
     uint32_t *result_buffer_count,
     const typename GRAPH_CFG::index_t & frontier,
     const uint32_t & k,
-    const uint32_t & beam_width) {
+    const uint32_t & beam_width,
+    const typename GRAPH_CFG::index_t* edge_override = nullptr,  // cached edges[R], or null
+    uint8_t n_edges_override = 0) {                              // cached edge count
 
   using INDEX_T = typename GRAPH_CFG::index_t;
 
-  const uint8_t  n_edges = graph.get_edge_count(frontier);
+  const uint8_t  n_edges = (edge_override != nullptr) ? n_edges_override
+                                                      : graph.get_edge_count(frontier);
   const uint32_t offset  = result_buffer_count[0];
   __syncthreads();
 
   const INDEX_T* __restrict__ edge_ptr =
-      &graph.get_neighbor_list(frontier).edges[0];
+      (edge_override != nullptr) ? edge_override
+                                 : &graph.get_neighbor_list(frontier).edges[0];
   const INDEX_T range_lo = graph.global_offset;
   const INDEX_T range_hi = graph.global_offset + graph.n_vectors;
 

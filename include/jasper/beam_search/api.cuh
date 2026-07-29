@@ -2,6 +2,7 @@
 
 #include "jasper/beam_search/beam_search.cuh"
 #include "jasper/beam_search/directional_beam_search.cuh"
+#include "jasper/beam_search/pq_beam_search.cuh"
 #include "jasper/beam_search/config.cuh"
 #include "jasper/lsh/lsh_globals.cuh"
 
@@ -12,6 +13,7 @@ struct search_params {
   uint32_t beam_width = 64;
   uint32_t limit      = 512;
   bool     get_visited = false;
+  float    early_slack = 0.0f;  // PQ adaptive early termination (0 = off)
 };
 
 template <typename GRAPH_CFG,
@@ -171,6 +173,121 @@ beam_search_result<GRAPH_CFG> directional_search(
   else if (bw + 64 < 512)  return directional_search_dispatch_width<GRAPH_CFG, BLOCK_SIZE, 512,  TILE_SIZE, 512>(g, globals, d_queries, params);
   else if (bw + 64 < 1024) return directional_search_dispatch_width<GRAPH_CFG, BLOCK_SIZE, 1024, TILE_SIZE, 1024>(g, globals, d_queries, params);
   else if (bw + 64 < 2048) return directional_search_dispatch_width<GRAPH_CFG, BLOCK_SIZE, 2048, TILE_SIZE, 2048>(g, globals, d_queries, params);
+  else throw std::invalid_argument(
+      "beam_width " + std::to_string(bw) +
+      " is too large (beam_width + 64 must be < 2048)");
+}
+
+// ───────────────────────────────── pq_search ───────────────────────────────
+// Same beam-search skeleton as directional_search, but neighbor distances are
+// estimated with Product-Quantization ADC instead of cross-polytope LSH.
+// Optional per-query seed set (d_seeds / d_seed_dists / n_seeds) replaces the
+// single-medoid start frontier — used by the fused device→host pipeline. When
+// d_seeds is null the behavior is identical to the single-medoid baseline.
+
+template <typename GRAPH_CFG,
+          uint32_t BLOCK_SIZE,
+          uint32_t MAX_SEARCH_WIDTH,
+          uint32_t TILE_SIZE,
+          uint32_t MAX_RESULT_SIZE,
+          bool     GET_VISITED>
+beam_search_result<GRAPH_CFG> pq_search_impl(
+    const graph<GRAPH_CFG>&                             g,
+    pq_codebooks_view<GRAPH_CFG::pq_m, GRAPH_CFG::pq_k> codebooks,
+    typename GRAPH_CFG::vector_view_t&                  d_queries,
+    const search_params&                               params,
+    const typename GRAPH_CFG::index_t*                  d_seeds,
+    const typename GRAPH_CFG::distance_t*               d_seed_dists,
+    uint32_t                                           n_seeds,
+    device_cache_view<GRAPH_CFG>                        cache) {
+  static_assert(GRAPH_CFG::use_lsh,
+                "pq_search requires graph_cfg::use_lsh (directional storage)");
+
+  using Cfg = beam_search_config<
+      GRAPH_CFG, GRAPH_CFG::dist_func,
+      BLOCK_SIZE, GET_VISITED,
+      MAX_SEARCH_WIDTH, TILE_SIZE, MAX_RESULT_SIZE>;
+
+  beam_search_params<Cfg> bp {
+    .graph         = g,
+    .query_vectors = d_queries,
+    .use_range     = false,
+    .medoid        = g.medoid,
+    .k             = params.k,
+    .beam_width    = params.beam_width,
+    .limit         = params.limit,
+    .early_slack   = params.early_slack,
+  };
+  return pq_beam_search<Cfg>(bp, codebooks, d_seeds, d_seed_dists, n_seeds,
+                             cache);
+}
+
+template <typename GRAPH_CFG, uint32_t BLOCK_SIZE, uint32_t MAX_SEARCH_WIDTH,
+          uint32_t TILE_SIZE, uint32_t MAX_RESULT_SIZE, bool GET_VISITED>
+beam_search_result<GRAPH_CFG> pq_search_dispatch_visited(
+    const graph<GRAPH_CFG>&                             g,
+    pq_codebooks_view<GRAPH_CFG::pq_m, GRAPH_CFG::pq_k> codebooks,
+    typename GRAPH_CFG::vector_view_t                   d_queries,
+    const search_params&                               params,
+    const typename GRAPH_CFG::index_t*                  d_seeds,
+    const typename GRAPH_CFG::distance_t*               d_seed_dists,
+    uint32_t                                           n_seeds,
+    device_cache_view<GRAPH_CFG>                        cache) {
+  return pq_search_impl<
+      GRAPH_CFG, BLOCK_SIZE, MAX_SEARCH_WIDTH,
+      TILE_SIZE, MAX_RESULT_SIZE, GET_VISITED>(
+      g, codebooks, d_queries, params, d_seeds, d_seed_dists, n_seeds,
+      cache);
+}
+
+template <typename GRAPH_CFG, uint32_t BLOCK_SIZE, uint32_t MAX_SEARCH_WIDTH,
+          uint32_t TILE_SIZE, uint32_t MAX_RESULT_SIZE>
+beam_search_result<GRAPH_CFG> pq_search_dispatch_width(
+    const graph<GRAPH_CFG>&                             g,
+    pq_codebooks_view<GRAPH_CFG::pq_m, GRAPH_CFG::pq_k> codebooks,
+    typename GRAPH_CFG::vector_view_t                   d_queries,
+    const search_params&                               params,
+    const typename GRAPH_CFG::index_t*                  d_seeds,
+    const typename GRAPH_CFG::distance_t*               d_seed_dists,
+    uint32_t                                           n_seeds,
+    device_cache_view<GRAPH_CFG>                        cache) {
+  if (params.get_visited) {
+    return pq_search_dispatch_visited<
+        GRAPH_CFG, BLOCK_SIZE, MAX_SEARCH_WIDTH,
+        TILE_SIZE, MAX_RESULT_SIZE, true>(
+        g, codebooks, d_queries, params, d_seeds, d_seed_dists, n_seeds,
+        cache);
+  } else {
+    return pq_search_dispatch_visited<
+        GRAPH_CFG, BLOCK_SIZE, MAX_SEARCH_WIDTH,
+        TILE_SIZE, MAX_RESULT_SIZE, false>(
+        g, codebooks, d_queries, params, d_seeds, d_seed_dists, n_seeds,
+        cache);
+  }
+}
+
+template <typename GRAPH_CFG,
+          uint32_t BLOCK_SIZE      = 128,
+          uint32_t TILE_SIZE       = 4,
+          uint32_t MAX_RESULT_SIZE = 2048>
+beam_search_result<GRAPH_CFG> pq_search(
+    const graph<GRAPH_CFG>&                             g,
+    pq_codebooks_view<GRAPH_CFG::pq_m, GRAPH_CFG::pq_k> codebooks,
+    typename GRAPH_CFG::vector_view_t                   d_queries,
+    const search_params&                               params       = {},
+    const typename GRAPH_CFG::index_t*                  d_seeds      = nullptr,
+    const typename GRAPH_CFG::distance_t*               d_seed_dists = nullptr,
+    uint32_t                                           n_seeds      = 0,
+    device_cache_view<GRAPH_CFG>                        cache = {}) {
+  static_assert(GRAPH_CFG::use_lsh,
+                "pq_search requires graph_cfg::use_lsh (directional storage)");
+
+  const uint32_t bw = params.beam_width;
+  if      (bw + 64 < 128)  return pq_search_dispatch_width<GRAPH_CFG, BLOCK_SIZE, 128,  TILE_SIZE, 128>(g, codebooks, d_queries, params, d_seeds, d_seed_dists, n_seeds, cache);
+  else if (bw + 64 < 256)  return pq_search_dispatch_width<GRAPH_CFG, BLOCK_SIZE, 256,  TILE_SIZE, 256>(g, codebooks, d_queries, params, d_seeds, d_seed_dists, n_seeds, cache);
+  else if (bw + 64 < 512)  return pq_search_dispatch_width<GRAPH_CFG, BLOCK_SIZE, 512,  TILE_SIZE, 512>(g, codebooks, d_queries, params, d_seeds, d_seed_dists, n_seeds, cache);
+  else if (bw + 64 < 1024) return pq_search_dispatch_width<GRAPH_CFG, BLOCK_SIZE, 1024, TILE_SIZE, 1024>(g, codebooks, d_queries, params, d_seeds, d_seed_dists, n_seeds, cache);
+  else if (bw + 64 < 2048) return pq_search_dispatch_width<GRAPH_CFG, BLOCK_SIZE, 2048, TILE_SIZE, 2048>(g, codebooks, d_queries, params, d_seeds, d_seed_dists, n_seeds, cache);
   else throw std::invalid_argument(
       "beam_width " + std::to_string(bw) +
       " is too large (beam_width + 64 must be < 2048)");
