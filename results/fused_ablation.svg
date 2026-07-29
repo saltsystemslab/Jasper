@@ -1,0 +1,80 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1140 480" width="1140" height="480">
+<rect x="0" y="0" width="1140" height="480" fill="#f9f9f7" rx="0"/>
+<rect x="14" y="36" width="516" height="438" fill="#fcfcfb" rx="12"/>
+<text x="26.0" y="58.0" fill="#0b0b0b" font-size="14" text-anchor="start" font-weight="650" font-family="system-ui,-apple-system,Segoe UI,sans-serif">Recall@10 vs throughput — new mode vs original</text>
+<line x1="66.0" y1="395.9" x2="410.0" y2="395.9" stroke="#e1e0d9" stroke-width="1"/>
+<text x="56.0" y="399.9" fill="#898781" font-size="11" text-anchor="end" font-weight="400" font-family="system-ui,-apple-system,Segoe UI,sans-serif">40k</text>
+<line x1="66.0" y1="350.5" x2="410.0" y2="350.5" stroke="#e1e0d9" stroke-width="1"/>
+<text x="56.0" y="354.5" fill="#898781" font-size="11" text-anchor="end" font-weight="400" font-family="system-ui,-apple-system,Segoe UI,sans-serif">60k</text>
+<line x1="66.0" y1="293.5" x2="410.0" y2="293.5" stroke="#e1e0d9" stroke-width="1"/>
+<text x="56.0" y="297.5" fill="#898781" font-size="11" text-anchor="end" font-weight="400" font-family="system-ui,-apple-system,Segoe UI,sans-serif">100k</text>
+<line x1="66.0" y1="216.0" x2="410.0" y2="216.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="56.0" y="220.0" fill="#898781" font-size="11" text-anchor="end" font-weight="400" font-family="system-ui,-apple-system,Segoe UI,sans-serif">200k</text>
+<line x1="66.0" y1="138.5" x2="410.0" y2="138.5" stroke="#e1e0d9" stroke-width="1"/>
+<text x="56.0" y="142.5" fill="#898781" font-size="11" text-anchor="end" font-weight="400" font-family="system-ui,-apple-system,Segoe UI,sans-serif">400k</text>
+<line x1="66.0" y1="93.2" x2="410.0" y2="93.2" stroke="#e1e0d9" stroke-width="1"/>
+<text x="56.0" y="97.2" fill="#898781" font-size="11" text-anchor="end" font-weight="400" font-family="system-ui,-apple-system,Segoe UI,sans-serif">600k</text>
+<text x="79.8" y="446.0" fill="#898781" font-size="11" text-anchor="middle" font-weight="400" font-family="system-ui,-apple-system,Segoe UI,sans-serif">0.3</text>
+<text x="125.6" y="446.0" fill="#898781" font-size="11" text-anchor="middle" font-weight="400" font-family="system-ui,-apple-system,Segoe UI,sans-serif">0.4</text>
+<text x="171.5" y="446.0" fill="#898781" font-size="11" text-anchor="middle" font-weight="400" font-family="system-ui,-apple-system,Segoe UI,sans-serif">0.5</text>
+<text x="217.4" y="446.0" fill="#898781" font-size="11" text-anchor="middle" font-weight="400" font-family="system-ui,-apple-system,Segoe UI,sans-serif">0.6</text>
+<text x="263.2" y="446.0" fill="#898781" font-size="11" text-anchor="middle" font-weight="400" font-family="system-ui,-apple-system,Segoe UI,sans-serif">0.7</text>
+<text x="309.1" y="446.0" fill="#898781" font-size="11" text-anchor="middle" font-weight="400" font-family="system-ui,-apple-system,Segoe UI,sans-serif">0.8</text>
+<text x="355.0" y="446.0" fill="#898781" font-size="11" text-anchor="middle" font-weight="400" font-family="system-ui,-apple-system,Segoe UI,sans-serif">0.9</text>
+<text x="400.8" y="446.0" fill="#898781" font-size="11" text-anchor="middle" font-weight="400" font-family="system-ui,-apple-system,Segoe UI,sans-serif">1.0</text>
+<line x1="66.0" y1="428.0" x2="410.0" y2="428.0" stroke="#c3c2b7" stroke-width="1"/>
+<text x="238.0" y="468.0" fill="#52514e" font-size="12" text-anchor="middle" font-weight="400" font-family="system-ui,-apple-system,Segoe UI,sans-serif">recall@10</text>
+<text x="20.0" y="252.0" fill="#52514e" font-size="12" text-anchor="middle" font-weight="400" transform="rotate(-90 20 252.0)" font-family="system-ui,-apple-system,Segoe UI,sans-serif">throughput (QPS)</text>
+<polyline points="80.1,144.9 203.4,221.8 320.7,264.5 379.4,337.7 396.1,395.6" fill="none" stroke="#eb6834" stroke-width="2"/>
+<circle cx="80.1" cy="144.9" r="4.5" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="203.4" cy="221.8" r="4.5" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="320.7" cy="264.5" r="4.5" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="379.4" cy="337.7" r="4.5" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="396.1" cy="395.6" r="4.5" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<polyline points="128.6,92.4 241.3,157.4 341.0,225.4 386.3,295.5 397.9,370.9" fill="none" stroke="#2a78d6" stroke-width="2"/>
+<circle cx="128.6" cy="92.4" r="4.5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="241.3" cy="157.4" r="4.5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="341.0" cy="225.4" r="4.5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="386.3" cy="295.5" r="4.5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="397.9" cy="370.9" r="4.5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<text x="405.9" y="374.9" fill="#2a78d6" font-size="12" text-anchor="start" font-weight="650" font-family="system-ui,-apple-system,Segoe UI,sans-serif">new mode</text>
+<text x="404.1" y="399.6" fill="#eb6834" font-size="12" text-anchor="start" font-weight="650" font-family="system-ui,-apple-system,Segoe UI,sans-serif">original</text>
+<text x="70.0" y="74.0" fill="#898781" font-size="10.5" text-anchor="start" font-weight="400" font-family="system-ui,-apple-system,Segoe UI,sans-serif">markers: beam 16→256 (left→right)</text>
+<rect x="594" y="36" width="516" height="438" fill="#fcfcfb" rx="12"/>
+<text x="606.0" y="58.0" fill="#0b0b0b" font-size="14" text-anchor="start" font-weight="650" font-family="system-ui,-apple-system,Segoe UI,sans-serif">Device-Jasper size sweep — throughput vs device size</text>
+<line x1="646.0" y1="422.9" x2="990.0" y2="422.9" stroke="#e1e0d9" stroke-width="1"/>
+<text x="636.0" y="426.9" fill="#898781" font-size="11" text-anchor="end" font-weight="400" font-family="system-ui,-apple-system,Segoe UI,sans-serif">60k</text>
+<line x1="646.0" y1="320.9" x2="990.0" y2="320.9" stroke="#e1e0d9" stroke-width="1"/>
+<text x="636.0" y="324.9" fill="#898781" font-size="11" text-anchor="end" font-weight="400" font-family="system-ui,-apple-system,Segoe UI,sans-serif">100k</text>
+<line x1="646.0" y1="218.8" x2="990.0" y2="218.8" stroke="#e1e0d9" stroke-width="1"/>
+<text x="636.0" y="222.8" fill="#898781" font-size="11" text-anchor="end" font-weight="400" font-family="system-ui,-apple-system,Segoe UI,sans-serif">140k</text>
+<line x1="646.0" y1="116.8" x2="990.0" y2="116.8" stroke="#e1e0d9" stroke-width="1"/>
+<text x="636.0" y="120.8" fill="#898781" font-size="11" text-anchor="end" font-weight="400" font-family="system-ui,-apple-system,Segoe UI,sans-serif">180k</text>
+<text x="667.8" y="446.0" fill="#898781" font-size="11" text-anchor="middle" font-weight="400" font-family="system-ui,-apple-system,Segoe UI,sans-serif">0.5%</text>
+<text x="735.6" y="446.0" fill="#898781" font-size="11" text-anchor="middle" font-weight="400" font-family="system-ui,-apple-system,Segoe UI,sans-serif">1%</text>
+<text x="803.3" y="446.0" fill="#898781" font-size="11" text-anchor="middle" font-weight="400" font-family="system-ui,-apple-system,Segoe UI,sans-serif">2%</text>
+<text x="892.9" y="446.0" fill="#898781" font-size="11" text-anchor="middle" font-weight="400" font-family="system-ui,-apple-system,Segoe UI,sans-serif">5%</text>
+<text x="960.7" y="446.0" fill="#898781" font-size="11" text-anchor="middle" font-weight="400" font-family="system-ui,-apple-system,Segoe UI,sans-serif">10%</text>
+<line x1="646.0" y1="428.0" x2="990.0" y2="428.0" stroke="#c3c2b7" stroke-width="1"/>
+<text x="818.0" y="468.0" fill="#52514e" font-size="12" text-anchor="middle" font-weight="400" font-family="system-ui,-apple-system,Segoe UI,sans-serif">device-Jasper size (subsample fraction, log)</text>
+<text x="600.0" y="252.0" fill="#52514e" font-size="12" text-anchor="middle" font-weight="400" transform="rotate(-90 600 252.0)" font-family="system-ui,-apple-system,Segoe UI,sans-serif">throughput (QPS)</text>
+<line x1="646.0" y1="243.3" x2="990.0" y2="243.3" stroke="#898781" stroke-width="1.5" stroke-dasharray="5 4"/>
+<text x="998.0" y="247.3" fill="#898781" font-size="11" text-anchor="start" font-weight="400" font-family="system-ui,-apple-system,Segoe UI,sans-serif">orig bw64</text>
+<line x1="646.0" y1="388.7" x2="990.0" y2="388.7" stroke="#898781" stroke-width="1.5" stroke-dasharray="5 4"/>
+<text x="998.0" y="392.7" fill="#898781" font-size="11" text-anchor="start" font-weight="400" font-family="system-ui,-apple-system,Segoe UI,sans-serif">orig bw128</text>
+<polyline points="667.8,182.9 735.6,173.4 803.3,165.5 892.9,149.0 960.7,114.8" fill="none" stroke="#2a78d6" stroke-width="2"/>
+<circle cx="667.8" cy="182.9" r="4.5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="735.6" cy="173.4" r="4.5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="803.3" cy="165.5" r="4.5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="892.9" cy="149.0" r="4.5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="960.7" cy="114.8" r="4.5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<polyline points="667.8,360.9 735.6,356.8 803.3,354.5 892.9,346.1 960.7,330.3" fill="none" stroke="#eb6834" stroke-width="2"/>
+<circle cx="667.8" cy="360.9" r="4.5" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="735.6" cy="356.8" r="4.5" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="803.3" cy="354.5" r="4.5" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="892.9" cy="346.1" r="4.5" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="960.7" cy="330.3" r="4.5" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<text x="968.7" y="118.8" fill="#2a78d6" font-size="12" text-anchor="start" font-weight="650" font-family="system-ui,-apple-system,Segoe UI,sans-serif">new bw64</text>
+<text x="968.7" y="334.3" fill="#eb6834" font-size="12" text-anchor="start" font-weight="650" font-family="system-ui,-apple-system,Segoe UI,sans-serif">new bw128</text>
+<text x="28.0" y="26.0" fill="#0b0b0b" font-size="15" text-anchor="start" font-weight="700" font-family="system-ui,-apple-system,Segoe UI,sans-serif">Fused device-seeded PQ-directional — ablation (bigann10M, 10M pts, k=10, full graph host-pinned)</text>
+</svg>

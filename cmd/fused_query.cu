@@ -259,6 +259,31 @@ void rotate_queries(DataT* d_queries, uint32_t n_queries, uint32_t dim,
   cudaFree(d_P);
 }
 
+// ── Classify visited nodes into host fetches vs device-cache hits ──────────
+// A visited node is device-served iff it lives in the subsample cache
+// (cache_map[gid] >= 0), which is EXACTLY the hit test the search kernel makes.
+// host_out[q] = # of this query's visited nodes that missed the cache and thus
+// cost a host PCIe fetch. `visited` has the same row stride the launcher used
+// (the beam bucket, MAX_RESULT_SIZE).
+template <typename GraphCfg>
+__global__ void count_host_hops_kernel(
+    const typename jasper::beam_search_result<GraphCfg>::entry_t* __restrict__ visited,
+    const uint32_t* __restrict__ counts,
+    const int32_t*  __restrict__ cache_map,
+    uint32_t stride, uint32_t n_queries,
+    uint32_t* __restrict__ host_out) {
+  uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
+  if (q >= n_queries) return;
+  uint32_t c = counts[q];
+  uint32_t h = 0;
+  for (uint32_t i = 0; i < c; ++i) {
+    uint32_t gid = static_cast<uint32_t>(visited[static_cast<size_t>(q) * stride + i].first);
+    if (gid == 0x7FFFFFFFu) continue;   // INVALID_INDEX
+    if (cache_map[gid] < 0) ++h;        // not in cache -> host fetch
+  }
+  host_out[q] = h;
+}
+
 // ── One PQ-directional round (baseline or fused) ───────────────
 // Times pq_search, computes recall@k and mean nodes-visited/query.
 template <typename GraphCfg, typename DataT, uint32_t BLOCK = 128>
@@ -332,6 +357,28 @@ void run_pq_round(
     mean_visited = std::accumulate(vc.begin(), vc.end(), 0.0) / n_queries;
   }
 
+  // Host-only hops: with no cache every visited node is a host PCIe fetch; with
+  // the device cache, subsample hits are device-served so host/q < visited/q.
+  double mean_host = mean_visited;
+  if (cache.map != nullptr && result.visited && result.visited_counts) {
+    const uint32_t stride = (beam_width + 64 < 128)  ? 128u
+                          : (beam_width + 64 < 256)  ? 256u
+                          : (beam_width + 64 < 512)  ? 512u
+                          : (beam_width + 64 < 1024) ? 1024u : 2048u;
+    uint32_t* d_host = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_host, n_queries * sizeof(uint32_t)));
+    uint32_t th = 256, bl = (n_queries + th - 1) / th;
+    count_host_hops_kernel<GraphCfg><<<bl, th>>>(
+        result.visited, result.visited_counts, cache.map,
+        stride, n_queries, d_host);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    std::vector<uint32_t> hh(n_queries);
+    CUDA_CHECK(cudaMemcpy(hh.data(), d_host, n_queries * sizeof(uint32_t),
+                          cudaMemcpyDeviceToHost));
+    mean_host = std::accumulate(hh.begin(), hh.end(), 0.0) / n_queries;
+    cudaFree(d_host);
+  }
+
   std::cout << "  [" << std::left << std::setw(8) << label << std::right << "]"
             << " bw=" << std::setw(4) << beam_width
             << " lim=" << std::setw(4) << limit
@@ -339,6 +386,7 @@ void run_pq_round(
             << " | recall@" << k << "="
             << std::setw(6) << std::setprecision(4) << recall
             << " | visited/q=" << std::setprecision(1) << mean_visited
+            << " | host/q=" << std::setprecision(1) << mean_host
             << std::endl;
 
   cudaFree(result.frontier);
