@@ -2,6 +2,9 @@
 
 #include <cstdint>
 #include <vector>
+#include <fstream>
+#include <iostream>
+#include <stdexcept>
 
 #include <cuda_bf16.h>
 #include <thrust/device_vector.h>
@@ -1512,6 +1515,297 @@ __host__ void save_graph_to_file(const graph<graph_cfg>& g,
             << "  medoid          : " << g.medoid        << "\n"
             << "  dim             : " << dim             << "\n"
             << "  total_file_size : " << total_file_size << "\n";
+}
+
+// ── Directional (LSH/PQ) graph persistence ──────────────────────────────────
+// Extends the base on-disk format above with an optional trailer holding
+// whichever of the LSH/PQ artifacts (edge_lshs, edge_pqs, per-vector norms,
+// lsh_globals, pq_codebooks) have been populated on the graph. The trailer is
+// purely additive: save_directional_graph_to_file first writes the exact same
+// byte-for-byte base section save_graph_to_file already produces, then
+// appends the trailer after it. Old files therefore have no trailer (and
+// load_graph_from_file never reads past the base section, so it's unaffected
+// either way), and load_directional_graph_from_file falls back to a
+// base-only bundle whenever the trailer is missing or unrecognized.
+inline constexpr uint32_t DIRECTIONAL_TRAILER_MAGIC   = 0x484C5344u;  // arbitrary sentinel
+inline constexpr uint32_t DIRECTIONAL_TRAILER_VERSION = 1u;
+
+// Bundle returned by load_directional_graph_from_file. `codebooks` owns its
+// device centroids (like generate_pq_codebooks) — call .free() on it once
+// has_pq is true and the bundle is no longer needed.
+template <typename graph_cfg>
+struct directional_graph_bundle {
+  graph<graph_cfg> g{};
+  bool has_lsh = false;
+  bool has_pq  = false;
+  lsh_globals<graph_cfg::k_ranks> globals{};
+  pq_codebooks<graph_cfg::pq_m, graph_cfg::pq_k> codebooks{};
+};
+
+template <typename graph_cfg>
+__host__ void save_directional_graph_to_file(
+    const graph<graph_cfg>& g,
+    const lsh_globals<graph_cfg::k_ranks>* globals,                  // nullptr if LSH not built
+    const pq_codebooks<graph_cfg::pq_m, graph_cfg::pq_k>* codebooks, // nullptr if PQ not built
+    std::string output_fname)
+{
+  static_assert(graph_cfg::use_lsh,
+                "save_directional_graph_to_file requires graph_cfg::use_lsh");
+
+  using segment_t       = graph_segment<graph_cfg>;
+  using edge_lsh_list_t = typename graph_cfg::edge_lsh_list_t;
+  using edge_pq_list_t  = typename graph_cfg::edge_pq_list_t;
+  constexpr uint32_t vectors_per_segment = graph_cfg::vectors_per_segment;
+
+  // Base section: identical bytes to save_graph_to_file, so old loaders (and
+  // load_graph_from_file itself) keep working unchanged.
+  save_graph_to_file<graph_cfg>(g, output_fname);
+  if (g.n_vectors == 0) return;
+
+  std::vector<segment_t> h_segments(g.segments.begin(), g.segments.end());
+  const bool has_lsh   = globals != nullptr && h_segments[0].edge_lshs != nullptr;
+  const bool has_pq    = codebooks != nullptr && h_segments[0].edge_pqs != nullptr;
+  const bool has_norms = g.d_vector_norms != nullptr;
+  if (!has_lsh && !has_pq && !has_norms) return;
+
+  std::ofstream outFile(output_fname, std::ios::binary | std::ios::app);
+  if (!outFile.is_open())
+    throw std::runtime_error(
+        "save_directional_graph_to_file: cannot reopen " + output_fname);
+
+  outFile.write(reinterpret_cast<const char*>(&DIRECTIONAL_TRAILER_MAGIC),   sizeof(uint32_t));
+  outFile.write(reinterpret_cast<const char*>(&DIRECTIONAL_TRAILER_VERSION), sizeof(uint32_t));
+  const uint8_t flags = (has_lsh ? 1u : 0u) | (has_pq ? 2u : 0u) | (has_norms ? 4u : 0u);
+  outFile.write(reinterpret_cast<const char*>(&flags), sizeof(uint8_t));
+
+  if (has_lsh) {
+    const uint8_t k_ranks_u8     = graph_cfg::k_ranks;
+    const uint8_t packed_size_u8 = static_cast<uint8_t>(sizeof(typename graph_cfg::packed_t));
+    outFile.write(reinterpret_cast<const char*>(&k_ranks_u8),     sizeof(uint8_t));
+    outFile.write(reinterpret_cast<const char*>(&packed_size_u8), sizeof(uint8_t));
+    outFile.write(reinterpret_cast<const char*>(globals),
+                  sizeof(lsh_globals<graph_cfg::k_ranks>));
+
+    edge_lsh_list_t* h_scratch = nullptr;
+    if (!g.on_host)
+      cudaMallocHost(&h_scratch, sizeof(edge_lsh_list_t) * vectors_per_segment);
+    for (uint32_t s = 0; s < g.n_segments; s++) {
+      const segment_t& seg       = h_segments[s];
+      const uint32_t   seg_count = static_cast<uint32_t>(seg.n_vectors);
+      const edge_lsh_list_t* src = seg.edge_lshs;
+      if (!g.on_host) {
+        cudaMemcpy(h_scratch, src, sizeof(edge_lsh_list_t) * seg_count,
+                  cudaMemcpyDeviceToHost);
+        src = h_scratch;
+      }
+      outFile.write(reinterpret_cast<const char*>(src),
+                    sizeof(edge_lsh_list_t) * seg_count);
+    }
+    if (!g.on_host) cudaFreeHost(h_scratch);
+  }
+
+  if (has_pq) {
+    constexpr uint32_t M = graph_cfg::pq_m;
+    constexpr uint32_t K = graph_cfg::pq_k;
+    const uint32_t m_u32 = M, k_u32 = K, dsub_u32 = codebooks->dsub;
+    outFile.write(reinterpret_cast<const char*>(&m_u32),    sizeof(uint32_t));
+    outFile.write(reinterpret_cast<const char*>(&k_u32),    sizeof(uint32_t));
+    outFile.write(reinterpret_cast<const char*>(&dsub_u32), sizeof(uint32_t));
+
+    const size_t centroid_count = static_cast<size_t>(M) * K * codebooks->dsub;
+    std::vector<float> h_centroids(centroid_count);
+    cudaMemcpy(h_centroids.data(), codebooks->d_centroids,
+               centroid_count * sizeof(float), cudaMemcpyDeviceToHost);
+    outFile.write(reinterpret_cast<const char*>(h_centroids.data()),
+                  static_cast<std::streamsize>(centroid_count * sizeof(float)));
+
+    edge_pq_list_t* h_scratch = nullptr;
+    if (!g.on_host)
+      cudaMallocHost(&h_scratch, sizeof(edge_pq_list_t) * vectors_per_segment);
+    for (uint32_t s = 0; s < g.n_segments; s++) {
+      const segment_t& seg       = h_segments[s];
+      const uint32_t   seg_count = static_cast<uint32_t>(seg.n_vectors);
+      const edge_pq_list_t* src  = seg.edge_pqs;
+      if (!g.on_host) {
+        cudaMemcpy(h_scratch, src, sizeof(edge_pq_list_t) * seg_count,
+                  cudaMemcpyDeviceToHost);
+        src = h_scratch;
+      }
+      outFile.write(reinterpret_cast<const char*>(src),
+                    sizeof(edge_pq_list_t) * seg_count);
+    }
+    if (!g.on_host) cudaFreeHost(h_scratch);
+  }
+
+  if (has_norms) {
+    std::vector<float> h_norms(static_cast<size_t>(g.n_vectors));
+    cudaMemcpy(h_norms.data(), g.d_vector_norms,
+               h_norms.size() * sizeof(float), cudaMemcpyDeviceToHost);
+    outFile.write(reinterpret_cast<const char*>(h_norms.data()),
+                  static_cast<std::streamsize>(h_norms.size() * sizeof(float)));
+  }
+
+  outFile.close();
+
+  std::cout << "Appended directional trailer to " << output_fname
+            << " (lsh=" << has_lsh << ", pq=" << has_pq
+            << ", norms=" << has_norms << ")\n";
+}
+
+template <typename graph_cfg>
+__host__ directional_graph_bundle<graph_cfg> load_directional_graph_from_file(
+    std::string input_fname,
+    uint32_t    dim,
+    bool        on_host = false)
+{
+  static_assert(graph_cfg::use_lsh,
+                "load_directional_graph_from_file requires graph_cfg::use_lsh");
+
+  using data_t          = typename graph_cfg::data_t;
+  using edge_list_t     = typename graph_cfg::edge_list_t;
+  using segment_t       = graph_segment<graph_cfg>;
+  using edge_lsh_list_t = typename graph_cfg::edge_lsh_list_t;
+  using edge_pq_list_t  = typename graph_cfg::edge_pq_list_t;
+  constexpr uint32_t vectors_per_segment = graph_cfg::vectors_per_segment;
+
+  directional_graph_bundle<graph_cfg> bundle;
+  bundle.g = load_graph_from_file<graph_cfg>(input_fname, dim, on_host);
+  if (bundle.g.n_vectors == 0) return bundle;
+
+  // Base section size is exactly what save_graph_to_file/load_graph_from_file
+  // agree on: 4 u64 header fields + n_vectors * bytes_per_node.
+  const uint64_t bytes_per_node =
+      sizeof(data_t) * dim + sizeof(uint8_t) + sizeof(edge_list_t);
+  const uint64_t base_section_size =
+      4 * sizeof(uint64_t) + static_cast<uint64_t>(bundle.g.n_vectors) * bytes_per_node;
+  const uint64_t trailer_prefix_size =
+      2 * sizeof(uint32_t) + sizeof(uint8_t);   // magic + version + flags
+
+  std::ifstream inFile(input_fname, std::ios::binary | std::ios::ate);
+  if (!inFile.is_open())
+    throw std::runtime_error(
+        "load_directional_graph_from_file: cannot reopen " + input_fname);
+  const uint64_t file_size = static_cast<uint64_t>(inFile.tellg());
+
+  if (file_size < base_section_size + trailer_prefix_size) {
+    return bundle;   // no trailer present — plain base graph, nothing more to do
+  }
+
+  inFile.seekg(static_cast<std::streamoff>(base_section_size));
+  uint32_t magic = 0, version = 0;
+  uint8_t  flags = 0;
+  inFile.read(reinterpret_cast<char*>(&magic),   sizeof(uint32_t));
+  inFile.read(reinterpret_cast<char*>(&version), sizeof(uint32_t));
+  inFile.read(reinterpret_cast<char*>(&flags),   sizeof(uint8_t));
+
+  if (magic != DIRECTIONAL_TRAILER_MAGIC || version != DIRECTIONAL_TRAILER_VERSION) {
+    return bundle;   // no (recognizable) trailer — treat as base-only
+  }
+
+  const bool file_has_lsh   = flags & 1u;
+  const bool file_has_pq    = flags & 2u;
+  const bool file_has_norms = flags & 4u;
+
+  std::vector<segment_t> h_segments(bundle.g.segments.begin(), bundle.g.segments.end());
+
+  if (file_has_lsh) {
+    uint8_t k_ranks_u8 = 0, packed_size_u8 = 0;
+    inFile.read(reinterpret_cast<char*>(&k_ranks_u8),     sizeof(uint8_t));
+    inFile.read(reinterpret_cast<char*>(&packed_size_u8), sizeof(uint8_t));
+    if (k_ranks_u8 != graph_cfg::k_ranks ||
+        packed_size_u8 != sizeof(typename graph_cfg::packed_t)) {
+      throw std::runtime_error(
+          "load_directional_graph_from_file: LSH trailer k_ranks/packed_t "
+          "mismatch — file was written with a different graph_cfg");
+    }
+    inFile.read(reinterpret_cast<char*>(&bundle.globals),
+                sizeof(lsh_globals<graph_cfg::k_ranks>));
+
+    for (auto& seg : h_segments) seg.allocate_edge_lsh();  // no-op if already allocated
+
+    edge_lsh_list_t* h_scratch = nullptr;
+    if (!on_host)
+      cudaMallocHost(&h_scratch, sizeof(edge_lsh_list_t) * vectors_per_segment);
+    for (uint32_t s = 0; s < bundle.g.n_segments; s++) {
+      segment_t&     seg       = h_segments[s];
+      const uint32_t seg_count = static_cast<uint32_t>(seg.n_vectors);
+      const std::streamsize want =
+          static_cast<std::streamsize>(seg_count) * sizeof(edge_lsh_list_t);
+      if (on_host) {
+        inFile.read(reinterpret_cast<char*>(seg.edge_lshs), want);
+      } else {
+        inFile.read(reinterpret_cast<char*>(h_scratch), want);
+        cudaMemcpy(seg.edge_lshs, h_scratch, want, cudaMemcpyHostToDevice);
+      }
+    }
+    if (!on_host) cudaFreeHost(h_scratch);
+    bundle.has_lsh = true;
+  }
+
+  if (file_has_pq) {
+    uint32_t m_u32 = 0, k_u32 = 0, dsub_u32 = 0;
+    inFile.read(reinterpret_cast<char*>(&m_u32),    sizeof(uint32_t));
+    inFile.read(reinterpret_cast<char*>(&k_u32),    sizeof(uint32_t));
+    inFile.read(reinterpret_cast<char*>(&dsub_u32), sizeof(uint32_t));
+    if (m_u32 != graph_cfg::pq_m || k_u32 != graph_cfg::pq_k) {
+      throw std::runtime_error(
+          "load_directional_graph_from_file: PQ trailer M/K mismatch — "
+          "file was written with a different graph_cfg");
+    }
+
+    bundle.codebooks = pq_codebooks<graph_cfg::pq_m, graph_cfg::pq_k>::allocate(dsub_u32);
+    const size_t centroid_count = static_cast<size_t>(m_u32) * k_u32 * dsub_u32;
+    std::vector<float> h_centroids(centroid_count);
+    inFile.read(reinterpret_cast<char*>(h_centroids.data()),
+                static_cast<std::streamsize>(centroid_count * sizeof(float)));
+    cudaMemcpy(bundle.codebooks.d_centroids, h_centroids.data(),
+               centroid_count * sizeof(float), cudaMemcpyHostToDevice);
+
+    for (auto& seg : h_segments) seg.allocate_edge_pq();  // no-op if already allocated
+
+    edge_pq_list_t* h_scratch = nullptr;
+    if (!on_host)
+      cudaMallocHost(&h_scratch, sizeof(edge_pq_list_t) * vectors_per_segment);
+    for (uint32_t s = 0; s < bundle.g.n_segments; s++) {
+      segment_t&     seg       = h_segments[s];
+      const uint32_t seg_count = static_cast<uint32_t>(seg.n_vectors);
+      const std::streamsize want =
+          static_cast<std::streamsize>(seg_count) * sizeof(edge_pq_list_t);
+      if (on_host) {
+        inFile.read(reinterpret_cast<char*>(seg.edge_pqs), want);
+      } else {
+        inFile.read(reinterpret_cast<char*>(h_scratch), want);
+        cudaMemcpy(seg.edge_pqs, h_scratch, want, cudaMemcpyHostToDevice);
+      }
+    }
+    if (!on_host) cudaFreeHost(h_scratch);
+    bundle.has_pq = true;
+  }
+
+  // The allocate_edge_lsh()/allocate_edge_pq() calls above only mutate the
+  // host-side `h_segments` copy's pointers; re-upload once so the device-
+  // resident segment structs (what device_view actually reads) see them.
+  if (file_has_lsh || file_has_pq) {
+    bundle.g.segments = thrust::device_vector<segment_t>(h_segments.begin(), h_segments.end());
+  }
+
+  if (file_has_norms) {
+    std::vector<float> h_norms(static_cast<size_t>(bundle.g.n_vectors));
+    inFile.read(reinterpret_cast<char*>(h_norms.data()),
+                static_cast<std::streamsize>(h_norms.size() * sizeof(float)));
+    cudaMalloc(&bundle.g.d_vector_norms, h_norms.size() * sizeof(float));
+    cudaMemcpy(bundle.g.d_vector_norms, h_norms.data(),
+               h_norms.size() * sizeof(float), cudaMemcpyHostToDevice);
+  }
+
+  inFile.close();
+  cudaDeviceSynchronize();
+
+  std::cout << "Loaded directional trailer from " << input_fname
+            << " (lsh=" << bundle.has_lsh << ", pq=" << bundle.has_pq
+            << ", norms=" << file_has_norms << ")\n";
+
+  return bundle;
 }
 
 }
