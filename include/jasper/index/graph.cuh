@@ -1527,6 +1527,19 @@ __host__ void save_graph_to_file(const graph<graph_cfg>& g,
 // load_graph_from_file never reads past the base section, so it's unaffected
 // either way), and load_directional_graph_from_file falls back to a
 // base-only bundle whenever the trailer is missing or unrecognized.
+//
+// ⚠ KNOWN GAP: the trailer does NOT persist whether the graph was
+// prerotated, or the rotation seed (graph_construct_params::prerotate /
+// prerotate_seed) — the estimator artifacts above don't need it, but the
+// caller does, to rotate queries at search time the same way the vectors
+// were rotated at build time. Right now the caller (see jasper_ffi.cu's
+// LoadDirectionalGraph_##id / python/jasper/__init__.py's Graph.load) must
+// re-supply the same prerotate/prerotate_seed used at construction; get it
+// wrong and queries silently search un-rotated against a rotated index —
+// wrong results, no error. Fixing this properly means adding prerotate +
+// prerotate_seed to the trailer (additive, same pattern as everything else
+// here) and having the loader hand them back instead of taking them as
+// parameters.
 inline constexpr uint32_t DIRECTIONAL_TRAILER_MAGIC   = 0x484C5344u;  // arbitrary sentinel
 inline constexpr uint32_t DIRECTIONAL_TRAILER_VERSION = 1u;
 

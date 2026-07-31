@@ -2,6 +2,7 @@
 #include <tvm/ffi/extra/c_env_api.h>
 #include <thrust/pair.h>
 #include <cuda_fp16.h>
+#include <cublas_v2.h>
 
 #include "jasper/jasper.cuh"
 
@@ -9,6 +10,7 @@
 #include <mutex>
 #include <variant>
 #include <string>
+#include <vector>
 
 namespace jasper_ffi {
 
@@ -38,13 +40,97 @@ JASPER_FOR_EACH_CONFIG(DECLARE_CONFIG)
 JASPER_FOR_EACH_CONFIG(DECLARE_CONSTRUCT_CONFIG)
 #undef DECLARE_CONSTRUCT_CONFIG
 
+// ── Directional (LSH + PQ) configs ──────────────────────────────
+// (CONFIG_ID, INDEX_T, N_NEIGHBORS, DATA_T, DISTANCE_T, DIST_FUNC, K_RANKS, PACKED_T)
+// Mirrors cmd/create_lsh_index.cu's JASPER_FOR_EACH_CONFIG. PACKED_T is chosen
+// by dim bucket: uint8_t for dim<=128 (7-bit coord), uint16_t for dim>128.
+#define JASPER_FOR_EACH_DIRECTIONAL_CONFIG(X)                                  \
+  X(f16_r32_l2_k4_d128,   uint32_t, 32, __half, float, jasper::distance_func::L2, 4,  uint8_t)  \
+  X(f16_r32_l2_k16_d128,  uint32_t, 32, __half, float, jasper::distance_func::L2, 16, uint8_t)  \
+  X(f16_r32_l2_k4_d32678, uint32_t, 32, __half, float, jasper::distance_func::L2, 4,  uint16_t) \
+  X(f16_r32_l2_k16_d32678, uint32_t, 32, __half, float, jasper::distance_func::L2, 16,  uint16_t) \
+  X(f16_r64_l2_k4_d128,   uint32_t, 64, __half, float, jasper::distance_func::L2, 4,  uint8_t)  \
+  X(f16_r64_l2_k16_d128,  uint32_t, 64, __half, float, jasper::distance_func::L2, 16, uint8_t)  \
+  X(f16_r64_l2_k4_d32678, uint32_t, 64, __half, float, jasper::distance_func::L2, 4,  uint16_t) \
+  X(f16_r64_l2_k16_d32678, uint32_t, 64, __half, float, jasper::distance_func::L2, 16,  uint16_t) \
+  X(f16_r32_ip_k4_d128, uint32_t, 32, __half, float, jasper::distance_func::INNER_PRODUCT, 4, uint8_t) \
+  X(f16_r32_ip_k16_d128, uint32_t, 32, __half, float, jasper::distance_func::INNER_PRODUCT, 16, uint8_t) \
+  X(f16_r32_ip_k4_d32678, uint32_t, 32, __half, float, jasper::distance_func::INNER_PRODUCT, 4, uint16_t) \
+  X(f16_r32_ip_k16_d32678, uint32_t, 32, __half, float, jasper::distance_func::INNER_PRODUCT, 16, uint16_t) \
+  X(f16_r64_ip_k4_d128, uint32_t, 64, __half, float, jasper::distance_func::INNER_PRODUCT, 4, uint8_t) \
+  X(f16_r64_ip_k16_d128, uint32_t, 64, __half, float, jasper::distance_func::INNER_PRODUCT, 16, uint8_t) \
+  X(f16_r64_ip_k4_d32678, uint32_t, 64, __half, float, jasper::distance_func::INNER_PRODUCT, 4, uint16_t) \
+  X(f16_r64_ip_k16_d32678, uint32_t, 64, __half, float, jasper::distance_func::INNER_PRODUCT, 16, uint16_t)
+
+#define DECLARE_DIRECTIONAL_CONFIG(id, IDX, R, DAT, DIST, FUNC, KR, PACKEDT) \
+  using cfg_##id = jasper::graph_config<IDX, R, DAT, DIST, FUNC, true, KR, PACKEDT>; \
+  using construct_cfg_##id = jasper::graph_construct_config<cfg_##id, 64, 4, R, 64>;
+
+JASPER_FOR_EACH_DIRECTIONAL_CONFIG(DECLARE_DIRECTIONAL_CONFIG)
+#undef DECLARE_DIRECTIONAL_CONFIG
+
 // ── Graph storage using variant ────────────────────────────────
+// Spans BOTH plain and directional configs, so plain and directional graphs
+// share one handle namespace/free path.
 #define VARIANT_ENTRY(id, ...) jasper::graph<cfg_##id>,
 using GraphVariant = std::variant<
   JASPER_FOR_EACH_CONFIG(VARIANT_ENTRY)
+  JASPER_FOR_EACH_DIRECTIONAL_CONFIG(VARIANT_ENTRY)
   std::monostate
 >;
 #undef VARIANT_ENTRY
+
+// ── Per-handle directional state ────────────────────────────────
+// Templated on the concrete graph type (GRAPH_T = jasper::graph<cfg_id>), so
+// there's exactly one dir_meta_map<GRAPH_T>() per directional config — no
+// variant-of-globals/codebooks needed, and FreeGraph can clean it up
+// generically inside the std::visit over GraphVariant (see below).
+template <typename GRAPH_T>
+struct dir_meta {
+  bool has_lsh   = false;
+  bool has_pq    = false;
+  bool prerotate = false;
+  typename GRAPH_T::data_t* d_rotation = nullptr;  // dim x dim, col-major, device; owned
+  jasper::lsh_globals<GRAPH_T::k_ranks> globals{};
+  jasper::pq_codebooks<GRAPH_T::pq_m, GRAPH_T::pq_k> codebooks{};  // owns d_centroids
+};
+
+template <typename GRAPH_T>
+std::unordered_map<int64_t, dir_meta<GRAPH_T>>& dir_meta_map() {
+  static std::unordered_map<int64_t, dir_meta<GRAPH_T>> m;
+  return m;
+}
+
+// Builds a dim x dim random orthogonal rotation matrix (see
+// jasper::set_rotation_matrix) and uploads it to device as __half,
+// column-major — the layout jasper::rotate_data_vec expects.
+inline __half* make_device_rotation_matrix(uint32_t dim, uint64_t seed) {
+  std::vector<float> h_P_f(static_cast<size_t>(dim) * dim);
+  std::vector<float> h_Pt_f(static_cast<size_t>(dim) * dim);  // unused, required by the API
+  jasper::set_rotation_matrix(static_cast<int>(dim), h_P_f.data(), h_Pt_f.data(), seed);
+
+  std::vector<__half> h_P(h_P_f.size());
+  for (size_t i = 0; i < h_P.size(); ++i) h_P[i] = static_cast<__half>(h_P_f[i]);
+
+  __half* d_P = nullptr;
+  cudaMalloc(&d_P, sizeof(__half) * h_P.size());
+  cudaMemcpy(d_P, h_P.data(), sizeof(__half) * h_P.size(), cudaMemcpyHostToDevice);
+  return d_P;
+}
+
+// Rotates queries (row-major [n_queries, dim], contiguous stride == dim) into
+// a freshly allocated device buffer of the same shape. Caller must cudaFree it.
+inline __half* rotate_query_batch(const __half* d_queries, uint32_t n_queries,
+                                  uint32_t dim, const __half* d_rotation) {
+  __half* d_out = nullptr;
+  cudaMalloc(&d_out, sizeof(__half) * static_cast<size_t>(n_queries) * dim);
+  cublasHandle_t handle;
+  cublasCreate(&handle);
+  jasper::rotate_data_vec<__half>(handle, const_cast<__half*>(d_queries), d_out,
+                                  n_queries, dim, const_cast<__half*>(d_rotation));
+  cublasDestroy(handle);
+  return d_out;
+}
 
 static std::unordered_map<int64_t, GraphVariant> g_graphs;
 static int64_t g_next_handle = 0;
@@ -216,15 +302,369 @@ void Search_##id(int64_t handle,                                               \
 JASPER_FOR_EACH_CONFIG(DEFINE_OPS)
 #undef DEFINE_OPS
 
+// ── Per-config directional (LSH + PQ) implementations ───────────
+// Mirrors cmd/create_lsh_index.cu's pipeline: construct (optionally
+// prerotated) -> build_lsh (generate_lsh_globals + populate_edge_lsh) ->
+// build_pq (generate_pq_codebooks + populate_edge_pq + compute_vector_norms)
+// -> directional_search / pq_search. Each step is its own op so callers
+// choose which artifacts to build (see dir_meta's has_lsh/has_pq flags).
+
+#define DEFINE_DIRECTIONAL_OPS(id, IDX, R, DAT, DIST, FUNC, KR, PACKEDT)       \
+                                                                               \
+int64_t ConstructDirectionalGraph_##id(ffi::TensorView vectors,                \
+                                       int64_t dim,                           \
+                                       double alpha,                         \
+                                       int64_t workspace_budget_bytes,        \
+                                       bool on_host,                         \
+                                       bool prerotate,                       \
+                                       int64_t prerotate_seed) {             \
+  uint32_t n_vectors = static_cast<uint32_t>(vectors.size(0));               \
+  uint32_t d = static_cast<uint32_t>(dim);                                   \
+                                                                               \
+  jasper::vector_view<DAT> vecs(                                             \
+      static_cast<DAT*>(vectors.data_ptr()), d, n_vectors, false);           \
+                                                                               \
+  jasper::graph_construct_params<construct_cfg_##id> params;                 \
+  jasper::graph_construct_workspace<construct_cfg_##id> ws;                  \
+  uint32_t max_batch_size = min(                                             \
+    ws.max_batch_size_for_budget(workspace_budget_bytes),                   \
+    n_vectors / 50                                                          \
+  );                                                                         \
+                                                                               \
+  params.data_vectors   = vecs;                                              \
+  params.alpha          = static_cast<float>(alpha);                        \
+  params.max_batch_size = max_batch_size;                                   \
+  params.on_host        = on_host;                                          \
+  params.prerotate      = prerotate;                                        \
+  params.prerotate_seed = static_cast<uint32_t>(prerotate_seed);            \
+                                                                               \
+  auto g = jasper::construct_graph<construct_cfg_##id>(params);              \
+                                                                               \
+  using graph_t = jasper::graph<cfg_##id>;                                   \
+  dir_meta<graph_t> meta;                                                    \
+  meta.prerotate = prerotate;                                               \
+  if (prerotate) {                                                          \
+    meta.d_rotation = make_device_rotation_matrix(                          \
+        d, static_cast<uint64_t>(prerotate_seed));                         \
+  }                                                                          \
+                                                                               \
+  std::lock_guard<std::mutex> lock(g_mutex);                                 \
+  int64_t handle = g_next_handle++;                                         \
+  g_graphs[handle] = std::move(g);                                          \
+  dir_meta_map<graph_t>()[handle] = meta;                                   \
+  return handle;                                                             \
+}                                                                             \
+                                                                               \
+void BuildLsh_##id(int64_t handle, int64_t n_samples, int64_t seed) {        \
+  using graph_t = jasper::graph<cfg_##id>;                                   \
+  graph_t* gp;                                                               \
+  {                                                                           \
+    std::lock_guard<std::mutex> lock(g_mutex);                              \
+    auto it = g_graphs.find(handle);                                        \
+    TVM_FFI_ICHECK(it != g_graphs.end()) << "Invalid handle: " << handle;     \
+    gp = &std::get<graph_t>(it->second);                                    \
+  }                                                                          \
+  auto globals = gp->generate_lsh_globals(                                  \
+      static_cast<uint32_t>(n_samples), static_cast<uint64_t>(seed));       \
+  gp->populate_edge_lsh();                                                  \
+                                                                               \
+  std::lock_guard<std::mutex> lock(g_mutex);                                 \
+  auto& meta = dir_meta_map<graph_t>()[handle];                             \
+  meta.has_lsh = true;                                                      \
+  meta.globals = globals;                                                   \
+}                                                                             \
+                                                                               \
+void BuildPq_##id(int64_t handle, int64_t n_train, int64_t kmeans_iter,      \
+                  int64_t seed) {                                           \
+  using graph_t = jasper::graph<cfg_##id>;                                   \
+  graph_t* gp;                                                               \
+  {                                                                           \
+    std::lock_guard<std::mutex> lock(g_mutex);                              \
+    auto it = g_graphs.find(handle);                                        \
+    TVM_FFI_ICHECK(it != g_graphs.end()) << "Invalid handle: " << handle;     \
+    gp = &std::get<graph_t>(it->second);                                    \
+  }                                                                          \
+  auto cb = gp->generate_pq_codebooks(                                      \
+      static_cast<uint32_t>(n_train), static_cast<uint32_t>(kmeans_iter),   \
+      static_cast<uint64_t>(seed));                                        \
+  gp->populate_edge_pq(cb);                                                 \
+  gp->compute_vector_norms();                                               \
+                                                                               \
+  std::lock_guard<std::mutex> lock(g_mutex);                                 \
+  auto& meta = dir_meta_map<graph_t>()[handle];                             \
+  if (meta.has_pq) meta.codebooks.free();                                  \
+  meta.has_pq    = true;                                                    \
+  meta.codebooks = cb;                                                      \
+}                                                                             \
+                                                                               \
+void DirectionalSearch_##id(int64_t handle,                                  \
+                            ffi::TensorView queries,                        \
+                            ffi::TensorView out_indices,                    \
+                            ffi::TensorView out_distances,                  \
+                            int64_t k, int64_t beam_width, int64_t limit,   \
+                            bool print_throughput) {                        \
+  using graph_t = jasper::graph<cfg_##id>;                                   \
+  graph_t* gp;                                                               \
+  dir_meta<graph_t> meta;                                                   \
+  {                                                                           \
+    std::lock_guard<std::mutex> lock(g_mutex);                              \
+    auto it = g_graphs.find(handle);                                        \
+    TVM_FFI_ICHECK(it != g_graphs.end()) << "Invalid handle: " << handle;     \
+    gp = &std::get<graph_t>(it->second);                                    \
+    auto mit = dir_meta_map<graph_t>().find(handle);                        \
+    TVM_FFI_ICHECK(mit != dir_meta_map<graph_t>().end())                    \
+        << "Handle " << handle << " has no directional metadata";           \
+    meta = mit->second;                                                     \
+  }                                                                          \
+  TVM_FFI_ICHECK(meta.has_lsh)                                              \
+      << "Graph " << handle << " has no LSH artifacts built — "            \
+      << "call build_lsh() first";                                         \
+  auto& g = *gp;                                                            \
+                                                                               \
+  uint32_t n_queries = static_cast<uint32_t>(queries.size(0));              \
+  uint32_t dim_ = g.dim;                                                    \
+                                                                               \
+  DAT* d_query_data = static_cast<DAT*>(queries.data_ptr());                \
+  DAT* d_rotated = nullptr;                                                 \
+  if (meta.prerotate) {                                                     \
+    d_rotated = rotate_query_batch(d_query_data, n_queries, dim_,           \
+                                   meta.d_rotation);                        \
+    d_query_data = d_rotated;                                              \
+  }                                                                          \
+                                                                               \
+  jasper::vector_view<DAT> d_queries(d_query_data, dim_, n_queries, false); \
+                                                                               \
+  jasper::search_params params{                                            \
+      .k           = static_cast<uint32_t>(k),                             \
+      .beam_width  = static_cast<uint32_t>(beam_width),                    \
+      .limit       = static_cast<uint32_t>(limit),                         \
+      .get_visited = false,                                                \
+  };                                                                         \
+                                                                               \
+  cudaEvent_t e0, e1;                                                       \
+  cudaEventCreate(&e0);                                                     \
+  cudaEventCreate(&e1);                                                     \
+  cudaEventRecord(e0);                                                      \
+  auto result = jasper::directional_search(g, meta.globals, d_queries, params); \
+  cudaEventRecord(e1);                                                      \
+  cudaEventSynchronize(e1);                                                 \
+                                                                               \
+  float duration_ms = 0;                                                    \
+  cudaEventElapsedTime(&duration_ms, e0, e1);                               \
+  cudaEventDestroy(e0);                                                     \
+  cudaEventDestroy(e1);                                                     \
+                                                                               \
+  if (print_throughput)                                                     \
+    std::cout << "[directional_search] duration=" << duration_ms            \
+      << "ms, throughput=" << (n_queries * 1000.0f)/duration_ms            \
+      << std::endl;                                                         \
+                                                                               \
+  DLDevice device = queries.device();                                      \
+  cudaStream_t stream = static_cast<cudaStream_t>(                          \
+      TVMFFIEnvGetStream(device.device_type, device.device_id));           \
+                                                                               \
+  uint32_t total = n_queries * static_cast<uint32_t>(k);                   \
+  uint32_t threads = 256;                                                   \
+  uint32_t blocks = (total + threads - 1) / threads;                       \
+                                                                               \
+  unpack_results_kernel<<<blocks, threads, 0, stream>>>(                   \
+      result.frontier,                                                      \
+      static_cast<int32_t*>(out_indices.data_ptr()),                       \
+      static_cast<float*>(out_distances.data_ptr()),                       \
+      total);                                                               \
+                                                                               \
+  cudaFree(result.frontier);                                               \
+  if (d_rotated) cudaFree(d_rotated);                                      \
+}                                                                             \
+                                                                               \
+void PqSearch_##id(int64_t handle,                                          \
+                   ffi::TensorView queries,                                 \
+                   ffi::TensorView out_indices,                             \
+                   ffi::TensorView out_distances,                          \
+                   int64_t k, int64_t beam_width, int64_t limit,           \
+                   bool print_throughput) {                                \
+  using graph_t = jasper::graph<cfg_##id>;                                   \
+  graph_t* gp;                                                               \
+  dir_meta<graph_t> meta;                                                   \
+  {                                                                           \
+    std::lock_guard<std::mutex> lock(g_mutex);                              \
+    auto it = g_graphs.find(handle);                                        \
+    TVM_FFI_ICHECK(it != g_graphs.end()) << "Invalid handle: " << handle;     \
+    gp = &std::get<graph_t>(it->second);                                    \
+    auto mit = dir_meta_map<graph_t>().find(handle);                        \
+    TVM_FFI_ICHECK(mit != dir_meta_map<graph_t>().end())                    \
+        << "Handle " << handle << " has no directional metadata";           \
+    meta = mit->second;                                                     \
+  }                                                                          \
+  TVM_FFI_ICHECK(meta.has_pq)                                               \
+      << "Graph " << handle << " has no PQ artifacts built — "             \
+      << "call build_pq() first";                                          \
+  auto& g = *gp;                                                            \
+                                                                               \
+  uint32_t n_queries = static_cast<uint32_t>(queries.size(0));              \
+  uint32_t dim_ = g.dim;                                                    \
+                                                                               \
+  DAT* d_query_data = static_cast<DAT*>(queries.data_ptr());                \
+  DAT* d_rotated = nullptr;                                                 \
+  if (meta.prerotate) {                                                     \
+    d_rotated = rotate_query_batch(d_query_data, n_queries, dim_,           \
+                                   meta.d_rotation);                        \
+    d_query_data = d_rotated;                                              \
+  }                                                                          \
+                                                                               \
+  jasper::vector_view<DAT> d_queries(d_query_data, dim_, n_queries, false); \
+                                                                               \
+  jasper::search_params params{                                            \
+      .k           = static_cast<uint32_t>(k),                             \
+      .beam_width  = static_cast<uint32_t>(beam_width),                    \
+      .limit       = static_cast<uint32_t>(limit),                         \
+      .get_visited = false,                                                \
+  };                                                                         \
+                                                                               \
+  cudaEvent_t e0, e1;                                                       \
+  cudaEventCreate(&e0);                                                     \
+  cudaEventCreate(&e1);                                                     \
+  cudaEventRecord(e0);                                                      \
+  auto result = jasper::pq_search(g, meta.codebooks.view(), d_queries, params); \
+  cudaEventRecord(e1);                                                      \
+  cudaEventSynchronize(e1);                                                 \
+                                                                               \
+  float duration_ms = 0;                                                    \
+  cudaEventElapsedTime(&duration_ms, e0, e1);                               \
+  cudaEventDestroy(e0);                                                     \
+  cudaEventDestroy(e1);                                                     \
+                                                                               \
+  if (print_throughput)                                                     \
+    std::cout << "[pq_search] duration=" << duration_ms                     \
+      << "ms, throughput=" << (n_queries * 1000.0f)/duration_ms            \
+      << std::endl;                                                         \
+                                                                               \
+  DLDevice device = queries.device();                                      \
+  cudaStream_t stream = static_cast<cudaStream_t>(                          \
+      TVMFFIEnvGetStream(device.device_type, device.device_id));           \
+                                                                               \
+  uint32_t total = n_queries * static_cast<uint32_t>(k);                   \
+  uint32_t threads = 256;                                                   \
+  uint32_t blocks = (total + threads - 1) / threads;                       \
+                                                                               \
+  unpack_results_kernel<<<blocks, threads, 0, stream>>>(                   \
+      result.frontier,                                                      \
+      static_cast<int32_t*>(out_indices.data_ptr()),                       \
+      static_cast<float*>(out_distances.data_ptr()),                       \
+      total);                                                               \
+                                                                               \
+  cudaFree(result.frontier);                                               \
+  if (d_rotated) cudaFree(d_rotated);                                      \
+}                                                                             \
+                                                                               \
+void SaveDirectionalGraph_##id(int64_t handle, ffi::String path) {          \
+  using graph_t = jasper::graph<cfg_##id>;                                   \
+  graph_t* gp;                                                               \
+  dir_meta<graph_t> meta;                                                   \
+  {                                                                           \
+    std::lock_guard<std::mutex> lock(g_mutex);                              \
+    auto it = g_graphs.find(handle);                                        \
+    TVM_FFI_ICHECK(it != g_graphs.end()) << "Invalid handle: " << handle;     \
+    gp = &std::get<graph_t>(it->second);                                    \
+    auto mit = dir_meta_map<graph_t>().find(handle);                        \
+    TVM_FFI_ICHECK(mit != dir_meta_map<graph_t>().end())                    \
+        << "Handle " << handle << " has no directional metadata";           \
+    meta = mit->second;                                                     \
+  }                                                                          \
+  jasper::save_directional_graph_to_file<cfg_##id>(                         \
+      *gp,                                                                  \
+      meta.has_lsh ? &meta.globals   : nullptr,                            \
+      meta.has_pq  ? &meta.codebooks : nullptr,                            \
+      std::string(path));                                                   \
+}                                                                             \
+                                                                               \
+int64_t LoadDirectionalGraph_##id(ffi::String path, int64_t dim, bool on_host, \
+                                  bool prerotate, int64_t prerotate_seed) {   \
+  auto bundle = jasper::load_directional_graph_from_file<cfg_##id>(          \
+      std::string(path), static_cast<uint32_t>(dim), on_host);              \
+                                                                               \
+  using graph_t = jasper::graph<cfg_##id>;                                   \
+  dir_meta<graph_t> meta;                                                   \
+  meta.has_lsh   = bundle.has_lsh;                                          \
+  meta.has_pq    = bundle.has_pq;                                           \
+  meta.globals   = bundle.globals;                                          \
+  meta.codebooks = bundle.codebooks;                                        \
+  meta.prerotate = prerotate;                                              \
+  if (prerotate) {                                                         \
+    meta.d_rotation = make_device_rotation_matrix(                         \
+        static_cast<uint32_t>(dim), static_cast<uint64_t>(prerotate_seed)); \
+  }                                                                          \
+                                                                               \
+  std::lock_guard<std::mutex> lock(g_mutex);                                \
+  int64_t handle = g_next_handle++;                                        \
+  g_graphs[handle] = std::move(bundle.g);                                  \
+  dir_meta_map<graph_t>()[handle] = meta;                                  \
+  return handle;                                                            \
+}                                                                             \
+                                                                               \
+void GetVectorDirectional_##id(int64_t handle, int64_t index,                \
+                               ffi::TensorView out) {                       \
+  using graph_t = jasper::graph<cfg_##id>;                                   \
+  graph_t* gp;                                                              \
+  {                                                                          \
+    std::lock_guard<std::mutex> lock(g_mutex);                             \
+    auto it = g_graphs.find(handle);                                       \
+    TVM_FFI_ICHECK(it != g_graphs.end()) << "Invalid handle: " << handle;    \
+    gp = &std::get<graph_t>(it->second);                                   \
+  }                                                                         \
+  auto& g = *gp;                                                           \
+  uint32_t idx = static_cast<uint32_t>(index);                             \
+  TVM_FFI_ICHECK(idx < g.n_vectors) << "Index " << idx << " out of range";   \
+                                                                               \
+  uint32_t seg_id     = graph_t::segment_of(idx);                          \
+  uint32_t local_idx  = graph_t::local_of(idx);                            \
+  uint32_t padded_dim = jasper::vector_view<DAT>::pad(g.dim);              \
+                                                                               \
+  jasper::graph_segment<cfg_##id> h_seg;                                    \
+  cudaMemcpy(&h_seg,                                                        \
+             thrust::raw_pointer_cast(g.segments.data()) + seg_id,          \
+             sizeof(h_seg), cudaMemcpyDeviceToHost);                        \
+                                                                               \
+  cudaMemcpy(                                                               \
+      static_cast<DAT*>(out.data_ptr()),                                   \
+      h_seg.vectors.data + static_cast<size_t>(local_idx) * padded_dim,     \
+      sizeof(DAT) * g.dim,                                                 \
+      cudaMemcpyDeviceToDevice);                                          \
+}                                                                             \
+                                                                               \
+/* bit0 = has_lsh, bit1 = has_pq. 0 if the handle has no directional        \
+   metadata at all (shouldn't happen for a directional-config handle, but   \
+   keeps this query total rather than throwing). */                        \
+int64_t GetDirectionalFlags_##id(int64_t handle) {                          \
+  using graph_t = jasper::graph<cfg_##id>;                                   \
+  std::lock_guard<std::mutex> lock(g_mutex);                                \
+  auto& dm = dir_meta_map<graph_t>();                                       \
+  auto it = dm.find(handle);                                                \
+  if (it == dm.end()) return 0;                                            \
+  return (it->second.has_lsh ? 1 : 0) | (it->second.has_pq ? 2 : 0);        \
+}
+
+JASPER_FOR_EACH_DIRECTIONAL_CONFIG(DEFINE_DIRECTIONAL_OPS)
+#undef DEFINE_DIRECTIONAL_OPS
+
 // ── Free (config-agnostic via variant visit) ───────────────────
 void FreeGraph(int64_t handle) {
   std::lock_guard<std::mutex> lock(g_mutex);
   auto it = g_graphs.find(handle);
   TVM_FFI_ICHECK(it != g_graphs.end()) << "Invalid handle: " << handle;
 
-  std::visit([](auto& g) {
+  std::visit([handle](auto& g) {
     using T = std::decay_t<decltype(g)>;
     if constexpr (!std::is_same_v<T, std::monostate>) {
+      if constexpr (T::use_lsh) {
+        auto& dm = dir_meta_map<T>();
+        auto dit = dm.find(handle);
+        if (dit != dm.end()) {
+          if (dit->second.has_pq) dit->second.codebooks.free();
+          if (dit->second.d_rotation) cudaFree(dit->second.d_rotation);
+          dm.erase(dit);
+        }
+      }
       g.deallocate();
     }
   }, it->second);
@@ -269,6 +709,20 @@ int64_t GetDim(int64_t handle) {
 
 JASPER_FOR_EACH_CONFIG(EXPORT_OPS)
 #undef EXPORT_OPS
+
+#define EXPORT_DIRECTIONAL_OPS(id, ...)                                                              \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_construct_directional_##id, jasper_ffi::ConstructDirectionalGraph_##id); \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_build_lsh_##id,             jasper_ffi::BuildLsh_##id);                  \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_build_pq_##id,              jasper_ffi::BuildPq_##id);                   \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_directional_search_##id,    jasper_ffi::DirectionalSearch_##id);         \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_pq_search_##id,             jasper_ffi::PqSearch_##id);                  \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_save_directional_##id,      jasper_ffi::SaveDirectionalGraph_##id);      \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_load_directional_##id,      jasper_ffi::LoadDirectionalGraph_##id);      \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_get_vector_directional_##id, jasper_ffi::GetVectorDirectional_##id);     \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_get_directional_flags_##id, jasper_ffi::GetDirectionalFlags_##id);
+
+JASPER_FOR_EACH_DIRECTIONAL_CONFIG(EXPORT_DIRECTIONAL_OPS)
+#undef EXPORT_DIRECTIONAL_OPS
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_free_graph,    jasper_ffi::FreeGraph);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_get_n_vectors, jasper_ffi::GetNumVectors);
