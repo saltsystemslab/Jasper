@@ -80,7 +80,7 @@ if(JASPER_BUILD_CMD)
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
   )
   set_target_properties(create_index PROPERTIES
-    CUDA_ARCHITECTURES "89;90;120"
+    CUDA_ARCHITECTURES native
     CUDA_SEPARABLE_COMPILATION ON
   )
 
@@ -91,7 +91,7 @@ if(JASPER_BUILD_CMD)
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
   )
   set_target_properties(create_scale_index PROPERTIES
-    CUDA_ARCHITECTURES "89;90;120"
+    CUDA_ARCHITECTURES native
     CUDA_SEPARABLE_COMPILATION ON
   )
 
@@ -102,7 +102,7 @@ if(JASPER_BUILD_CMD)
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
   )
   set_target_properties(create_diskann_index PROPERTIES
-    CUDA_ARCHITECTURES "89;90;120"
+    CUDA_ARCHITECTURES native
     CUDA_SEPARABLE_COMPILATION ON
   )
 
@@ -113,7 +113,7 @@ if(JASPER_BUILD_CMD)
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
   )
   set_target_properties(create_lsh_index PROPERTIES
-    CUDA_ARCHITECTURES "89;120"
+    CUDA_ARCHITECTURES native
     CUDA_SEPARABLE_COMPILATION ON
   )
   # target_compile_definitions(create_lsh_index PRIVATE JASPER_PROFILE_CLOCKS)
@@ -125,7 +125,7 @@ if(JASPER_BUILD_CMD)
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
   )
   set_target_properties(run_query PROPERTIES
-    CUDA_ARCHITECTURES "89;90;120"
+    CUDA_ARCHITECTURES native
     CUDA_SEPARABLE_COMPILATION ON
   )
 endif()
@@ -171,7 +171,7 @@ if(JASPER_BUILD_FFI)
 
   # Set CUDA arch — adjust to your target GPU
   set_target_properties(jasper_ffi PROPERTIES
-    CUDA_ARCHITECTURES "80;89;90;120"
+    CUDA_ARCHITECTURES native
     CUDA_SEPARABLE_COMPILATION ON
   )
 

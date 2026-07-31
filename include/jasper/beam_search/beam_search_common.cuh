@@ -155,7 +155,7 @@ __device__ __forceinline__ float compute_qu_diff_and_exact(
 
 // ===== Helper: insertion-sort a new (u, exact_dist) into the top-k frontier =====
 // Single-threaded. Maintains frontier_buffer[0..count) sorted ascending by dist.
-__device__ __forceinline__ void frontier_insert_sorted(
+static __device__ __forceinline__ void frontier_insert_sorted(
     ENTRY_T   new_entry,
     float     new_dist,
     ENTRY_T*  frontier_buffer,

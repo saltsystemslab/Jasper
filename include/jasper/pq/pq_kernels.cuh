@@ -16,7 +16,7 @@ namespace jasper {
 // splitmix64-style hash, used to pick pseudo-random training points for
 // centroid initialization and empty-cluster reseeding (Math.random is not
 // available inside kernels and we want reproducibility from a seed).
-__device__ __forceinline__ uint64_t pq_hash(uint64_t x, uint64_t seed) {
+static __device__ __forceinline__ uint64_t pq_hash(uint64_t x, uint64_t seed) {
   x += seed + 0x9E3779B97F4A7C15ull;
   x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
   x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
