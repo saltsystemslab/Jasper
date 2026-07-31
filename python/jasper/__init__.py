@@ -55,7 +55,7 @@ def _resolve_config(
 
 
 # ── Directional (LSH + PQ) config registry ───────────────────────
-# Mirrors JASPER_FOR_EACH_DIRECTIONAL_CONFIG in ffi/jasper_ffi.cu. Unlike the
+# Mirrors JASPER_FOR_EACH_DIRECTIONAL_CONFIG in ffi/jasper_ffi_common.cuh. Unlike the
 # plain registry, the same (data_type, n_neighbors, distance, k_ranks) can map
 # to different compiled configs depending on dim — PACKED_T (7-bit vs 15-bit
 # packed coordinates) is chosen by dim bucket.

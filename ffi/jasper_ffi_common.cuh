@@ -1,3 +1,19 @@
+// jasper_ffi_common.cuh
+//
+// Shared declarations for the jasper_ffi target. This target's config matrix
+// (4 plain + 16 directional graph_configs) is too expensive to compile as one
+// translation unit — directional_search()/pq_search() alone each expand into
+// 10 full graph_beam_search_kernel instantiations per config (5
+// MAX_SEARCH_WIDTH branches x 2 GET_VISITED branches, see beam_search/api.cuh),
+// on top of construct_graph and the LSH/PQ pipeline kernels. So the actual
+// per-config op bodies (DEFINE_OPS / DEFINE_DIRECTIONAL_OPS) are only DEFINED
+// here as macros; each ffi/jasper_ffi_*.cu file includes this header and
+// invokes them for its own slice of the config table, so nvcc can compile
+// those files as independent, parallelizable translation units (the build
+// already sets -rdc=true / CUDA_SEPARABLE_COMPILATION ON for this target, so
+// the resulting device code links back together normally).
+#pragma once
+
 #include <tvm/ffi/tvm_ffi.h>
 #include <tvm/ffi/extra/c_env_api.h>
 #include <thrust/pair.h>
@@ -16,7 +32,7 @@ namespace jasper_ffi {
 
 namespace ffi = tvm::ffi;
 
-// ── Enumerate all configs ──────────────────────────────────────
+// ── Enumerate all plain configs ──────────────────────────────────
 // (CONFIG_ID, INDEX_T, N_NEIGHBORS, DATA_T, DISTANCE_T, DIST_FUNC)
 
 #define JASPER_FOR_EACH_CONFIG(X)                                              \
@@ -42,25 +58,45 @@ JASPER_FOR_EACH_CONFIG(DECLARE_CONSTRUCT_CONFIG)
 
 // ── Directional (LSH + PQ) configs ──────────────────────────────
 // (CONFIG_ID, INDEX_T, N_NEIGHBORS, DATA_T, DISTANCE_T, DIST_FUNC, K_RANKS, PACKED_T)
-// Mirrors cmd/create_lsh_index.cu's JASPER_FOR_EACH_CONFIG. PACKED_T is chosen
-// by dim bucket: uint8_t for dim<=128 (7-bit coord), uint16_t for dim>128.
-#define JASPER_FOR_EACH_DIRECTIONAL_CONFIG(X)                                  \
-  X(f16_r32_l2_k4_d128,   uint32_t, 32, __half, float, jasper::distance_func::L2, 4,  uint8_t)  \
-  X(f16_r32_l2_k16_d128,  uint32_t, 32, __half, float, jasper::distance_func::L2, 16, uint8_t)  \
-  X(f16_r32_l2_k4_d32678, uint32_t, 32, __half, float, jasper::distance_func::L2, 4,  uint16_t) \
-  X(f16_r32_l2_k16_d32678, uint32_t, 32, __half, float, jasper::distance_func::L2, 16,  uint16_t) \
-  X(f16_r64_l2_k4_d128,   uint32_t, 64, __half, float, jasper::distance_func::L2, 4,  uint8_t)  \
-  X(f16_r64_l2_k16_d128,  uint32_t, 64, __half, float, jasper::distance_func::L2, 16, uint8_t)  \
-  X(f16_r64_l2_k4_d32678, uint32_t, 64, __half, float, jasper::distance_func::L2, 4,  uint16_t) \
-  X(f16_r64_l2_k16_d32678, uint32_t, 64, __half, float, jasper::distance_func::L2, 16,  uint16_t) \
-  X(f16_r32_ip_k4_d128, uint32_t, 32, __half, float, jasper::distance_func::INNER_PRODUCT, 4, uint8_t) \
-  X(f16_r32_ip_k16_d128, uint32_t, 32, __half, float, jasper::distance_func::INNER_PRODUCT, 16, uint8_t) \
+// PACKED_T is chosen by dim bucket: uint8_t for dim<=128 (7-bit coord),
+// uint16_t for dim>128.
+//
+// Split into 4 buckets of 4 configs each (by distance x k_ranks) so each
+// bucket's ops can live in its own translation unit — see
+// ffi/jasper_ffi_directional_{l2,ip}_{k4,k16}.cu.
+#define JASPER_FOR_EACH_DIRECTIONAL_CONFIG_L2_K4(X)                            \
+  X(f16_r32_l2_k4_d128,   uint32_t, 32, __half, float, jasper::distance_func::L2, 4, uint8_t)  \
+  X(f16_r32_l2_k4_d32678, uint32_t, 32, __half, float, jasper::distance_func::L2, 4, uint16_t) \
+  X(f16_r64_l2_k4_d128,   uint32_t, 64, __half, float, jasper::distance_func::L2, 4, uint8_t)  \
+  X(f16_r64_l2_k4_d32678, uint32_t, 64, __half, float, jasper::distance_func::L2, 4, uint16_t)
+
+#define JASPER_FOR_EACH_DIRECTIONAL_CONFIG_L2_K16(X)                            \
+  X(f16_r32_l2_k16_d128,   uint32_t, 32, __half, float, jasper::distance_func::L2, 16, uint8_t)  \
+  X(f16_r32_l2_k16_d32678, uint32_t, 32, __half, float, jasper::distance_func::L2, 16, uint16_t) \
+  X(f16_r64_l2_k16_d128,   uint32_t, 64, __half, float, jasper::distance_func::L2, 16, uint8_t)  \
+  X(f16_r64_l2_k16_d32678, uint32_t, 64, __half, float, jasper::distance_func::L2, 16, uint16_t)
+
+#define JASPER_FOR_EACH_DIRECTIONAL_CONFIG_IP_K4(X)                             \
+  X(f16_r32_ip_k4_d128,   uint32_t, 32, __half, float, jasper::distance_func::INNER_PRODUCT, 4, uint8_t)  \
   X(f16_r32_ip_k4_d32678, uint32_t, 32, __half, float, jasper::distance_func::INNER_PRODUCT, 4, uint16_t) \
+  X(f16_r64_ip_k4_d128,   uint32_t, 64, __half, float, jasper::distance_func::INNER_PRODUCT, 4, uint8_t)  \
+  X(f16_r64_ip_k4_d32678, uint32_t, 64, __half, float, jasper::distance_func::INNER_PRODUCT, 4, uint16_t)
+
+#define JASPER_FOR_EACH_DIRECTIONAL_CONFIG_IP_K16(X)                            \
+  X(f16_r32_ip_k16_d128,   uint32_t, 32, __half, float, jasper::distance_func::INNER_PRODUCT, 16, uint8_t)  \
   X(f16_r32_ip_k16_d32678, uint32_t, 32, __half, float, jasper::distance_func::INNER_PRODUCT, 16, uint16_t) \
-  X(f16_r64_ip_k4_d128, uint32_t, 64, __half, float, jasper::distance_func::INNER_PRODUCT, 4, uint8_t) \
-  X(f16_r64_ip_k16_d128, uint32_t, 64, __half, float, jasper::distance_func::INNER_PRODUCT, 16, uint8_t) \
-  X(f16_r64_ip_k4_d32678, uint32_t, 64, __half, float, jasper::distance_func::INNER_PRODUCT, 4, uint16_t) \
+  X(f16_r64_ip_k16_d128,   uint32_t, 64, __half, float, jasper::distance_func::INNER_PRODUCT, 16, uint8_t)  \
   X(f16_r64_ip_k16_d32678, uint32_t, 64, __half, float, jasper::distance_func::INNER_PRODUCT, 16, uint16_t)
+
+// Full set — used only for type declarations that must span every
+// directional config (cfg_##id/construct_cfg_##id aliases, GraphVariant).
+// Actual op instantiation happens per-bucket in each
+// ffi/jasper_ffi_directional_*.cu (see DEFINE_DIRECTIONAL_OPS below).
+#define JASPER_FOR_EACH_DIRECTIONAL_CONFIG(X)  \
+  JASPER_FOR_EACH_DIRECTIONAL_CONFIG_L2_K4(X)  \
+  JASPER_FOR_EACH_DIRECTIONAL_CONFIG_L2_K16(X) \
+  JASPER_FOR_EACH_DIRECTIONAL_CONFIG_IP_K4(X)  \
+  JASPER_FOR_EACH_DIRECTIONAL_CONFIG_IP_K16(X)
 
 #define DECLARE_DIRECTIONAL_CONFIG(id, IDX, R, DAT, DIST, FUNC, KR, PACKEDT) \
   using cfg_##id = jasper::graph_config<IDX, R, DAT, DIST, FUNC, true, KR, PACKEDT>; \
@@ -71,7 +107,9 @@ JASPER_FOR_EACH_DIRECTIONAL_CONFIG(DECLARE_DIRECTIONAL_CONFIG)
 
 // ── Graph storage using variant ────────────────────────────────
 // Spans BOTH plain and directional configs, so plain and directional graphs
-// share one handle namespace/free path.
+// share one handle namespace/free path. Naming every alternative type here
+// is cheap (it doesn't instantiate any kernels) even though only a subset of
+// their ops are compiled in any one translation unit.
 #define VARIANT_ENTRY(id, ...) jasper::graph<cfg_##id>,
 using GraphVariant = std::variant<
   JASPER_FOR_EACH_CONFIG(VARIANT_ENTRY)
@@ -84,7 +122,11 @@ using GraphVariant = std::variant<
 // Templated on the concrete graph type (GRAPH_T = jasper::graph<cfg_id>), so
 // there's exactly one dir_meta_map<GRAPH_T>() per directional config — no
 // variant-of-globals/codebooks needed, and FreeGraph can clean it up
-// generically inside the std::visit over GraphVariant (see below).
+// generically inside the std::visit over GraphVariant (see
+// ffi/jasper_ffi_plain.cu). Being a template, this is safe to define here in
+// the shared header: identical instantiations across translation units are
+// merged by the linker like any other template (including the function-local
+// static in dir_meta_map), so there's still exactly one map per GRAPH_T.
 template <typename GRAPH_T>
 struct dir_meta {
   bool has_lsh   = false;
@@ -132,12 +174,18 @@ inline __half* rotate_query_batch(const __half* d_queries, uint32_t n_queries,
   return d_out;
 }
 
-static std::unordered_map<int64_t, GraphVariant> g_graphs;
-static int64_t g_next_handle = 0;
-static std::mutex g_mutex;
+// ── Global handle table ─────────────────────────────────────────
+// Shared by every config across every translation unit, so this must have
+// exactly one definition — see ffi/jasper_ffi_plain.cu.
+extern std::unordered_map<int64_t, GraphVariant> g_graphs;
+extern int64_t g_next_handle;
+extern std::mutex g_mutex;
 
 // ── Unpack kernel (shared across all configs) ──────────────────
-__global__ void unpack_results_kernel(
+// `static` so each translation unit that includes this header gets its own
+// private (internal-linkage) copy — trivially cheap to duplicate, and avoids
+// a device-link "multiple definition" across the split .cu files.
+static __global__ void unpack_results_kernel(
     const thrust::pair<uint32_t, float>* __restrict__ pairs,
     int32_t* __restrict__ out_indices,
     float* __restrict__ out_distances,
@@ -150,6 +198,7 @@ __global__ void unpack_results_kernel(
 }
 
 // ── Per-config load/search/construct implementations ───────────
+// Defined here as a macro only — invoked per-config in ffi/jasper_ffi_plain.cu.
 
 #define DEFINE_OPS(id, IDX, R, DAT, DIST, FUNC)                                \
                                                                                \
@@ -299,15 +348,14 @@ void Search_##id(int64_t handle,                                               \
   cudaFree(result.frontier);                                                   \
 }
 
-JASPER_FOR_EACH_CONFIG(DEFINE_OPS)
-#undef DEFINE_OPS
-
 // ── Per-config directional (LSH + PQ) implementations ───────────
 // Mirrors cmd/create_lsh_index.cu's pipeline: construct (optionally
 // prerotated) -> build_lsh (generate_lsh_globals + populate_edge_lsh) ->
 // build_pq (generate_pq_codebooks + populate_edge_pq + compute_vector_norms)
 // -> directional_search / pq_search. Each step is its own op so callers
 // choose which artifacts to build (see dir_meta's has_lsh/has_pq flags).
+// Defined here as a macro only — invoked per-bucket in each
+// ffi/jasper_ffi_directional_*.cu.
 
 #define DEFINE_DIRECTIONAL_OPS(id, IDX, R, DAT, DIST, FUNC, KR, PACKEDT)       \
                                                                                \
@@ -644,71 +692,19 @@ int64_t GetDirectionalFlags_##id(int64_t handle) {                          \
   return (it->second.has_lsh ? 1 : 0) | (it->second.has_pq ? 2 : 0);        \
 }
 
-JASPER_FOR_EACH_DIRECTIONAL_CONFIG(DEFINE_DIRECTIONAL_OPS)
-#undef DEFINE_DIRECTIONAL_OPS
+// ── Free / info (config-agnostic; defined once in ffi/jasper_ffi_plain.cu) ──
+void FreeGraph(int64_t handle);
+int64_t GetNumVectors(int64_t handle);
+int64_t GetDim(int64_t handle);
 
-// ── Free (config-agnostic via variant visit) ───────────────────
-void FreeGraph(int64_t handle) {
-  std::lock_guard<std::mutex> lock(g_mutex);
-  auto it = g_graphs.find(handle);
-  TVM_FFI_ICHECK(it != g_graphs.end()) << "Invalid handle: " << handle;
-
-  std::visit([handle](auto& g) {
-    using T = std::decay_t<decltype(g)>;
-    if constexpr (!std::is_same_v<T, std::monostate>) {
-      if constexpr (T::use_lsh) {
-        auto& dm = dir_meta_map<T>();
-        auto dit = dm.find(handle);
-        if (dit != dm.end()) {
-          if (dit->second.has_pq) dit->second.codebooks.free();
-          if (dit->second.d_rotation) cudaFree(dit->second.d_rotation);
-          dm.erase(dit);
-        }
-      }
-      g.deallocate();
-    }
-  }, it->second);
-
-  g_graphs.erase(it);
-}
-
-// ── Info (config-agnostic) ─────────────────────────────────────
-int64_t GetNumVectors(int64_t handle) {
-  std::lock_guard<std::mutex> lock(g_mutex);
-  auto it = g_graphs.find(handle);
-  TVM_FFI_ICHECK(it != g_graphs.end()) << "Invalid handle";
-  return std::visit([](auto& g) -> int64_t {
-    using T = std::decay_t<decltype(g)>;
-    if constexpr (!std::is_same_v<T, std::monostate>)
-      return static_cast<int64_t>(g.n_vectors);
-    else
-      return 0;
-  }, it->second);
-}
-
-int64_t GetDim(int64_t handle) {
-  std::lock_guard<std::mutex> lock(g_mutex);
-  auto it = g_graphs.find(handle);
-  TVM_FFI_ICHECK(it != g_graphs.end()) << "Invalid handle";
-  return std::visit([](auto& g) -> int64_t {
-    using T = std::decay_t<decltype(g)>;
-    if constexpr (!std::is_same_v<T, std::monostate>)
-      return static_cast<int64_t>(g.dim);
-    else
-      return 0;
-  }, it->second);
-}
-
-// ── Export all generated functions ──────────────────────────────
+// ── Export macros ────────────────────────────────────────────────
+// Invoked per-file, for whichever configs that file actually defined ops for.
 #define EXPORT_OPS(id, ...)                                                    \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_load_##id,      jasper_ffi::LoadGraph_##id);      \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_construct_##id,  jasper_ffi::ConstructGraph_##id); \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_search_##id,     jasper_ffi::Search_##id); \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_save_##id,       jasper_ffi::SaveGraph_##id); \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_get_vector_##id, jasper_ffi::GetVector_##id);
-
-JASPER_FOR_EACH_CONFIG(EXPORT_OPS)
-#undef EXPORT_OPS
 
 #define EXPORT_DIRECTIONAL_OPS(id, ...)                                                              \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_construct_directional_##id, jasper_ffi::ConstructDirectionalGraph_##id); \
@@ -721,11 +717,4 @@ JASPER_FOR_EACH_CONFIG(EXPORT_OPS)
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_get_vector_directional_##id, jasper_ffi::GetVectorDirectional_##id);     \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_get_directional_flags_##id, jasper_ffi::GetDirectionalFlags_##id);
 
-JASPER_FOR_EACH_DIRECTIONAL_CONFIG(EXPORT_DIRECTIONAL_OPS)
-#undef EXPORT_DIRECTIONAL_OPS
-
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_free_graph,    jasper_ffi::FreeGraph);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_get_n_vectors, jasper_ffi::GetNumVectors);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_get_dim,       jasper_ffi::GetDim);
-
-} // namespace jasper_ffi
+}  // namespace jasper_ffi

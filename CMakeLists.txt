@@ -144,7 +144,17 @@ if(JASPER_BUILD_FFI)
   find_package(tvm_ffi CONFIG REQUIRED)
 
   # Build the .so
-  add_library(jasper_ffi SHARED ffi/jasper_ffi.cu)
+  # Split across multiple .cu files so nvcc can compile the directional
+  # config buckets (each ~20 real kernel instantiations, see
+  # ffi/jasper_ffi_common.cuh) as independent, parallelizable translation
+  # units instead of one massive one.
+  add_library(jasper_ffi SHARED
+    ffi/jasper_ffi_plain.cu
+    ffi/jasper_ffi_directional_l2_k4.cu
+    ffi/jasper_ffi_directional_l2_k16.cu
+    ffi/jasper_ffi_directional_ip_k4.cu
+    ffi/jasper_ffi_directional_ip_k16.cu
+  )
   target_link_libraries(jasper_ffi PRIVATE 
     jasper 
     CUDA::cublas

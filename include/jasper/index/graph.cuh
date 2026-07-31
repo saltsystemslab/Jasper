@@ -1532,8 +1532,9 @@ __host__ void save_graph_to_file(const graph<graph_cfg>& g,
 // prerotated, or the rotation seed (graph_construct_params::prerotate /
 // prerotate_seed) — the estimator artifacts above don't need it, but the
 // caller does, to rotate queries at search time the same way the vectors
-// were rotated at build time. Right now the caller (see jasper_ffi.cu's
-// LoadDirectionalGraph_##id / python/jasper/__init__.py's Graph.load) must
+// were rotated at build time. Right now the caller (see
+// ffi/jasper_ffi_common.cuh's LoadDirectionalGraph_##id /
+// python/jasper/__init__.py's Graph.load) must
 // re-supply the same prerotate/prerotate_seed used at construction; get it
 // wrong and queries silently search un-rotated against a rotated index —
 // wrong results, no error. Fixing this properly means adding prerotate +
