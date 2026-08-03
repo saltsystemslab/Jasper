@@ -36,7 +36,29 @@ CPMAddPackage (
   GIT_TAG origin/master
 )
 
-add_subdirectory(external/gpu_error)
+# ── Feature flags (temporary) ──
+# Stable-id "label" layer (WarpSpeed-backed id<->slot map) and graph compaction
+# are both OFF by default: deletion path is mark_deleted + consolidate, and
+# without compaction slot==id so the label layer isn't needed.
+option(JASPER_STABLE_IDS    "Enable WarpSpeed-backed stable-id labels" OFF)
+option(JASPER_ENABLE_COMPACT "Enable graph compaction (compact())"     OFF)
+
+# WarpSpeed GPU hash tables — only needed when the stable-id layer is enabled.
+if(JASPER_STABLE_IDS)
+  CPMAddPackage(
+    NAME warpSpeed
+    GITHUB_REPOSITORY saltsystemslab/warpSpeed
+    GIT_TAG main
+    DOWNLOAD_ONLY YES
+    GIT_SUBMODULES ""      # benchmark deps (BGHT/SlabHash/warpcore) — not needed
+  )
+endif()
+
+# gpu_error is an optional submodule (debug logging helpers). jasper's own
+# sources don't depend on it, so only add it when the submodule is checked out.
+if(EXISTS "${PROJECT_SOURCE_DIR}/external/gpu_error/CMakeLists.txt")
+  add_subdirectory(external/gpu_error)
+endif()
 
 # ── Header-only library ──
 add_library(jasper INTERFACE)
@@ -45,6 +67,15 @@ target_include_directories(jasper
     $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
 )
+# Propagate the feature flags as compile definitions.
+target_compile_definitions(jasper INTERFACE
+  JASPER_STABLE_IDS=$<BOOL:${JASPER_STABLE_IDS}>
+  JASPER_ENABLE_COMPACT=$<BOOL:${JASPER_ENABLE_COMPACT}>
+)
+if(JASPER_STABLE_IDS)
+  target_include_directories(jasper INTERFACE
+    $<BUILD_INTERFACE:${warpSpeed_SOURCE_DIR}/include>)
+endif()
 target_compile_features(jasper INTERFACE cxx_std_17)
 target_compile_options(jasper
   INTERFACE
@@ -78,7 +109,18 @@ if(JASPER_BUILD_CMD)
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
   )
   set_target_properties(create_index PROPERTIES
-    CUDA_ARCHITECTURES ${CMAKE_CUDA_ARCHITECTURES}
+    CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
+    CUDA_SEPARABLE_COMPILATION ON
+  )
+
+  add_executable(sweep_batch_size cmd/sweep_batch_size.cu)
+  target_link_libraries(sweep_batch_size PRIVATE jasper)
+  set_target_properties(sweep_batch_size PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+  )
+  set_target_properties(sweep_batch_size PROPERTIES
+    CUDA_ARCHITECTURES "80;89;90;120"
     CUDA_SEPARABLE_COMPILATION ON
   )
 
@@ -89,7 +131,7 @@ if(JASPER_BUILD_CMD)
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
   )
   set_target_properties(create_scale_index PROPERTIES
-    CUDA_ARCHITECTURES ${CMAKE_CUDA_ARCHITECTURES}
+    CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
     CUDA_SEPARABLE_COMPILATION ON
   )
 
@@ -100,7 +142,7 @@ if(JASPER_BUILD_CMD)
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
   )
   set_target_properties(create_diskann_index PROPERTIES
-    CUDA_ARCHITECTURES ${CMAKE_CUDA_ARCHITECTURES}
+    CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
     CUDA_SEPARABLE_COMPILATION ON
   )
 
@@ -111,7 +153,7 @@ if(JASPER_BUILD_CMD)
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
   )
   set_target_properties(create_lsh_index PROPERTIES
-    CUDA_ARCHITECTURES ${CMAKE_CUDA_ARCHITECTURES}
+    CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
     CUDA_SEPARABLE_COMPILATION ON
   )
   # target_compile_definitions(create_lsh_index PRIVATE JASPER_PROFILE_CLOCKS)
@@ -123,7 +165,55 @@ if(JASPER_BUILD_CMD)
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
   )
   set_target_properties(run_query PROPERTIES
-    CUDA_ARCHITECTURES ${CMAKE_CUDA_ARCHITECTURES}
+    CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
+    CUDA_SEPARABLE_COMPILATION ON
+  )
+
+  add_executable(test_deletion cmd/test_deletion.cu)
+  target_link_libraries(test_deletion PRIVATE jasper)
+  set_target_properties(test_deletion PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+  )
+  set_target_properties(test_deletion PROPERTIES
+    CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
+    CUDA_SEPARABLE_COMPILATION ON
+  )
+
+  # test_idmap exercises the WarpSpeed table API directly, so it only builds
+  # when the stable-id layer is enabled.
+  if(JASPER_STABLE_IDS)
+    add_executable(test_idmap cmd/test_idmap.cu)
+    target_link_libraries(test_idmap PRIVATE jasper)
+    set_target_properties(test_idmap PROPERTIES
+      CUDA_SEPARABLE_COMPILATION ON
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    )
+    set_target_properties(test_idmap PROPERTIES
+      CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
+      CUDA_SEPARABLE_COMPILATION ON
+    )
+  endif()
+
+  add_executable(test_append cmd/test_append.cu)
+  target_link_libraries(test_append PRIVATE jasper)
+  set_target_properties(test_append PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+  )
+  set_target_properties(test_append PROPERTIES
+    CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
+    CUDA_SEPARABLE_COMPILATION ON
+  )
+
+  add_executable(bench_all cmd/bench_all.cu)
+  target_link_libraries(bench_all PRIVATE jasper)
+  set_target_properties(bench_all PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+  )
+  set_target_properties(bench_all PROPERTIES
+    CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
     CUDA_SEPARABLE_COMPILATION ON
   )
 endif()
@@ -168,7 +258,7 @@ if(JASPER_BUILD_FFI)
   tvm_ffi_configure_target(jasper_ffi)
 
   set_target_properties(jasper_ffi PROPERTIES
-    CUDA_ARCHITECTURES ${CMAKE_CUDA_ARCHITECTURES}
+    CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
     CUDA_SEPARABLE_COMPILATION ON
   )
 

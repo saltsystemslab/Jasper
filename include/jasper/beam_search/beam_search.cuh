@@ -200,12 +200,23 @@ __global__ void beam_search_kernel(
     _CLK_REC(clk_clip_k);
   }
 
-  // copy to the external result
-  for (uint i=threadIdx.x; i<k; i += blockDim.x) {
-    frontier_results[query_id * k + i].first =
-        get_index(result_buffer[i]);
-    frontier_results[query_id * k + i].second =
-        get_distance(result_buffer[i]);
+  // copy to the external result, skipping any soft-deleted vertices so they
+  // never surface in search results (matches JasperGPUANNS beam search).
+  if (threadIdx.x == 0) {
+    const uint32_t buf_count = result_buffer_count[0];
+    uint32_t out = 0;
+    for (uint32_t i = 0; i < buf_count && out < k; i++) {
+      uint32_t idx = get_index(result_buffer[i]);
+      if (!graph.is_valid(idx)) continue;       // empty / out-of-range slot
+      if (graph.is_deleted(idx)) continue;       // soft-deleted
+      frontier_results[query_id * k + out].first  = idx;
+      frontier_results[query_id * k + out].second = get_distance(result_buffer[i]);
+      out++;
+    }
+    for (uint32_t i = out; i < k; i++) {
+      frontier_results[query_id * k + i].first  = std::numeric_limits<INDEX_T>::max();
+      frontier_results[query_id * k + i].second = static_cast<DISTANCE_T>(1e30f);
+    }
   }
   if (threadIdx.x == 0 && GET_VISITED) {
     visited_counts[query_id] = visited_counter;

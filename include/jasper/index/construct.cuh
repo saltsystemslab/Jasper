@@ -2,6 +2,7 @@
 
 #include <cstdlib>
 #include <cstdint>
+#include <chrono>
 #include <iostream>
 #include <type_traits>
 #include <vector>
@@ -18,6 +19,7 @@
 
 #include "jasper/index/graph.cuh"
 #include "jasper/index/vector.cuh"
+#include "jasper/index/id_map.cuh"
 #include "jasper/beam_search/beam_search.cuh"
 #include "jasper/index/utils.cuh"
 #include "jasper/rotation/rotation.cuh"
@@ -925,14 +927,24 @@ __host__ void construction_round(
     batch_size = std::min(batch_size, graph.n_vectors - count);
     batch_size = std::min(batch_size, max_batch_size);
 
+#ifdef JASPER_TIME_BATCH
+    auto batch_t0 = std::chrono::steady_clock::now();
+#endif
+
     process_batch<CONSTRUCT_GRAPH_CONFIG, BEAM_SEARCH_CONFIG>(
         graph, ws, count, batch_size, alpha, timer, stream);
 
     count += batch_size;
 
+#ifdef JASPER_TIME_BATCH
+    auto batch_t1 = std::chrono::steady_clock::now();
+    double batch_ms = std::chrono::duration<double, std::milli>(batch_t1 - batch_t0).count();
+    std::printf("[construct] batch %u vectors constructed in %.3f ms\n", batch_size, batch_ms);
+#else
     std::printf("\r[construct] %u / %u (%.1f%%)", count, graph.n_vectors,
                 100.0f * count / graph.n_vectors);
     std::fflush(stdout);
+#endif
 
     if (batch_size < max_batch_size) {
       batch_size = std::min(max_batch_size, batch_size * 2);
@@ -1142,7 +1154,117 @@ __host__ graph<typename CONSTRUCT_GRAPH_CONFIG::graph_cfg_t> construct_graph(
   second_round_timer.print();
 
   ws.free();
+
+  // Assign stable ids (identity at construction) and build the forward table.
+  assign_identity_ids_and_build<typename CONSTRUCT_GRAPH_CONFIG::graph_cfg_t>(g);
+
   return g;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Live batch append: insert `new_vectors` (device-resident, padded like the
+// graph) into an existing graph, wiring their edges with the same machinery as
+// construction (process_batch), and assign each a fresh monotonic stable id.
+// Returns the assigned ids in input order. The graph must be device-resident
+// with global_offset == 0.
+// ─────────────────────────────────────────────────────────────────────────
+template <typename CONSTRUCT_GRAPH_CONFIG>
+__host__ std::vector<typename CONSTRUCT_GRAPH_CONFIG::index_t>
+append_batch(typename CONSTRUCT_GRAPH_CONFIG::graph_t& g,
+             typename CONSTRUCT_GRAPH_CONFIG::vector_view_t new_vectors,
+             float alpha = 1.2f,
+             uint32_t max_batch_size = 0,
+             cudaStream_t stream = 0) {
+  using graph_cfg_t = typename CONSTRUCT_GRAPH_CONFIG::graph_cfg_t;
+  using graph_t     = typename CONSTRUCT_GRAPH_CONFIG::graph_t;
+  using index_t     = typename graph_cfg_t::index_t;
+  using data_t      = typename graph_cfg_t::data_t;
+  using segment_t   = graph_segment<graph_cfg_t>;
+  constexpr uint32_t VPS = graph_t::vectors_per_segment;
+
+  const index_t count = static_cast<index_t>(new_vectors.n_vectors);
+  std::vector<index_t> ids;
+  if (count == 0) return ids;
+  if (g.on_host)        throw std::runtime_error("append_batch requires graph on device");
+  if (g.global_offset != 0) throw std::runtime_error("append_batch requires global_offset == 0");
+  if (new_vectors.dim != g.dim) throw std::runtime_error("append_batch: dim mismatch");
+
+  const index_t  old_n      = g.n_vectors;
+  const index_t  new_n      = old_n + count;
+  const uint32_t padded_dim = vector_view<data_t>::pad(g.dim);
+
+  // 1. Grow segment storage if needed and place the new vectors into slots
+  //    [old_n, new_n), extending each touched segment's n_vectors.
+  {
+    std::vector<segment_t> h_segs(g.segments.begin(), g.segments.end());
+    uint32_t needed_segments =
+        static_cast<uint32_t>((new_n + VPS - 1) / VPS);
+    for (uint32_t s = g.n_segments; s < needed_segments; s++)
+      h_segs.push_back(segment_t::allocate(g.dim, /*on_host=*/false));
+
+    index_t copied = 0;
+    for (index_t global = old_n; global < new_n; ) {
+      uint32_t seg   = graph_t::segment_of(global);
+      uint32_t local = graph_t::local_of(global);
+      uint32_t avail = VPS - local;
+      uint32_t cnt   = static_cast<uint32_t>(
+          std::min<index_t>(avail, new_n - global));
+
+      cudaMemcpyAsync(
+          h_segs[seg].vectors.data + static_cast<size_t>(local) * padded_dim,
+          new_vectors.data + static_cast<size_t>(copied) * padded_dim,
+          static_cast<size_t>(cnt) * padded_dim * sizeof(data_t),
+          cudaMemcpyDeviceToDevice, stream);
+      h_segs[seg].n_vectors = local + cnt;
+
+      global += cnt;
+      copied += cnt;
+    }
+    cudaStreamSynchronize(stream);
+
+    g.n_segments = needed_segments;
+    g.n_vectors  = new_n;
+    // Re-upload so device-side segment structs see new pointers + n_vectors.
+    g.segments = thrust::device_vector<segment_t>(h_segs.begin(), h_segs.end());
+  }
+
+  // 2. Build edges for the appended range with the construction machinery.
+  if (max_batch_size == 0)
+    max_batch_size = static_cast<uint32_t>(std::min<index_t>(count, 100000));
+  {
+    constexpr uint32_t beam_search_tile_size  = 4;
+    constexpr uint32_t beam_search_block_size = 64;
+    using beam_search_cfg = beam_search_config<
+        graph_cfg_t, graph_cfg_t::dist_func, beam_search_block_size, true,
+        CONSTRUCT_GRAPH_CONFIG::beam_search_max_search_width,
+        beam_search_tile_size,
+        CONSTRUCT_GRAPH_CONFIG::beam_search_max_result_size>;
+
+    auto ws = graph_construct_workspace<CONSTRUCT_GRAPH_CONFIG>::allocate(max_batch_size);
+    construct_timer timer;
+    for (index_t off = old_n; off < new_n; ) {
+      uint32_t bsize = static_cast<uint32_t>(
+          std::min<index_t>(max_batch_size, new_n - off));
+      process_batch<CONSTRUCT_GRAPH_CONFIG, beam_search_cfg>(
+          g, ws, static_cast<uint32_t>(off), bsize, alpha, timer, stream);
+      off += bsize;
+    }
+    ws.free();
+  }
+
+  // 3. Reserve ids, write the reverse map for the new slots, then add them to
+  //    the forward table incrementally (upsert), resizing only if capacity is
+  //    exceeded (geometric growth, so appends are amortized O(batch)).
+  ids = assign_ids<graph_cfg_t>(g, count);
+  {
+    uint32_t BLK = 256, grid = (uint32_t)((count + BLK - 1) / BLK);
+    set_id_range_kernel<graph_cfg_t><<<grid, BLK>>>(
+        g.view(), old_n, ids.front(), count);
+    cudaDeviceSynchronize();
+  }
+  id_map_add_range<graph_cfg_t>(g, old_n, count);
+
+  return ids;
 }
 
 }

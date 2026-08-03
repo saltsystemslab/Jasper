@@ -20,6 +20,20 @@
 #include "assert.h"
 #include "stdio.h"
 
+// ── Feature flags (temporary) ───────────────────────────────────────────────
+// JASPER_STABLE_IDS: when 0, the WarpSpeed-backed stable-id "label" layer is
+//   compiled out entirely. Without compaction, internal slot == stable id
+//   (identity), so search/delete/get_vector operate directly on slots.
+// JASPER_ENABLE_COMPACT: when 0, compact() is disabled (deletion path is
+//   mark_deleted + consolidate only). slots are never renumbered, which is what
+//   makes the identity id==slot hold and lets the label layer be turned off.
+#ifndef JASPER_STABLE_IDS
+#define JASPER_STABLE_IDS 0
+#endif
+#ifndef JASPER_ENABLE_COMPACT
+#define JASPER_ENABLE_COMPACT 0
+#endif
+
 namespace jasper {
   
 template <typename INDEX_T, uint32_t N_NEIGHBORS>
@@ -95,6 +109,21 @@ struct graph_segment {
   edge_lsh_list_t* edge_lshs; // only enabled if USE_LSH
   edge_pq_list_t*  edge_pqs;  // PQ codes; only enabled if USE_LSH (directional)
 
+  // Deletion support: 1 BIT per slot (packed), 1 = soft-deleted. Word w covers
+  // slots [32w, 32w+32); slot i is bit (i & 31) of deleted_bits[i >> 5]. 8x
+  // smaller than a byte per slot. Preallocated + zeroed alongside edge_counts
+  // so it rides along with move_to/copy_to; set/cleared atomically on device.
+  uint32_t *deleted_bits;
+
+  // Number of 32-bit words needed to hold n deletion bits.
+  __host__ __device__ static constexpr uint64_t deleted_words(uint64_t n) {
+    return (n + 31) / 32;
+  }
+
+  // Stable-id support: reverse map slot -> stable external id, one index_t per
+  // slot. Preallocated to INVALID and migrated/copied like deleted/edge_counts.
+  index_t *slot_to_id;
+
   // if on_host is true, the data is allocated on cpu pinned memory
   bool on_host = false;
 
@@ -112,10 +141,18 @@ struct graph_segment {
         check(cudaMallocHost(&seg.edges, max_vectors * sizeof(edge_list_t)), "cudaMallocHost(edges)");
         check(cudaMallocHost(&seg.edge_counts, max_vectors * sizeof(uint8_t)), "cudaMallocHost(edge_counts)");
         std::memset(seg.edge_counts, 0, max_vectors * sizeof(uint8_t));
+        check(cudaMallocHost(&seg.deleted_bits, deleted_words(max_vectors) * sizeof(uint32_t)), "cudaMallocHost(deleted_bits)");
+        std::memset(seg.deleted_bits, 0, deleted_words(max_vectors) * sizeof(uint32_t));
+        check(cudaMallocHost(&seg.slot_to_id, max_vectors * sizeof(index_t)), "cudaMallocHost(slot_to_id)");
+        std::memset(seg.slot_to_id, 0xFF, max_vectors * sizeof(index_t));  // INVALID
     } else {
         check(cudaMalloc(&seg.edges, max_vectors * sizeof(edge_list_t)), "cudaMalloc(edges)");
         check(cudaMalloc(&seg.edge_counts, max_vectors * sizeof(uint8_t)), "cudaMalloc(edge_counts)");
         check(cudaMemset(seg.edge_counts, 0, max_vectors * sizeof(uint8_t)), "cudaMemset(edge_counts)");
+        check(cudaMalloc(&seg.deleted_bits, deleted_words(max_vectors) * sizeof(uint32_t)), "cudaMalloc(deleted_bits)");
+        check(cudaMemset(seg.deleted_bits, 0, deleted_words(max_vectors) * sizeof(uint32_t)), "cudaMemset(deleted_bits)");
+        check(cudaMalloc(&seg.slot_to_id, max_vectors * sizeof(index_t)), "cudaMalloc(slot_to_id)");
+        check(cudaMemset(seg.slot_to_id, 0xFF, max_vectors * sizeof(index_t)), "cudaMemset(slot_to_id)");
     }
 
     seg.vectors = vector_view_t::allocate(dim, max_vectors, on_host);
@@ -175,9 +212,13 @@ struct graph_segment {
     if (on_host) {
         cudaFreeHost(edges);
         cudaFreeHost(edge_counts);
+        cudaFreeHost(deleted_bits);
+        cudaFreeHost(slot_to_id);
     } else {
         cudaFree(edges);
         cudaFree(edge_counts);
+        cudaFree(deleted_bits);
+        cudaFree(slot_to_id);
     }
     if constexpr (graph_cfg::use_lsh) {
       if (on_host) cudaFreeHost(edge_lshs); else cudaFree(edge_lshs);
@@ -188,6 +229,8 @@ struct graph_segment {
     vectors.deallocate();
     edges = nullptr;
     edge_counts = nullptr;
+    deleted_bits = nullptr;
+    slot_to_id = nullptr;
     n_vectors = 0;
   }
 
@@ -205,6 +248,8 @@ struct graph_segment {
     // Allocate new buffers on the target side (same capacity as allocate()).
     edge_list_t* new_edges       = nullptr;
     uint8_t*     new_edge_counts = nullptr;
+    uint32_t*    new_deleted     = nullptr;
+    index_t*     new_slot_to_id  = nullptr;
     edge_lsh_list_t* new_edge_lshs = nullptr;
     edge_pq_list_t*  new_edge_pqs  = nullptr;
 
@@ -212,6 +257,10 @@ struct graph_segment {
       cudaMallocHost(&new_edges,       max_vectors * sizeof(edge_list_t));
       cudaMallocHost(&new_edge_counts, max_vectors * sizeof(uint8_t));
       std::memset(new_edge_counts, 0,  max_vectors * sizeof(uint8_t));
+      cudaMallocHost(&new_deleted,     deleted_words(max_vectors) * sizeof(uint32_t));
+      std::memset(new_deleted, 0,      deleted_words(max_vectors) * sizeof(uint32_t));
+      cudaMallocHost(&new_slot_to_id,  max_vectors * sizeof(index_t));
+      std::memset(new_slot_to_id, 0xFF, max_vectors * sizeof(index_t));
       if constexpr (graph_cfg::use_lsh) {
         if (edge_lshs != nullptr)
           cudaMallocHost(&new_edge_lshs, max_vectors * sizeof(edge_lsh_list_t));
@@ -223,6 +272,12 @@ struct graph_segment {
       cudaMalloc(&new_edge_counts, max_vectors * sizeof(uint8_t));
       cudaMemsetAsync(new_edge_counts, 0,
                       max_vectors * sizeof(uint8_t), stream);
+      cudaMalloc(&new_deleted,     deleted_words(max_vectors) * sizeof(uint32_t));
+      cudaMemsetAsync(new_deleted, 0,
+                      deleted_words(max_vectors) * sizeof(uint32_t), stream);
+      cudaMalloc(&new_slot_to_id,  max_vectors * sizeof(index_t));
+      cudaMemsetAsync(new_slot_to_id, 0xFF,
+                      max_vectors * sizeof(index_t), stream);
       if constexpr (graph_cfg::use_lsh) {
         if (edge_lshs != nullptr)
           cudaMalloc(&new_edge_lshs, max_vectors * sizeof(edge_lsh_list_t));
@@ -240,6 +295,12 @@ struct graph_segment {
                       copy_kind, stream);
       cudaMemcpyAsync(new_edge_counts, edge_counts,
                       static_cast<size_t>(n_vectors) * sizeof(uint8_t),
+                      copy_kind, stream);
+      cudaMemcpyAsync(new_deleted, deleted_bits,
+                      deleted_words(n_vectors) * sizeof(uint32_t),
+                      copy_kind, stream);
+      cudaMemcpyAsync(new_slot_to_id, slot_to_id,
+                      static_cast<size_t>(n_vectors) * sizeof(index_t),
                       copy_kind, stream);
       if constexpr (graph_cfg::use_lsh) {
         if (edge_lshs != nullptr)
@@ -261,10 +322,14 @@ struct graph_segment {
     if (on_host) {
       cudaFreeHost(edges);
       cudaFreeHost(edge_counts);
+      cudaFreeHost(deleted_bits);
+      cudaFreeHost(slot_to_id);
       if constexpr (graph_cfg::use_lsh) { cudaFreeHost(edge_lshs); cudaFreeHost(edge_pqs); }
     } else {
       cudaFree(edges);
       cudaFree(edge_counts);
+      cudaFree(deleted_bits);
+      cudaFree(slot_to_id);
       if constexpr (graph_cfg::use_lsh) { cudaFree(edge_lshs); cudaFree(edge_pqs); }
     }
     vectors.deallocate();
@@ -272,7 +337,12 @@ struct graph_segment {
     // Install new buffers.
     edges       = new_edges;
     edge_counts = new_edge_counts;
+
+    deleted_bits = new_deleted;
+    slot_to_id  = new_slot_to_id;
+
     if constexpr (graph_cfg::use_lsh) { edge_lshs = new_edge_lshs; edge_pqs = new_edge_pqs; }
+
     vectors     = new_vectors;
     on_host     = target_on_host;
   }
@@ -304,6 +374,12 @@ struct graph_segment {
                       kind, stream);
       cudaMemcpyAsync(target.edge_counts, edge_counts,
                       static_cast<size_t>(n_vectors) * sizeof(uint8_t),
+                      kind, stream);
+      cudaMemcpyAsync(target.deleted_bits, deleted_bits,
+                      deleted_words(n_vectors) * sizeof(uint32_t),
+                      kind, stream);
+      cudaMemcpyAsync(target.slot_to_id, slot_to_id,
+                      static_cast<size_t>(n_vectors) * sizeof(index_t),
                       kind, stream);
       if constexpr (graph_cfg::use_lsh) {
         if (edge_lshs != nullptr) {
@@ -377,6 +453,34 @@ struct graph_segment {
   }
 
   __device__ __forceinline__
+  bool is_deleted(uint32_t local_idx) const {
+    assert(local_idx < static_cast<uint32_t>(n_vectors));
+    return (deleted_bits[local_idx >> 5] >> (local_idx & 31u)) & 1u;
+  }
+
+  // Atomic so concurrent set/clear of different bits in the same word are safe.
+  __device__ __forceinline__
+  void set_deleted(uint32_t local_idx, uint8_t value) {
+    assert(local_idx < static_cast<uint32_t>(n_vectors));
+    uint32_t* word = &deleted_bits[local_idx >> 5];
+    uint32_t mask  = 1u << (local_idx & 31u);
+    if (value) atomicOr(word, mask);
+    else       atomicAnd(word, ~mask);
+  }
+
+  __device__ __forceinline__
+  index_t get_stable_id(uint32_t local_idx) const {
+    assert(local_idx < static_cast<uint32_t>(n_vectors));
+    return slot_to_id[local_idx];
+  }
+
+  __device__ __forceinline__
+  void set_stable_id(uint32_t local_idx, index_t id) {
+    assert(local_idx < static_cast<uint32_t>(n_vectors));
+    slot_to_id[local_idx] = id;
+  }
+
+  __device__ __forceinline__
   void set_neighbor(uint32_t local_idx, uint8_t neighbor_idx, index_t neighbor) {
     assert(local_idx < static_cast<uint32_t>(n_vectors));
     assert(neighbor_idx < n_neighbors);
@@ -420,6 +524,20 @@ struct graph {
   // Device array, computed post-build via compute_vector_norms(); used by the PQ
   // L2 estimator to reconstruct ||q-v||² with the exact ||v||². nullptr until set.
   float* d_vector_norms = nullptr;
+  
+  // Deletion bookkeeping. n_deleted counts soft-deleted vectors not yet
+  // consolidated away; consolidation_threshold is the n_deleted/n_live ratio
+  // above which maybe_consolidate() triggers.
+  index_t n_deleted = 0;
+  double  consolidation_threshold = 0.1;
+
+  // Stable-id support. next_id is the monotonic counter for the next id to
+  // hand out (assign_ids). id_map is the forward stable_id -> slot table
+  // (a jasper::id_map_t<index_t>*, stored type-erased so this header stays
+  // free of the WarpSpeed dependency; id_map.cuh holds the typed accessors).
+  index_t next_id = 0;
+  void*   id_map  = nullptr;
+  uint64_t id_map_capacity = 0;  // entries the forward table can hold
 
   thrust::device_vector<segment_t> segments;
 
@@ -784,6 +902,34 @@ struct graph {
       index_t local_idx = to_local(global_idx);
       assert(local_idx < n_vectors && "global_idx out of bounds");
       segments[segment_of(local_idx)].set_edge_count(local_of(local_idx), count);
+    }
+
+    __device__ __forceinline__
+    bool is_deleted(index_t global_idx) const {
+      index_t local_idx = to_local(global_idx);
+      assert(local_idx < n_vectors && "global_idx out of bounds");
+      return segments[segment_of(local_idx)].is_deleted(local_of(local_idx));
+    }
+
+    __device__ __forceinline__
+    void set_deleted(index_t global_idx, uint8_t value) {
+      index_t local_idx = to_local(global_idx);
+      assert(local_idx < n_vectors && "global_idx out of bounds");
+      segments[segment_of(local_idx)].set_deleted(local_of(local_idx), value);
+    }
+
+    __device__ __forceinline__
+    index_t get_stable_id(index_t global_idx) const {
+      index_t local_idx = to_local(global_idx);
+      assert(local_idx < n_vectors && "global_idx out of bounds");
+      return segments[segment_of(local_idx)].get_stable_id(local_of(local_idx));
+    }
+
+    __device__ __forceinline__
+    void set_stable_id(index_t global_idx, index_t id) {
+      index_t local_idx = to_local(global_idx);
+      assert(local_idx < n_vectors && "global_idx out of bounds");
+      segments[segment_of(local_idx)].set_stable_id(local_of(local_idx), id);
     }
 
     __device__ __forceinline__
@@ -1311,15 +1457,30 @@ __host__ graph<graph_cfg> load_graph_from_file(std::string input_fname,
   const uint32_t n_segments =
       static_cast<uint32_t>((big_n_vectors + vector_per_segment - 1) / vector_per_segment);
 
-  // One node on disk: [vector: dim*data_t][count: u8][edges: edge_list_t]
-  const size_t data_per_node =
-      sizeof(data_t) * dim + sizeof(uint8_t) + sizeof(edge_list_t);
-
-  // Sanity check against the header field (optional but cheap).
-  if (bytes_per_node != data_per_node) {
-    std::cerr << "WARNING: computed bytes_per_node (" << data_per_node
-              << ") != header (" << bytes_per_node << ")\n";
+  // Detect per-node columns by bytes_per_node. Layouts that have shipped:
+  //   legacy:        vector + edge_count + edge_list
+  //   +deleted:      ... + deleted(1B)                                (byte-inline)
+  //   +deleted+id:   ... + deleted(1B) + slot_to_id(index_t)          (byte-inline)
+  //   bitpacked+id:  ... + slot_to_id(index_t), deletion as a packed  (current)
+  //                  ceil(N/8)-byte bitmask block after all records
+  const uint64_t bpn_base         = sizeof(data_t) * dim + sizeof(uint8_t) + sizeof(edge_list_t);
+  const uint64_t bpn_with_deleted = bpn_base + sizeof(uint8_t);
+  const uint64_t bpn_with_id      = bpn_with_deleted + sizeof(index_t);
+  const uint64_t bpn_bitpacked    = bpn_base + sizeof(index_t);  // id inline, no deleted byte
+  const bool bitpacked_deleted  = (bytes_per_node == bpn_bitpacked);
+  const bool has_id_column      = (bytes_per_node == bpn_with_id) || bitpacked_deleted;
+  const bool has_inline_deleted = (bytes_per_node == bpn_with_id) || (bytes_per_node == bpn_with_deleted);
+  const bool has_deleted_column = has_inline_deleted || bitpacked_deleted;
+  if (!has_deleted_column && bytes_per_node != bpn_base) {
+    std::cerr << "Warning: bytes_per_node=" << bytes_per_node
+              << " matches none of legacy(" << bpn_base << ")/+del("
+              << bpn_with_deleted << ")/+id(" << bpn_with_id
+              << ")/bitpacked(" << bpn_bitpacked << "); assuming legacy layout.\n";
   }
+  // Per-node record size on disk == bytes_per_node itself (the trailing
+  // bit-packed deletion block and next_id counter are file-level, not
+  // per-node).
+  const size_t data_per_node = static_cast<size_t>(bytes_per_node);
 
   const cudaMemcpyKind copy_kind =
       on_host ? cudaMemcpyHostToHost : cudaMemcpyHostToDevice;
@@ -1332,12 +1493,17 @@ __host__ graph<graph_cfg> load_graph_from_file(std::string input_fname,
   data_t*      h_vectors = nullptr;
   edge_list_t* h_edges   = nullptr;
   uint8_t*     h_counts  = nullptr;
+  index_t*     h_ids     = nullptr;
   if (!on_host) {
     cudaMallocHost(&h_vectors, sizeof(data_t)      * vector_per_segment * padded_dim);
     cudaMallocHost(&h_edges,   sizeof(edge_list_t) * vector_per_segment);
     cudaMallocHost(&h_counts,  sizeof(uint8_t)     * vector_per_segment);
+    cudaMallocHost(&h_ids,     sizeof(index_t)     * vector_per_segment);
   }
+  // Per-slot inline-deleted byte staging, reused across segments.
+  std::vector<uint8_t> h_deleted_byte(vector_per_segment, 0);
 
+  uint64_t n_deleted_loaded = 0;
   std::vector<segment_t> h_segments(n_segments);
 
   for (uint32_t s = 0; s < n_segments; s++) {
@@ -1355,28 +1521,26 @@ __host__ graph<graph_cfg> load_graph_from_file(std::string input_fname,
       exit(EXIT_FAILURE);
     }
 
-    // 2. Allocate this segment's destination (host or device).
+    // 2. Allocate this segment's destination (host or device). Covers
+    //    vectors/edges/edge_counts/deleted_bits/slot_to_id in one shot
+    //    (deleted_bits zeroed, slot_to_id filled with INVALID).
     segment_t& seg = h_segments[s];
+    seg = segment_t::allocate(dim, on_host);
     seg.n_vectors = static_cast<index_t>(seg_count);
-    seg.on_host   = on_host;
-    seg.vectors   = vector_view_t::allocate(dim, vector_per_segment, on_host);
-    if (on_host) {
-      cudaMallocHost(&seg.edges,       vector_per_segment * sizeof(edge_list_t));
-      cudaMallocHost(&seg.edge_counts, vector_per_segment * sizeof(uint8_t));
-    } else {
-      cudaMalloc(&seg.edges,       vector_per_segment * sizeof(edge_list_t));
-      cudaMalloc(&seg.edge_counts, vector_per_segment * sizeof(uint8_t));
-    }
 
     // 3. Scatter target: straight into the host segment, or into pinned
     //    staging when the segment lives on the device.
     data_t*      vec_dst   = on_host ? seg.vectors.data : h_vectors;
     edge_list_t* edge_dst  = on_host ? seg.edges        : h_edges;
     uint8_t*     count_dst = on_host ? seg.edge_counts  : h_counts;
+    index_t*     id_dst    = on_host ? seg.slot_to_id   : h_ids;
 
-    // Zero vector padding + unused tail rows, and all edge counts.
-    std::memset(vec_dst,   0, sizeof(data_t)  * vector_per_segment * padded_dim);
-    std::memset(count_dst, 0, sizeof(uint8_t) * vector_per_segment);
+    // Zero vector padding + unused tail rows, all edge counts, and mark the
+    // id tail as INVALID (0xFF pattern matches graph_segment::allocate).
+    std::memset(vec_dst,   0,    sizeof(data_t)  * vector_per_segment * padded_dim);
+    std::memset(count_dst, 0,    sizeof(uint8_t) * vector_per_segment);
+    std::memset(id_dst,    0xFF, sizeof(index_t) * vector_per_segment);
+    std::fill(h_deleted_byte.begin(), h_deleted_byte.end(), 0);
 
     // 4. Scatter interleaved -> separated layout (CPU only, parallel).
     #pragma omp parallel for schedule(static)
@@ -1388,9 +1552,34 @@ __host__ graph<graph_cfg> load_graph_from_file(std::string input_fname,
       count_dst[i] = *p;
       p += sizeof(uint8_t);
       std::memcpy(&edge_dst[i], p, sizeof(edge_list_t));
+      p += sizeof(edge_list_t);
+      if (has_inline_deleted) {
+        h_deleted_byte[i] = *p;
+        p += sizeof(uint8_t);
+      }
+      if (has_id_column) {
+        std::memcpy(&id_dst[i], p, sizeof(index_t));
+      } else {
+        id_dst[i] = static_cast<index_t>(seg_begin + i);  // legacy: identity ids
+      }
     }
 
-    // 5. For device segments, push it over in 3 bulk synchronous copies.
+    // Byte-inline deletion layouts: pack this segment's per-slot deletion
+    // bytes into a local bitmask (bit j == local slot j) and copy it in.
+    // (Bit-packed layout is handled in one pass after the segment loop.)
+    if (has_inline_deleted) {
+      std::vector<uint32_t> seg_bits(segment_t::deleted_words(seg_count), 0u);
+      for (uint32_t j = 0; j < seg_count; j++) {
+        if (h_deleted_byte[j]) {
+          seg_bits[j >> 5] |= (1u << (j & 31u));
+          n_deleted_loaded++;
+        }
+      }
+      cudaMemcpy(seg.deleted_bits, seg_bits.data(),
+                 seg_bits.size() * sizeof(uint32_t), copy_kind);
+    }
+
+    // 5. For device segments, push it over in bulk synchronous copies.
     if (!on_host) {
       cudaMemcpy(seg.vectors.data, vec_dst,
                  sizeof(data_t) * vector_per_segment * padded_dim, copy_kind);
@@ -1398,17 +1587,51 @@ __host__ graph<graph_cfg> load_graph_from_file(std::string input_fname,
                  sizeof(edge_list_t) * vector_per_segment, copy_kind);
       cudaMemcpy(seg.edge_counts, count_dst,
                  sizeof(uint8_t) * vector_per_segment, copy_kind);
+      cudaMemcpy(seg.slot_to_id, id_dst,
+                 sizeof(index_t) * vector_per_segment, copy_kind);
     }
 
     std::cout << "\r[load] segment " << (s + 1) << "/" << n_segments << std::flush;
   }
   std::cout << "\n";
+
+  // Bit-packed deletion block (current format): ceil(N/8) bytes after all
+  // node records, bit i == GLOBAL slot i. Read once, then redistribute each
+  // segment's slice into its own deleted_bits.
+  if (bitpacked_deleted) {
+    const uint64_t nbytes = (big_n_vectors + 7) / 8;
+    std::vector<uint8_t> packed(nbytes);
+    inputFile.read(reinterpret_cast<char*>(packed.data()), static_cast<std::streamsize>(nbytes));
+    for (uint32_t s = 0; s < n_segments; s++) {
+      const uint64_t seg_begin = static_cast<uint64_t>(s) * vector_per_segment;
+      const uint32_t seg_count = static_cast<uint32_t>(h_segments[s].n_vectors);
+      std::vector<uint32_t> seg_bits(segment_t::deleted_words(seg_count), 0u);
+      for (uint32_t j = 0; j < seg_count; j++) {
+        const uint64_t gidx = seg_begin + j;
+        const uint8_t bit = (packed[gidx >> 3] >> (gidx & 7u)) & 1u;
+        if (bit) {
+          seg_bits[j >> 5] |= (1u << (j & 31u));
+          n_deleted_loaded++;
+        }
+      }
+      cudaMemcpy(h_segments[s].deleted_bits, seg_bits.data(),
+                 seg_bits.size() * sizeof(uint32_t), copy_kind);
+    }
+  }
+
+  // Stable-id counter: persisted as a trailing field when the id column is
+  // present; otherwise it's just the vector count (identity ids).
+  uint64_t next_id_loaded = big_n_vectors;
+  if (has_id_column) {
+    inputFile.read(reinterpret_cast<char*>(&next_id_loaded), sizeof(uint64_t));
+  }
   inputFile.close();
 
   if (!on_host) {
     cudaFreeHost(h_vectors);
     cudaFreeHost(h_edges);
     cudaFreeHost(h_counts);
+    cudaFreeHost(h_ids);
   }
 
   graph<graph_cfg> g{};
@@ -1416,8 +1639,12 @@ __host__ graph<graph_cfg> load_graph_from_file(std::string input_fname,
   g.n_vectors  = static_cast<index_t>(big_n_vectors);
   g.n_segments = n_segments;
   g.medoid     = static_cast<index_t>(medoid_as_uint64);
+  g.n_deleted  = static_cast<index_t>(n_deleted_loaded);
+  g.next_id    = static_cast<index_t>(next_id_loaded);
   g.segments   = thrust::device_vector<segment_t>(h_segments.begin(), h_segments.end());
   g.on_host    = on_host;
+  // NOTE: g.id_map (forward table) is NOT built here — the caller rebuilds it
+  // after load via jasper::rebuild_id_map(g) (keeps this header WarpSpeed-free).
 
   cudaDeviceSynchronize();
   return g;
@@ -1439,13 +1666,26 @@ __host__ void save_graph_to_file(const graph<graph_cfg>& g,
     exit(EXIT_FAILURE);
   }
 
+  using index_t = typename graph_cfg::index_t;
   uint64_t big_n_vectors    = static_cast<uint64_t>(g.n_vectors);
   uint64_t medoid_as_uint64 = static_cast<uint64_t>(g.medoid);
   uint32_t dim              = g.dim;
   uint32_t padded_dim       = vector_view_t::pad(g.dim);
-  // File format uses packed dim, not padded
-  uint64_t bytes_per_node   = sizeof(data_t) * dim + sizeof(uint8_t) + sizeof(edge_list_t);
-  uint64_t total_file_size  = 4 * sizeof(uint64_t) + big_n_vectors * bytes_per_node;
+  // File format uses packed dim, not padded. Each node record stores
+  // slot_to_id (index_t) inline; deletion is a packed 1-bit-per-node bitmask
+  // block written after ALL node records (not an inline per-node byte), so
+  // bytes_per_node omits the deleted byte. The distinct bytes_per_node value
+  // lets the loader pick this layout (and still read legacy byte-inline files).
+  // Layout: [4x u64 header][N node records][ceil(N/8) deleted bits][u64 next_id]
+  uint64_t bytes_per_node   = sizeof(data_t) * dim + sizeof(uint8_t) + sizeof(edge_list_t)
+                              + sizeof(index_t);
+  uint64_t deleted_bytes    = (big_n_vectors + 7) / 8;
+  uint64_t total_file_size  = 4 * sizeof(uint64_t) + big_n_vectors * bytes_per_node
+                              + deleted_bytes + sizeof(uint64_t);  // + packed deleted + next_id
+
+  // Accumulated packed deletion bitmask (bit g == global slot g), filled as we
+  // stream node records below and written as one block afterward.
+  std::vector<uint8_t> packed_deleted((big_n_vectors + 7) / 8, 0u);
 
   // Write metadata
   outFile.write(reinterpret_cast<const char*>(&total_file_size),  sizeof(uint64_t));
@@ -1469,6 +1709,12 @@ __host__ void save_graph_to_file(const graph<graph_cfg>& g,
                       sizeof(uint8_t));
         outFile.write(reinterpret_cast<const char*>(&seg.edges[i]),
                       sizeof(edge_list_t));
+        outFile.write(reinterpret_cast<const char*>(&seg.slot_to_id[i]),
+                      sizeof(index_t));
+        if ((seg.deleted_bits[i >> 5] >> (i & 31u)) & 1u) {
+          uint64_t gidx = static_cast<uint64_t>(s) * vectors_per_segment + i;
+          packed_deleted[gidx >> 3] |= static_cast<uint8_t>(1u << (gidx & 7u));
+        }
       }
     }
   } else {
@@ -1476,10 +1722,14 @@ __host__ void save_graph_to_file(const graph<graph_cfg>& g,
     uint8_t*     h_edge_counts;
     edge_list_t* h_edges;
     data_t*      h_vectors;
+    uint32_t*    h_deleted_bits;
+    index_t*     h_slot_to_id;
 
     cudaMallocHost(&h_edge_counts, sizeof(uint8_t)     * vectors_per_segment);
     cudaMallocHost(&h_edges,       sizeof(edge_list_t) * vectors_per_segment);
     cudaMallocHost(&h_vectors,     sizeof(data_t)      * vectors_per_segment * padded_dim);
+    cudaMallocHost(&h_deleted_bits, segment_t::deleted_words(vectors_per_segment) * sizeof(uint32_t));
+    cudaMallocHost(&h_slot_to_id,  sizeof(index_t)     * vectors_per_segment);
 
     for (uint32_t s = 0; s < g.n_segments; s++) {
       const segment_t& seg = h_segments[s];
@@ -1491,6 +1741,10 @@ __host__ void save_graph_to_file(const graph<graph_cfg>& g,
                  seg_count * sizeof(edge_list_t), cudaMemcpyDeviceToHost);
       cudaMemcpy(h_vectors,     seg.vectors.data,
                  seg_count * padded_dim * sizeof(data_t), cudaMemcpyDeviceToHost);
+      cudaMemcpy(h_deleted_bits, seg.deleted_bits,
+                 segment_t::deleted_words(seg_count) * sizeof(uint32_t), cudaMemcpyDeviceToHost);
+      cudaMemcpy(h_slot_to_id,  seg.slot_to_id,
+                 seg_count * sizeof(index_t),     cudaMemcpyDeviceToHost);
       cudaDeviceSynchronize();
 
       for (uint32_t i = 0; i < seg_count; i++) {
@@ -1500,13 +1754,29 @@ __host__ void save_graph_to_file(const graph<graph_cfg>& g,
                       sizeof(uint8_t));
         outFile.write(reinterpret_cast<const char*>(&h_edges[i]),
                       sizeof(edge_list_t));
+        outFile.write(reinterpret_cast<const char*>(&h_slot_to_id[i]),
+                      sizeof(index_t));
+        if ((h_deleted_bits[i >> 5] >> (i & 31u)) & 1u) {
+          uint64_t gidx = static_cast<uint64_t>(s) * vectors_per_segment + i;
+          packed_deleted[gidx >> 3] |= static_cast<uint8_t>(1u << (gidx & 7u));
+        }
       }
     }
 
     cudaFreeHost(h_edge_counts);
     cudaFreeHost(h_edges);
     cudaFreeHost(h_vectors);
+    cudaFreeHost(h_deleted_bits);
+    cudaFreeHost(h_slot_to_id);
   }
+
+  // Packed deletion bitmask block (ceil(N/8) bytes), before the trailer.
+  outFile.write(reinterpret_cast<const char*>(packed_deleted.data()),
+                static_cast<std::streamsize>(packed_deleted.size()));
+
+  // Trailing stable-id counter.
+  uint64_t next_id64 = static_cast<uint64_t>(g.next_id);
+  outFile.write(reinterpret_cast<const char*>(&next_id64), sizeof(uint64_t));
 
   outFile.close();
 

@@ -205,6 +205,8 @@ static __global__ void unpack_results_kernel(
 int64_t LoadGraph_##id(ffi::String path, int64_t dim, bool on_host) {          \
   auto g = jasper::load_graph_from_file<cfg_##id>(                             \
       std::string(path), static_cast<uint32_t>(dim), on_host);                 \
+  /* rebuild the forward stable_id -> slot table from the loaded slot_to_id */ \
+  if (!on_host) jasper::build_id_map<cfg_##id>(g);                              \
   std::lock_guard<std::mutex> lock(g_mutex);                                   \
   int64_t handle = g_next_handle++;                                            \
   g_graphs[handle] = std::move(g);                                             \
@@ -263,8 +265,17 @@ void GetVector_##id(int64_t handle, int64_t index,                             \
     gp = &std::get<jasper::graph<cfg_##id>>(it->second);                       \
   }                                                                            \
   auto& g = *gp;                                                               \
-  uint32_t idx = static_cast<uint32_t>(index);                                 \
-  TVM_FFI_ICHECK(idx < g.n_vectors) << "Index " << idx << " out of range";     \
+  /* translate stable id -> internal slot (identity when labels are off) */    \
+  IDX h_id = static_cast<IDX>(index);                                          \
+  IDX *d_id, *d_slot;                                                          \
+  cudaMalloc(&d_id, sizeof(IDX)); cudaMalloc(&d_slot, sizeof(IDX));            \
+  cudaMemcpy(d_id, &h_id, sizeof(IDX), cudaMemcpyHostToDevice);                \
+  jasper::ids_to_slots_kernel<IDX><<<1, jasper::ID_MAP_TILE>>>(               \
+      jasper::id_map_of<cfg_##id>(g), d_id, d_slot, 1);                        \
+  cudaDeviceSynchronize();                                                     \
+  IDX idx; cudaMemcpy(&idx, d_slot, sizeof(IDX), cudaMemcpyDeviceToHost);      \
+  cudaFree(d_id); cudaFree(d_slot);                                            \
+  TVM_FFI_ICHECK(idx < g.n_vectors) << "Stable id " << h_id << " not found";   \
                                                                                \
   uint32_t seg_id    = jasper::graph<cfg_##id>::segment_of(idx);               \
   uint32_t local_idx = jasper::graph<cfg_##id>::local_of(idx);                 \
@@ -339,6 +350,10 @@ void Search_##id(int64_t handle,                                               \
   uint32_t threads = 256;                                                      \
   uint32_t blocks = (total + threads - 1) / threads;                           \
                                                                                \
+  /* translate internal slots -> stable ids before returning */               \
+  jasper::translate_slots_to_ids_kernel<cfg_##id>                              \
+      <<<blocks, threads, 0, stream>>>(g.view(), result.frontier, total);      \
+                                                                               \
   unpack_results_kernel<<<blocks, threads, 0, stream>>>(                       \
       result.frontier,                                                         \
       static_cast<int32_t*>(out_indices.data_ptr()),                           \
@@ -346,6 +361,68 @@ void Search_##id(int64_t handle,                                               \
       total);                                                                  \
                                                                                \
   cudaFree(result.frontier);                                                   \
+}                                                                              \
+                                                                               \
+/* ids: contiguous CPU int32 tensor of vertex ids to soft-delete */            \
+void MarkDeleted_##id(int64_t handle, ffi::TensorView ids) {                   \
+  jasper::graph<cfg_##id>* gp;                                                 \
+  {                                                                            \
+    std::lock_guard<std::mutex> lock(g_mutex);                                 \
+    auto it = g_graphs.find(handle);                                           \
+    TVM_FFI_ICHECK(it != g_graphs.end()) << "Invalid handle: " << handle;      \
+    gp = &std::get<jasper::graph<cfg_##id>>(it->second);                       \
+  }                                                                            \
+  uint32_t n_ids = static_cast<uint32_t>(ids.size(0));                         \
+  const int32_t* p = static_cast<const int32_t*>(ids.data_ptr());              \
+  std::vector<IDX> host_ids(n_ids);                                            \
+  for (uint32_t i = 0; i < n_ids; i++)                                         \
+    host_ids[i] = static_cast<IDX>(p[i]);                                      \
+  jasper::mark_deleted<construct_cfg_##id>(*gp, host_ids.data(),               \
+                                           static_cast<IDX>(n_ids));           \
+}                                                                              \
+                                                                               \
+void Consolidate_##id(int64_t handle, double alpha) {                          \
+  jasper::graph<cfg_##id>* gp;                                                 \
+  {                                                                            \
+    std::lock_guard<std::mutex> lock(g_mutex);                                 \
+    auto it = g_graphs.find(handle);                                           \
+    TVM_FFI_ICHECK(it != g_graphs.end()) << "Invalid handle: " << handle;      \
+    gp = &std::get<jasper::graph<cfg_##id>>(it->second);                       \
+  }                                                                            \
+  jasper::consolidate<construct_cfg_##id>(*gp, static_cast<float>(alpha));     \
+}                                                                              \
+                                                                               \
+void Compact_##id(int64_t handle) {                                            \
+  jasper::graph<cfg_##id>* gp;                                                 \
+  {                                                                            \
+    std::lock_guard<std::mutex> lock(g_mutex);                                 \
+    auto it = g_graphs.find(handle);                                           \
+    TVM_FFI_ICHECK(it != g_graphs.end()) << "Invalid handle: " << handle;      \
+    gp = &std::get<jasper::graph<cfg_##id>>(it->second);                       \
+  }                                                                            \
+  jasper::compact<construct_cfg_##id>(*gp, static_cast<IDX>(0));               \
+}                                                                              \
+                                                                               \
+/* Append a batch of vectors ([n, dim], __half, device). Returns the assigned  \
+   stable ids written (int32) into out_ids[0:n]. */                            \
+void Append_##id(int64_t handle, ffi::TensorView vectors, double alpha,        \
+                 ffi::TensorView out_ids) {                                    \
+  jasper::graph<cfg_##id>* gp;                                                 \
+  {                                                                            \
+    std::lock_guard<std::mutex> lock(g_mutex);                                 \
+    auto it = g_graphs.find(handle);                                           \
+    TVM_FFI_ICHECK(it != g_graphs.end()) << "Invalid handle: " << handle;      \
+    gp = &std::get<jasper::graph<cfg_##id>>(it->second);                       \
+  }                                                                            \
+  uint32_t n = static_cast<uint32_t>(vectors.size(0));                         \
+  jasper::vector_view<DAT> vecs(                                               \
+      static_cast<DAT*>(vectors.data_ptr()), gp->dim, n, false);               \
+  auto ids = jasper::append_batch<construct_cfg_##id>(                         \
+      *gp, vecs, static_cast<float>(alpha));                                   \
+  std::vector<int32_t> h(ids.size());                                          \
+  for (size_t i = 0; i < ids.size(); i++) h[i] = static_cast<int32_t>(ids[i]); \
+  cudaMemcpy(out_ids.data_ptr(), h.data(),                                     \
+             h.size() * sizeof(int32_t), cudaMemcpyDefault);                   \
 }
 
 // ── Per-config directional (LSH + PQ) implementations ───────────
@@ -695,6 +772,9 @@ int64_t GetDirectionalFlags_##id(int64_t handle) {                          \
 // ── Free / info (config-agnostic; defined once in ffi/jasper_ffi_plain.cu) ──
 void FreeGraph(int64_t handle);
 int64_t GetNumVectors(int64_t handle);
+int64_t GetNumTombstoned(int64_t handle);
+int64_t GetNumLive(int64_t handle);
+void ReserveIds(int64_t handle, ffi::TensorView out_ids, int64_t count);
 int64_t GetDim(int64_t handle);
 
 // ── Export macros ────────────────────────────────────────────────
@@ -704,7 +784,11 @@ int64_t GetDim(int64_t handle);
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_construct_##id,  jasper_ffi::ConstructGraph_##id); \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_search_##id,     jasper_ffi::Search_##id); \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_save_##id,       jasper_ffi::SaveGraph_##id); \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_get_vector_##id, jasper_ffi::GetVector_##id);
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_get_vector_##id, jasper_ffi::GetVector_##id); \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_mark_deleted_##id, jasper_ffi::MarkDeleted_##id); \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_consolidate_##id,  jasper_ffi::Consolidate_##id); \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_compact_##id,      jasper_ffi::Compact_##id); \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_append_##id,       jasper_ffi::Append_##id);
 
 #define EXPORT_DIRECTIONAL_OPS(id, ...)                                                              \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_construct_directional_##id, jasper_ffi::ConstructDirectionalGraph_##id); \

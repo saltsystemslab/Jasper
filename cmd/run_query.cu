@@ -528,6 +528,9 @@ void load_and_bench_lsh(const std::string& index_path,
   // so honor --on_host directly at load time.
   std::cout << "Loading index..." << std::endl;
   auto graph = jasper::load_graph_from_file<GraphCfg>(index_path, dim, on_host);
+  // load_graph_from_file doesn't build the forward stable_id -> slot table
+  // (see graph.cuh) — rebuild it here (device-resident graphs only).
+  if (!on_host) jasper::rebuild_id_map<GraphCfg>(graph);
   std::cout << "  " << graph.n_vectors << " vectors, dim=" << graph.dim << std::endl;
 
   // Rotate stored vectors so the LSH hashing matches create_lsh_index's
@@ -636,6 +639,9 @@ void load_and_bench_pq(const std::string& index_path,
   // Load graph (LSH config; edge_pqs storage is allocated lazily below).
   std::cout << "Loading index..." << std::endl;
   auto graph = jasper::load_graph_from_file<GraphCfg>(index_path, dim, on_host);
+  // load_graph_from_file doesn't build the forward stable_id -> slot table
+  // (see graph.cuh) — rebuild it here (device-resident graphs only).
+  if (!on_host) jasper::rebuild_id_map<GraphCfg>(graph);
   std::cout << "  " << graph.n_vectors << " vectors, dim=" << graph.dim << std::endl;
 
   // Rotate stored vectors so the PQ residuals match create_lsh_index's
@@ -743,6 +749,9 @@ void load_and_bench(const std::string& index_path,
   // Load graph (optionally directly into host memory).
   std::cout << "Loading index..." << std::endl;
   auto graph = jasper::load_graph_from_file<GraphCfg>(index_path, dim, on_host);
+  // load_graph_from_file doesn't build the forward stable_id -> slot table
+  // (see graph.cuh) — rebuild it here (device-resident graphs only).
+  if (!on_host) jasper::rebuild_id_map<GraphCfg>(graph);
   std::cout << "  " << graph.n_vectors << " vectors, dim=" << graph.dim << std::endl;
 
   // Load queries, casting src_dtype -> DataT (__half)

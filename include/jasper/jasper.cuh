@@ -11,6 +11,8 @@
 #include "jasper/index/construct.cuh"
 #include "jasper/index/construct_scale.cuh"
 #include "jasper/index/construct_diskann.cuh"
+#include "jasper/index/deletion.cuh"
+#include "jasper/index/graph_ops.cuh"
 
 #include "jasper/rabitq/distance.cuh"
 #include "jasper/rabitq/layout.cuh"

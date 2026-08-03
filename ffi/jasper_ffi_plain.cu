@@ -33,6 +33,12 @@ void FreeGraph(int64_t handle) {
           dm.erase(dit);
         }
       }
+      if (g.id_map) {
+        using index_t = typename T::index_t;
+        jasper::id_map_destroy<index_t>(
+            static_cast<jasper::id_map_t<index_t>*>(g.id_map));
+        g.id_map = nullptr;
+      }
       g.deallocate();
     }
   }, it->second);
@@ -49,6 +55,53 @@ int64_t GetNumVectors(int64_t handle) {
     using T = std::decay_t<decltype(g)>;
     if constexpr (!std::is_same_v<T, std::monostate>)
       return static_cast<int64_t>(g.n_vectors);
+    else
+      return 0;
+  }, it->second);
+}
+
+int64_t GetNumTombstoned(int64_t handle) {
+  std::lock_guard<std::mutex> lock(g_mutex);
+  auto it = g_graphs.find(handle);
+  TVM_FFI_ICHECK(it != g_graphs.end()) << "Invalid handle";
+  return std::visit([](auto& g) -> int64_t {
+    using T = std::decay_t<decltype(g)>;
+    if constexpr (!std::is_same_v<T, std::monostate>)
+      return static_cast<int64_t>(g.n_deleted);
+    else
+      return 0;
+  }, it->second);
+}
+
+// Reserve `count` fresh stable ids and write them (int32) into out_ids.
+// Config-agnostic: only advances the monotonic counter.
+void ReserveIds(int64_t handle, ffi::TensorView out_ids, int64_t count) {
+  std::lock_guard<std::mutex> lock(g_mutex);
+  auto it = g_graphs.find(handle);
+  TVM_FFI_ICHECK(it != g_graphs.end()) << "Invalid handle";
+  std::visit([&](auto& g) {
+    using T = std::decay_t<decltype(g)>;
+    if constexpr (!std::is_same_v<T, std::monostate>) {
+      using index_t = typename T::index_t;
+      index_t start = g.next_id;
+      g.next_id += static_cast<index_t>(count);
+      std::vector<int32_t> host(count);
+      for (int64_t i = 0; i < count; i++)
+        host[i] = static_cast<int32_t>(start + static_cast<index_t>(i));
+      cudaMemcpy(out_ids.data_ptr(), host.data(),
+                 count * sizeof(int32_t), cudaMemcpyDefault);
+    }
+  }, it->second);
+}
+
+int64_t GetNumLive(int64_t handle) {
+  std::lock_guard<std::mutex> lock(g_mutex);
+  auto it = g_graphs.find(handle);
+  TVM_FFI_ICHECK(it != g_graphs.end()) << "Invalid handle";
+  return std::visit([](auto& g) -> int64_t {
+    using T = std::decay_t<decltype(g)>;
+    if constexpr (!std::is_same_v<T, std::monostate>)
+      return static_cast<int64_t>(g.n_vectors - g.n_deleted);
     else
       return 0;
   }, it->second);
@@ -72,6 +125,9 @@ JASPER_FOR_EACH_CONFIG(EXPORT_OPS)
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_free_graph,    jasper_ffi::FreeGraph);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_get_n_vectors, jasper_ffi::GetNumVectors);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_get_n_tombstoned, jasper_ffi::GetNumTombstoned);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_get_n_live,    jasper_ffi::GetNumLive);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_reserve_ids,   jasper_ffi::ReserveIds);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_get_dim,       jasper_ffi::GetDim);
 
 } // namespace jasper_ffi

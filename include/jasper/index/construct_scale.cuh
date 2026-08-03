@@ -533,6 +533,11 @@ struct intermediate_graph {
       p.deallocate();  // free as we go so peak host memory never doubles
     }
 
+    // File omits the slot_to_id/deleted columns (legacy bytes_per_node), which
+    // is fine here: fresh construction has no deletions yet and no prior
+    // stable ids to preserve, and load_graph_from_file's legacy-format path
+    // reconstructs exactly this state (identity ids, zero deletions,
+    // next_id == n_vectors) — see its bpn_base fallback.
     outFile.close();
 
     std::cout << "Saved graph to " << output_fname << "\n"

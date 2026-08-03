@@ -2,7 +2,7 @@
 #include "helpers.cuh"
 #include "jasper/rabitq/layout.cuh"
 #include "jasper/rabitq/quantize.cuh"
-#include "jasper/rabitq/rotation.cuh"
+#include "jasper/rotation/rotation.cuh"
 
 #include <cmath>
 #include <numeric>
@@ -225,7 +225,7 @@ TEST_F(QuantizeTest, SmallDataset_1bit_Runs) {
   for (auto& v : h_vecs) v = dist(rng);
 
   DeviceBuf<float> d_vecs(h_vecs);
-  vector_view<float> vecs(d_vecs.ptr, DIM, N);
+  vector_view<float> vecs(d_vecs.ptr, DIM, N, false);
 
   // Centroid = mean
   std::vector<float> h_centroid(DIM, 0.0f);
@@ -271,7 +271,7 @@ TEST_F(QuantizeTest, BinaryCodes_Are1Bit) {
   std::vector<float> h_vecs(N * DIM);
   for (auto& v : h_vecs) v = dist(rng);
   DeviceBuf<float> d_vecs(h_vecs);
-  vector_view<float> vecs(d_vecs.ptr, DIM, N);
+  vector_view<float> vecs(d_vecs.ptr, DIM, N, false);
 
   std::vector<float> h_centroid(DIM, 0.0f);
   DeviceBuf<float> d_centroid(h_centroid);
@@ -305,7 +305,7 @@ TEST_F(QuantizeTest, Rescale_IsNegative_L2) {
   std::vector<float> h_vecs(N * DIM);
   for (auto& v : h_vecs) v = dist(rng);
   DeviceBuf<float> d_vecs(h_vecs);
-  vector_view<float> vecs(d_vecs.ptr, DIM, N);
+  vector_view<float> vecs(d_vecs.ptr, DIM, N, false);
 
   std::vector<float> h_centroid(DIM, 0.0f);
   DeviceBuf<float> d_centroid(h_centroid);
@@ -338,7 +338,7 @@ TEST_F(QuantizeTest, IdenticalVectors_SameQuantization) {
       h_vecs[i * DIM + j] = static_cast<float>(j + 1);
 
   DeviceBuf<float> d_vecs(h_vecs);
-  vector_view<float> vecs(d_vecs.ptr, DIM, N);
+  vector_view<float> vecs(d_vecs.ptr, DIM, N, false);
 
   std::vector<float> h_centroid(DIM, 0.0f);
   DeviceBuf<float> d_centroid(h_centroid);
@@ -375,7 +375,7 @@ TEST_F(QuantizeTest, WithRotation_StillFinite) {
   std::vector<float> h_vecs(N * DIM);
   for (auto& v : h_vecs) v = dist(rng);
   DeviceBuf<float> d_vecs(h_vecs);
-  vector_view<float> vecs(d_vecs.ptr, DIM, N);
+  vector_view<float> vecs(d_vecs.ptr, DIM, N, false);
 
   std::vector<float> h_centroid(DIM, 0.0f);
   DeviceBuf<float> d_centroid(h_centroid);
@@ -408,7 +408,7 @@ TEST_F(QuantizeTest, InnerProduct_DifferentFactors) {
   std::vector<float> h_vecs(N * DIM);
   for (auto& v : h_vecs) v = dist(rng);
   DeviceBuf<float> d_vecs(h_vecs);
-  vector_view<float> vecs(d_vecs.ptr, DIM, N);
+  vector_view<float> vecs(d_vecs.ptr, DIM, N, false);
 
   std::vector<float> h_centroid(DIM, 0.0f);
   DeviceBuf<float> d_centroid(h_centroid);
