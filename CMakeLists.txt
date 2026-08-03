@@ -1,9 +1,7 @@
 cmake_minimum_required(VERSION 3.18 FATAL_ERROR)
 project(Jasper LANGUAGES CXX CUDA)
 
-if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-  set(CMAKE_CUDA_ARCHITECTURES native)
-endif()
+set(CMAKE_CUDA_ARCHITECTURES 120 CACHE STRING "CUDA architecture(s) to compile for")
 
 include("cmake/CPM.cmake")
 
@@ -80,7 +78,7 @@ if(JASPER_BUILD_CMD)
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
   )
   set_target_properties(create_index PROPERTIES
-    CUDA_ARCHITECTURES native
+    CUDA_ARCHITECTURES ${CMAKE_CUDA_ARCHITECTURES}
     CUDA_SEPARABLE_COMPILATION ON
   )
 
@@ -91,7 +89,7 @@ if(JASPER_BUILD_CMD)
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
   )
   set_target_properties(create_scale_index PROPERTIES
-    CUDA_ARCHITECTURES native
+    CUDA_ARCHITECTURES ${CMAKE_CUDA_ARCHITECTURES}
     CUDA_SEPARABLE_COMPILATION ON
   )
 
@@ -102,7 +100,7 @@ if(JASPER_BUILD_CMD)
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
   )
   set_target_properties(create_diskann_index PROPERTIES
-    CUDA_ARCHITECTURES native
+    CUDA_ARCHITECTURES ${CMAKE_CUDA_ARCHITECTURES}
     CUDA_SEPARABLE_COMPILATION ON
   )
 
@@ -113,7 +111,7 @@ if(JASPER_BUILD_CMD)
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
   )
   set_target_properties(create_lsh_index PROPERTIES
-    CUDA_ARCHITECTURES native
+    CUDA_ARCHITECTURES ${CMAKE_CUDA_ARCHITECTURES}
     CUDA_SEPARABLE_COMPILATION ON
   )
   # target_compile_definitions(create_lsh_index PRIVATE JASPER_PROFILE_CLOCKS)
@@ -125,7 +123,7 @@ if(JASPER_BUILD_CMD)
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
   )
   set_target_properties(run_query PROPERTIES
-    CUDA_ARCHITECTURES native
+    CUDA_ARCHITECTURES ${CMAKE_CUDA_ARCHITECTURES}
     CUDA_SEPARABLE_COMPILATION ON
   )
 endif()
@@ -169,9 +167,8 @@ if(JASPER_BUILD_FFI)
   #   - visibility flags so TVM_FFI_DLL_EXPORT_TYPED_FUNC works
   tvm_ffi_configure_target(jasper_ffi)
 
-  # Set CUDA arch — adjust to your target GPU
   set_target_properties(jasper_ffi PROPERTIES
-    CUDA_ARCHITECTURES native
+    CUDA_ARCHITECTURES ${CMAKE_CUDA_ARCHITECTURES}
     CUDA_SEPARABLE_COMPILATION ON
   )
 

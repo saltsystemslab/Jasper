@@ -22,7 +22,8 @@ Compile library
 pip install apache-tvm-ffi
 
 # Build the FFI shared library
-cmake -B build -DJASPER_BUILD_FFI=ON -DJASPER_BUILD_CMD=ON
+# CMAKE_CUDA_ARCHITECTURES defaults to 120; override for your target GPU
+cmake -B build -DJASPER_BUILD_FFI=ON -DJASPER_BUILD_CMD=ON -DCMAKE_CUDA_ARCHITECTURES="90;120"
 cmake --build build -j
 cmake --install build
 pip install -e python/
