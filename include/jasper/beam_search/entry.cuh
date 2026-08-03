@@ -13,7 +13,7 @@ namespace jasper {
 // - 32 bits: distance
 typedef uint64_t ENTRY_T;
 
-__device__ __forceinline__ ENTRY_T create_entry(uint32_t index, float distance) {
+static __device__ __forceinline__ ENTRY_T create_entry(uint32_t index, float distance) {
   uint64_t entry = 0;
   entry |= (uint64_t(index) & 0x7FFFFFFFul) << 32;
   uint32_t dist_bits = __float_as_uint(distance);
@@ -21,38 +21,38 @@ __device__ __forceinline__ ENTRY_T create_entry(uint32_t index, float distance) 
   return entry;
 }
 
-__device__ __forceinline__ ENTRY_T empty_entry() {
+static __device__ __forceinline__ ENTRY_T empty_entry() {
   return create_entry(
     std::numeric_limits<uint32_t>::max(),
     std::numeric_limits<float>::max()
   );
 }
 
-__device__ __forceinline__ bool get_visited(ENTRY_T i) {
+static __device__ __forceinline__ bool get_visited(ENTRY_T i) {
   return (i >> 63) & 1;
 }
 
-__device__ __forceinline__ ENTRY_T set_visited(ENTRY_T i) {
+static __device__ __forceinline__ ENTRY_T set_visited(ENTRY_T i) {
   constexpr uint64_t MASK = 1ull << 63;
   return i | MASK;
 }
 
-__device__ __forceinline__ uint32_t get_index(ENTRY_T entry) {
+static __device__ __forceinline__ uint32_t get_index(ENTRY_T entry) {
   return static_cast<uint32_t>((entry >> 32) & 0x7FFFFFFF);
 }
 
-__device__ __forceinline__ ENTRY_T set_index(ENTRY_T entry, uint32_t index) {
+static __device__ __forceinline__ ENTRY_T set_index(ENTRY_T entry, uint32_t index) {
   uint64_t idx64 = static_cast<uint64_t>(index) << 32;
   uint64_t dist64 = entry & 0xFFFFFFFFull;
   return dist64 | idx64;
 }
 
-__device__ __forceinline__ float get_distance(ENTRY_T entry) {
+static __device__ __forceinline__ float get_distance(ENTRY_T entry) {
   uint32_t dist_bits = static_cast<uint32_t>(entry & 0xFFFFFFFF);
   return __uint_as_float(dist_bits);
 }
 
-__device__ __forceinline__ ENTRY_T set_distance(ENTRY_T entry, float distance) {
+static __device__ __forceinline__ ENTRY_T set_distance(ENTRY_T entry, float distance) {
   uint32_t dist_bits = __float_as_uint(static_cast<float>(distance));
   uint64_t dist64 = uint64_t(dist_bits);
   uint64_t idx64 = entry & 0xFFFFFFFF00000000ull;

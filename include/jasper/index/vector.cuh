@@ -1,7 +1,9 @@
 #pragma once
 
+#include <algorithm>
 #include <fstream>
 #include <sstream>
+#include <vector>
 
 namespace jasper {
 
@@ -258,20 +260,34 @@ __host__ vector_view<DATA_T> load_vectors_from_file_cast(std::string filename) {
   cudaMallocHost(&host_data, padded_bytes);
   memset(host_data, 0, padded_bytes);
 
-  std::vector<SrcT> row(dim);
-  for (int32_t i = 0; i < n_data_points; i++) {
-    if (!file.read(reinterpret_cast<char*>(row.data()), sizeof(SrcT) * dim)) {
-      std::cerr << "Error reading vector " << i << "\n";
+  // Read in large chunks rather than one syscall per vector, then convert.
+  // Going through float as intermediate so e.g. uint8_t -> __half works
+  // without relying on direct conversion constructors.
+  constexpr size_t kTargetChunkBytes = size_t{16} << 20;  // ~16 MiB raw per read
+  size_t rows_per_chunk = std::max<size_t>(1, kTargetChunkBytes / (sizeof(SrcT) * dim));
+  std::vector<SrcT> buf(rows_per_chunk * dim);
+
+  for (size_t base = 0; base < static_cast<size_t>(n_data_points); base += rows_per_chunk) {
+    size_t chunk_rows = std::min(rows_per_chunk, static_cast<size_t>(n_data_points) - base);
+    if (!file.read(reinterpret_cast<char*>(buf.data()),
+                   sizeof(SrcT) * chunk_rows * dim)) {
+      std::cerr << "Error reading vectors at " << base << "\n";
       cudaFreeHost(host_data);
       return {nullptr, 0, 0, false};
     }
-    DATA_T* dst = host_data + static_cast<size_t>(i) * padded_dim;
-    for (uint32_t j = 0; j < dim; j++) {
-      // Go through float as intermediate so e.g. uint8_t -> __half works
-      // without relying on direct conversion constructors.
-      dst[j] = static_cast<DATA_T>(static_cast<float>(row[j]));
+    for (size_t r = 0; r < chunk_rows; r++) {
+      const SrcT* src = buf.data() + r * dim;
+      DATA_T* dst = host_data + (base + r) * padded_dim;
+      for (uint32_t j = 0; j < dim; j++) {
+        dst[j] = static_cast<DATA_T>(static_cast<float>(src[j]));
+      }
     }
+    size_t done = base + chunk_rows;
+    std::cout << "\rLoading " << filename << ": " << done << "/" << n_data_points
+              << " (" << (100 * done / static_cast<size_t>(n_data_points)) << "%)"
+              << std::flush;
   }
+  std::cout << "\n";
 
   std::cout << "Loaded " << n_data_points
             << " vectors (dim=" << dim

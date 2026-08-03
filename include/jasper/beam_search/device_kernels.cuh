@@ -185,7 +185,7 @@ __device__ void merge_sort(ENTRY_T *result_buffer,
 }
 
 // clip the search results to beam_width
-__device__ void clip_k(uint32_t* result_buffer_count, const uint32_t & beam_width) {
+static __device__ void clip_k(uint32_t* result_buffer_count, const uint32_t & beam_width) {
   if (threadIdx.x == 0) {
     result_buffer_count[0] = min(result_buffer_count[0], beam_width);
   }

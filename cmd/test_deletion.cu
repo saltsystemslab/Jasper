@@ -193,6 +193,9 @@ int run_test(const std::string& index_path, const std::string& base_path,
   } else {
     std::cout << "Loading index from " << index_path << " ..." << std::endl;
     g = jasper::load_graph_from_file<GraphCfg>(index_path, dim);
+    // load_graph_from_file doesn't build the forward stable_id -> slot table
+    // (see graph.cuh) — rebuild it here so mark_deleted() can resolve ids.
+    jasper::rebuild_id_map<GraphCfg>(g);
   }
   std::cout << "  " << g.n_vectors << " vectors, dim=" << g.dim
             << ", medoid=" << g.medoid << std::endl;
