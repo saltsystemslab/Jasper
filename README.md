@@ -1,14 +1,17 @@
 # Jasper: Fast and scalable GPU-native ANNS index
 
-Jasper is a GPU-native approximate nearest neighbor search (ANNS) index designed for speed and scalability. Drawing on the Vamana graph index and RaBitQ quantization, Jasper delivers state-of-the-art construction throughput and query performance entirely on the GPU.
+[![arXiv](https://img.shields.io/badge/System_Paper-VLDB_2026-blue.svg)](https://arxiv.org/abs/2601.07048)
+[![arXiv](https://img.shields.io/badge/Directional_Beam_Search-VecDB_Workshop_2026-blue.svg)](https://prashantpandey.github.io/assets/pdf/uploads/vecdb26_dbs.pdf)
+[![GitHub Repo stars](https://img.shields.io/github/stars/zikunw/jasper?style=social)](https://github.com/zikunw/jasper)
 
-The core algorithms are based on our research paper: [GPU-Accelerated ANNS: Quantized for Speed, Built for Change](https://arxiv.org/abs/2601.07048). This repository extends the [original experiment code](https://github.com/saltsystemslab/JasperGPUANNS) into a reusable header-only CUDA library with Python bindings via [TVM FFI](https://github.com/apache/tvm-ffi).
+Jasper is a GPU-native approximate nearest neighbor search (ANNS) index designed for speed and scalability. Drawing on the Vamana graph index and RaBitQ quantization, Jasper delivers state-of-the-art construction throughput and query performance entirely on the GPU.
 
 
 ## Why Jasper?
 
-- **Fast construction and search.** Jasper matches or exceeds state-of-the-art GPU-based ANNS libraries in both index build throughput and query latency.
-- **Index updates.** Jasper supports inserting vectors without rebuilding the entire index.
+- **Fast construction.** Jasper matches or exceeds state-of-the-art GPU-based ANNS libraries in index build throughput, and scales out to billion-vector datasets.
+- **Directional beam search.** Jasper supports directional beam search, a faster search algorithm and index layout for both device-memory and host-memory search.
+- **Index insert, update, and delete.** Jasper supports index updates without rebuilding the entire index.
 - **RaBitQ quantization.** Jasper uses RaBitQ for vector quantization, which achieves higher performance than traditional product quantization and maps naturally to GPU computations.
 
 ## Compilation
