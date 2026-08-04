@@ -3,9 +3,10 @@
 // Shared declarations for the jasper_ffi target. This target's config matrix
 // (4 plain + 16 directional graph_configs) is too expensive to compile as one
 // translation unit — directional_search()/pq_search() alone each expand into
-// 10 full graph_beam_search_kernel instantiations per config (5
-// MAX_SEARCH_WIDTH branches x 2 GET_VISITED branches, see beam_search/api.cuh),
-// on top of construct_graph and the LSH/PQ pipeline kernels. So the actual
+// 5 full graph_beam_search_kernel instantiations per config (one per
+// MAX_SEARCH_WIDTH branch; get_visited/max_result_size are runtime kernel
+// args, not template axes, see beam_search/api.cuh), on top of construct_graph
+// and the LSH/PQ pipeline kernels. So the actual
 // per-config op bodies (DEFINE_OPS / DEFINE_DIRECTIONAL_OPS) are only DEFINED
 // here as macros; each ffi/jasper_ffi_*.cu file includes this header and
 // invokes them for its own slice of the config table, so nvcc can compile
