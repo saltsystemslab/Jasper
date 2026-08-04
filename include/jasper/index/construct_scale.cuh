@@ -174,10 +174,8 @@ struct intermediate_graph {
     using beam_search_cfg = beam_search_config<
       graph_cfg_t, graph_cfg_t::dist_func,
       beam_search_block_size,
-      true,
       GRAPH_CONSTRUCT_CONFIG::beam_search_max_search_width,
-      beam_search_tile_size,
-      GRAPH_CONSTRUCT_CONFIG::beam_search_max_result_size>;
+      beam_search_tile_size>;
 
     // Beam search: B1 batch queries → B2 graph.
     // The batch lies within one segment because partition_size <= vectors_per_segment.
@@ -189,12 +187,14 @@ struct intermediate_graph {
     auto query_view = h_segs_b1[b1_seg].vectors.subview(b1_local, batch_size);
 
     beam_search_params<beam_search_cfg> bp {
-      .graph         = B2_graph,
-      .query_vectors = query_view,
-      .medoid        = B2_graph.medoid,
-      .k             = L,
-      .beam_width    = L,
-      .limit         = GRAPH_CONSTRUCT_CONFIG::BEAM_SEARCH_LIMIT,
+      .graph           = B2_graph,
+      .query_vectors   = query_view,
+      .medoid          = B2_graph.medoid,
+      .k               = L,
+      .beam_width      = L,
+      .limit           = GRAPH_CONSTRUCT_CONFIG::BEAM_SEARCH_LIMIT,
+      .get_visited     = true,
+      .max_result_size = GRAPH_CONSTRUCT_CONFIG::beam_search_max_result_size,
     };
     beam_search_result<graph_cfg_t> bs_result;
     bs_result.frontier       = ws.frontier;

@@ -23,7 +23,7 @@ namespace jasper {
 
 // main search kernel
 template <typename GRAPH_CFG, uint32_t BLOCK_SIZE, distance_func DISTANCE_FUNC,
-          uint32_t MAX_SEARCH_WIDTH, bool GET_VISITED, uint32_t TILE_SIZE = 4, uint32_t MAX_RESULT_SIZE = 1024>
+          uint32_t MAX_SEARCH_WIDTH, uint32_t TILE_SIZE = 4>
 __global__ void beam_search_kernel(
     typename graph<GRAPH_CFG>::device_view graph,
     thrust::pair<typename GRAPH_CFG::index_t, typename GRAPH_CFG::distance_t> *frontier_results,
@@ -33,10 +33,12 @@ __global__ void beam_search_kernel(
     bool use_range,
     uint32_t query_start,
     uint32_t query_end,
-    typename GRAPH_CFG::index_t medoid, 
-    uint32_t k, 
+    typename GRAPH_CFG::index_t medoid,
+    uint32_t k,
     uint32_t beam_width,
-    uint32_t limit) {
+    uint32_t limit,
+    bool get_visited,
+    uint32_t max_result_size) {
 
   #ifdef _CLK_BREAKDOWN
     std::uint64_t clk_init = 0;
@@ -152,16 +154,16 @@ __global__ void beam_search_kernel(
     
     // Add frontier to visited list
     // we do not add the first point
-    if (threadIdx.x == 0 && GET_VISITED) {
-      visited_results[query_id * MAX_RESULT_SIZE + visited_counter].first =
+    if (threadIdx.x == 0 && get_visited) {
+      visited_results[query_id * max_result_size + visited_counter].first =
           get_index(result_buffer[frontierIdx]);
-      visited_results[query_id * MAX_RESULT_SIZE+ visited_counter].second =
+      visited_results[query_id * max_result_size + visited_counter].second =
           get_distance(result_buffer[frontierIdx]);
-      // assert(visited_counter < MAX_RESULT_SIZE);
+      // assert(visited_counter < max_result_size);
     }
     visited_counter += 1;
     // break if we exceeded the result size for visited list.
-    if (visited_counter == MAX_RESULT_SIZE) break;
+    if (visited_counter == max_result_size) break;
     __syncthreads();
 
     // record offset so that we know where to start calculating distances
@@ -218,7 +220,7 @@ __global__ void beam_search_kernel(
       frontier_results[query_id * k + i].second = static_cast<DISTANCE_T>(1e30f);
     }
   }
-  if (threadIdx.x == 0 && GET_VISITED) {
+  if (threadIdx.x == 0 && get_visited) {
     visited_counts[query_id] = visited_counter;
   }
 
@@ -294,9 +296,9 @@ beam_search(const beam_search_params<Cfg>& p, cudaStream_t stream = 0) {
   // Allocate frontier
   cudaMalloc(&result.frontier, sizeof(entry_t) * n_query_vectors * p.k);
   // Allocate visited
-  if constexpr (Cfg::get_visited) {
+  if (p.get_visited) {
     cudaMalloc(&result.visited,
-               sizeof(entry_t) * n_query_vectors * Cfg::max_result_size);
+               sizeof(entry_t) * n_query_vectors * p.max_result_size);
     cudaMalloc(&result.visited_counts,
                sizeof(uint32_t) * n_query_vectors);
   }
@@ -307,8 +309,8 @@ beam_search(const beam_search_params<Cfg>& p, cudaStream_t stream = 0) {
   beam_search_kernel<
       typename Cfg::graph_cfg_t,
       Cfg::block_size, Cfg::dist_func,
-      Cfg::max_search_width, Cfg::get_visited,
-      Cfg::tile_size, Cfg::max_result_size>
+      Cfg::max_search_width,
+      Cfg::tile_size>
     <<<blocks, threads, smem, stream>>>(
         graph_device_view,
         result.frontier,
@@ -321,7 +323,9 @@ beam_search(const beam_search_params<Cfg>& p, cudaStream_t stream = 0) {
         p.medoid,
         p.k,
         p.beam_width,
-        p.limit);
+        p.limit,
+        p.get_visited,
+        p.max_result_size);
 
   cudaError_t err = cudaStreamSynchronize(stream);
   if (err != cudaSuccess) {
@@ -359,8 +363,8 @@ __host__ void beam_search(
   beam_search_kernel<
       typename Cfg::graph_cfg_t,
       Cfg::block_size, Cfg::dist_func,
-      Cfg::max_search_width, Cfg::get_visited,
-      Cfg::tile_size, Cfg::max_result_size>
+      Cfg::max_search_width,
+      Cfg::tile_size>
     <<<blocks, threads, smem, stream>>>(
         graph_device_view,
         result.frontier,
@@ -373,7 +377,9 @@ __host__ void beam_search(
         p.medoid,
         p.k,
         p.beam_width,
-        p.limit);
+        p.limit,
+        p.get_visited,
+        p.max_result_size);
 
   cudaError_t err = cudaStreamSynchronize(stream);
   if (err != cudaSuccess) {

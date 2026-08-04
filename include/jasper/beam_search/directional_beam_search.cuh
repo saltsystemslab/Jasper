@@ -330,8 +330,7 @@ __device__ __forceinline__ void frontier_insert_sorted(
 
 // ===== The kernel =====
 template <typename GRAPH_CFG, uint32_t BLOCK_SIZE,
-          uint32_t MAX_SEARCH_WIDTH, bool GET_VISITED,
-          uint32_t TILE_SIZE = 4, uint32_t MAX_RESULT_SIZE = 1024>
+          uint32_t MAX_SEARCH_WIDTH, uint32_t TILE_SIZE = 4>
 __global__ void directional_beam_search_kernel(
     typename graph<GRAPH_CFG>::device_view graph,
     lsh_globals<GRAPH_CFG::k_ranks>        globals,
@@ -345,7 +344,9 @@ __global__ void directional_beam_search_kernel(
     typename GRAPH_CFG::index_t            medoid,
     uint32_t                               k,
     uint32_t                               beam_width,
-    uint32_t                               limit)
+    uint32_t                               limit,
+    bool                                   get_visited,
+    uint32_t                               max_result_size)
 {
   using INDEX_T    = typename GRAPH_CFG::index_t;
   using DATA_T     = typename GRAPH_CFG::data_t;
@@ -486,14 +487,14 @@ __global__ void directional_beam_search_kernel(
       frontier_insert_sorted(u_entry, exact_dist_u_sq,
                              frontier_buffer, frontier_buffer_count, k);
 
-      if (GET_VISITED) {
-        visited_results[query_id * MAX_RESULT_SIZE + visited_counter].first  = u_gid;
-        visited_results[query_id * MAX_RESULT_SIZE + visited_counter].second =
+      if (get_visited) {
+        visited_results[query_id * max_result_size + visited_counter].first  = u_gid;
+        visited_results[query_id * max_result_size + visited_counter].second =
             static_cast<DISTANCE_T>(exact_dist_u_sq);
       }
     }
     ++visited_counter;
-    if (visited_counter == MAX_RESULT_SIZE) break;
+    if (visited_counter == max_result_size) break;
     __syncthreads();
     CLOCK_ACCUM(t_frontier, PHASE_FRONTIER);
 
@@ -558,7 +559,7 @@ __global__ void directional_beam_search_kernel(
           std::numeric_limits<DISTANCE_T>::max();
     }
   }
-  if (threadIdx.x == 0 && GET_VISITED) {
+  if (threadIdx.x == 0 && get_visited) {
     visited_counts[query_id] = visited_counter;
   }
 }
@@ -609,16 +610,15 @@ directional_beam_search(
 
   beam_search_result<graph_cfg_t> result{};
   cudaMalloc(&result.frontier, sizeof(entry_t) * n_query_vectors * p.k);
-  if constexpr (Cfg::get_visited) {
+  if (p.get_visited) {
     cudaMalloc(&result.visited,
-               sizeof(entry_t) * n_query_vectors * Cfg::max_result_size);
+               sizeof(entry_t) * n_query_vectors * p.max_result_size);
     cudaMalloc(&result.visited_counts, sizeof(uint32_t) * n_query_vectors);
   }
 
   auto kernel = directional_beam_search_kernel<
       graph_cfg_t, Cfg::block_size,
-      Cfg::max_search_width, Cfg::get_visited,
-      Cfg::tile_size, Cfg::max_result_size>;
+      Cfg::max_search_width, Cfg::tile_size>;
 
   if (smem > 48 * 1024) {
     cudaFuncSetAttribute(kernel,
@@ -629,7 +629,8 @@ directional_beam_search(
       p.graph.view(), globals,
       result.frontier, result.visited, result.visited_counts,
       p.query_vectors, p.use_range, p.query_start, p.query_end,
-      p.medoid, p.k, p.beam_width, p.limit);
+      p.medoid, p.k, p.beam_width, p.limit,
+      p.get_visited, p.max_result_size);
 
   cudaError_t err = cudaStreamSynchronize(stream);
   if (err != cudaSuccess) {
@@ -664,8 +665,7 @@ __host__ void directional_beam_search(
 
   auto kernel = directional_beam_search_kernel<
       graph_cfg_t, Cfg::block_size,
-      Cfg::max_search_width, Cfg::get_visited,
-      Cfg::tile_size, Cfg::max_result_size>;
+      Cfg::max_search_width, Cfg::tile_size>;
 
   if (smem > 48 * 1024) {
     cudaFuncSetAttribute(kernel,
@@ -676,7 +676,8 @@ __host__ void directional_beam_search(
       p.graph.view(), globals,
       result.frontier, result.visited, result.visited_counts,
       p.query_vectors, p.use_range, p.query_start, p.query_end,
-      p.medoid, p.k, p.beam_width, p.limit);
+      p.medoid, p.k, p.beam_width, p.limit,
+      p.get_visited, p.max_result_size);
 
   cudaError_t err = cudaStreamSynchronize(stream);
   if (err != cudaSuccess) {

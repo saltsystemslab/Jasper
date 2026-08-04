@@ -10,10 +10,8 @@ namespace jasper {
 template <typename GRAPH_CFG,
           distance_func DISTANCE_FUNC,
           uint32_t BLOCK_SIZE = 128,
-          bool GET_VISITED = true,
           uint32_t MAX_SEARCH_WIDTH = 512,
-          uint32_t TILE_SIZE = 4,
-          uint32_t MAX_RESULT_SIZE=1024>
+          uint32_t TILE_SIZE = 4>
 struct beam_search_config {
   using graph_cfg_t  = GRAPH_CFG;
   using index_t       = typename GRAPH_CFG::index_t;
@@ -25,10 +23,8 @@ struct beam_search_config {
 
   static constexpr distance_func dist_func    = DISTANCE_FUNC;
   static constexpr uint32_t block_size        = BLOCK_SIZE;
-  static constexpr bool     get_visited       = GET_VISITED;
   static constexpr uint32_t max_search_width  = MAX_SEARCH_WIDTH;
   static constexpr uint32_t tile_size         = TILE_SIZE;
-  static constexpr uint32_t max_result_size   = MAX_RESULT_SIZE;
 };
 
 template <typename Cfg>
@@ -50,6 +46,12 @@ struct beam_search_params {
   uint32_t                    k;
   uint32_t                    beam_width;
   uint32_t                    limit;
+
+  // Visited-list bookkeeping. Neither of these affects kernel codegen (no
+  // shared/register array or CUB template is sized off them), so they are
+  // plain runtime knobs rather than template parameters.
+  bool                        get_visited     = false;
+  uint32_t                    max_result_size = 1024;
 };
 
 template <typename GRAPH_CFG>
