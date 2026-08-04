@@ -776,14 +776,16 @@ __host__ void process_batch(
   // beam search
   cudaEventRecord(e0, stream);
   beam_search_params<BEAM_SEARCH_CONFIG> bp {
-    .graph          = graph,
-    .use_range      = true,
-    .query_start    = batch_offset,
-    .query_end      = batch_offset + batch_size,
-    .medoid         = graph.medoid,
-    .k              = L,
-    .beam_width     = L,
-    .limit          = CONSTRUCT_GRAPH_CONFIG::BEAM_SEARCH_LIMIT,
+    .graph           = graph,
+    .use_range       = true,
+    .query_start     = batch_offset,
+    .query_end       = batch_offset + batch_size,
+    .medoid          = graph.medoid,
+    .k               = L,
+    .beam_width      = L,
+    .limit           = CONSTRUCT_GRAPH_CONFIG::BEAM_SEARCH_LIMIT,
+    .get_visited     = true,
+    .max_result_size = CONSTRUCT_GRAPH_CONFIG::beam_search_max_result_size,
   };
   beam_search_result<typename CONSTRUCT_GRAPH_CONFIG::graph_cfg_t> bs_result;
   bs_result.frontier       = ws.frontier;
@@ -978,10 +980,8 @@ __host__ void construct_graph_into(
   using beam_search_cfg = beam_search_config<
     graph_cfg_t, graph_cfg_t::dist_func,
     beam_search_block_size,
-    true,  // get visited
     CONSTRUCT_GRAPH_CONFIG::beam_search_max_search_width,
-    beam_search_tile_size,
-    CONSTRUCT_GRAPH_CONFIG::beam_search_max_result_size>;
+    beam_search_tile_size>;
 
   construct_timer timer;
   construction_round<CONSTRUCT_GRAPH_CONFIG, beam_search_cfg>(
@@ -1134,10 +1134,8 @@ __host__ graph<typename CONSTRUCT_GRAPH_CONFIG::graph_cfg_t> construct_graph(
   using beam_search_cfg = beam_search_config<
     graph_cfg_t, graph_cfg_t::dist_func,
     beam_search_block_size,
-    true,  // get visited
     CONSTRUCT_GRAPH_CONFIG::beam_search_max_search_width,
-    beam_search_tile_size,
-    CONSTRUCT_GRAPH_CONFIG::beam_search_max_result_size>;
+    beam_search_tile_size>;
 
   // first round establish edges
   // construct_timer first_round_timer;
@@ -1235,10 +1233,9 @@ append_batch(typename CONSTRUCT_GRAPH_CONFIG::graph_t& g,
     constexpr uint32_t beam_search_tile_size  = 4;
     constexpr uint32_t beam_search_block_size = 64;
     using beam_search_cfg = beam_search_config<
-        graph_cfg_t, graph_cfg_t::dist_func, beam_search_block_size, true,
+        graph_cfg_t, graph_cfg_t::dist_func, beam_search_block_size,
         CONSTRUCT_GRAPH_CONFIG::beam_search_max_search_width,
-        beam_search_tile_size,
-        CONSTRUCT_GRAPH_CONFIG::beam_search_max_result_size>;
+        beam_search_tile_size>;
 
     auto ws = graph_construct_workspace<CONSTRUCT_GRAPH_CONFIG>::allocate(max_batch_size);
     construct_timer timer;
