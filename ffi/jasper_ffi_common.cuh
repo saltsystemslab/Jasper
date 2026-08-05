@@ -37,8 +37,12 @@ namespace ffi = tvm::ffi;
 // (CONFIG_ID, INDEX_T, N_NEIGHBORS, DATA_T, DISTANCE_T, DIST_FUNC)
 
 #define JASPER_FOR_EACH_CONFIG(X)                                              \
+  X(f16_r8_l2,    uint32_t, 8,  __half, float, jasper::distance_func::L2)      \
+  X(f16_r16_l2,   uint32_t, 16, __half, float, jasper::distance_func::L2)      \
   X(f16_r32_l2,   uint32_t, 32, __half, float, jasper::distance_func::L2)      \
   X(f16_r64_l2,   uint32_t, 64, __half, float, jasper::distance_func::L2)      \
+  X(f16_r8_ip,    uint32_t, 8,  __half, float, jasper::distance_func::INNER_PRODUCT) \
+  X(f16_r16_ip,   uint32_t, 16, __half, float, jasper::distance_func::INNER_PRODUCT) \
   X(f16_r32_ip,   uint32_t, 32, __half, float, jasper::distance_func::INNER_PRODUCT) \
   X(f16_r64_ip,   uint32_t, 64, __half, float, jasper::distance_func::INNER_PRODUCT)
 

@@ -27,8 +27,12 @@ class DataType(str, Enum):
 # ── Config registry (must match JASPER_FOR_EACH_CONFIG in C++) ──
 # Index storage is __half; callers must pass torch.float16 tensors.
 _CONFIGS: dict[tuple[DataType, int, DistanceFunc], str] = {
+    (DataType.FLOAT16, 8,   DistanceFunc.L2):             "f16_r8_l2",
+    (DataType.FLOAT16, 16,  DistanceFunc.L2):             "f16_r16_l2",
     (DataType.FLOAT16, 32,  DistanceFunc.L2):             "f16_r32_l2",
     (DataType.FLOAT16, 64,  DistanceFunc.L2):             "f16_r64_l2",
+    (DataType.FLOAT16, 8,   DistanceFunc.INNER_PRODUCT):  "f16_r8_ip",
+    (DataType.FLOAT16, 16,  DistanceFunc.INNER_PRODUCT):  "f16_r16_ip",
     (DataType.FLOAT16, 32,  DistanceFunc.INNER_PRODUCT):  "f16_r32_ip",
     (DataType.FLOAT16, 64,  DistanceFunc.INNER_PRODUCT):  "f16_r64_ip",
 }
