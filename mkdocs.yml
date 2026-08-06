@@ -1,0 +1,65 @@
+site_name: Jasper
+site_description: Fast and scalable GPU-native ANNS index
+site_url: https://saltsystemslab.github.io/jasper/
+repo_url: https://github.com/saltsystemslab/Jasper
+repo_name: saltsystemslab/jasper
+
+theme:
+  name: material
+  font:
+    text: Roboto
+    code: JetBrains Mono
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.instant
+    - navigation.tracking
+    - navigation.sections
+    - content.code.copy
+    - search.suggest
+
+nav:
+  - Welcome: index.md
+  - Quick Start: quickstart.md
+  - Python API: api.md
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          paths: [python]
+          options:
+            docstring_style: google
+            show_source: false
+            show_root_heading: true
+            heading_level: 3
+            merge_init_into_class: true
+            group_by_category: true
+            members_order: source
+
+markdown_extensions:
+  - attr_list
+  - footnotes
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+  - toc:
+      permalink: true
