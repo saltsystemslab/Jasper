@@ -790,7 +790,7 @@ def read_groundtruth(path: str, k: int = 10) -> tuple[torch.Tensor, torch.Tensor
     """
     Read ground truth from a binary file.
 
-    Format: [n_queries: uint32][gt_k: uint32][ids: n_queries * gt_k * uint32][distances: n_queries * gt_k * float32]
+    Format: `[n_queries: uint32][gt_k: uint32][ids: n_queries * gt_k * uint32][distances: n_queries * gt_k * float32]`
 
     Args:
         path: Path to the ground truth .bin file.
@@ -934,7 +934,7 @@ def save_groundtruth(
     """
     Write ground truth to the binary format expected by `jasper.read_groundtruth`.
 
-    Format: [n_queries: u32][k: u32][ids: u32 * nq * k][dists: f32 * nq * k]
+    Format: `[n_queries: u32][k: u32][ids: u32 * nq * k][dists: f32 * nq * k]`
     """
     ids_np = indices.cpu().numpy().astype(np.uint32)
     dists_np = distances.cpu().numpy().astype(np.float32)
