@@ -26,8 +26,10 @@ theme:
     - navigation.instant
     - navigation.tracking
     - navigation.sections
+    - navigation.indexes
     - content.code.copy
     - search.suggest
+    - toc.follow
 
 nav:
   - Welcome: index.md
@@ -42,12 +44,21 @@ plugins:
           paths: [python]
           options:
             docstring_style: google
+            docstring_section_style: list
             show_source: false
             show_root_heading: true
+            show_root_full_path: false
             heading_level: 3
             merge_init_into_class: true
             group_by_category: true
             members_order: source
+            separate_signature: true
+            show_signature_annotations: true
+            signature_crossrefs: true
+            annotations_path: brief
+            show_symbol_type_heading: true
+            show_symbol_type_toc: true
+            summary: true
 
 markdown_extensions:
   - attr_list
