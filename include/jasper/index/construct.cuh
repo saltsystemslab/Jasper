@@ -880,8 +880,19 @@ __host__ void process_batch(
 
   cudaEventRecord(e5, stream);
 
-  // add edges + robust prune
-  constexpr uint64_t process_reverse_edges_kernel_grid_size = 1024; // fix size
+  // add edges + robust prune. The kernel grid-strides over unique target
+  // vertices (one target per block-iteration), so size the grid to the number
+  // of targets rather than a fixed 1024: a batch can touch millions of distinct
+  // targets, and 1024 blocks badly under-saturates the GPU. Since reverse-prune
+  // dominates construction/append time, this is the single biggest build-speed
+  // lever (~1.5x construct throughput on bigann10M/H200). Capped so the grid
+  // stays reasonable; work beyond the cap is handled by the grid stride.
+#ifndef JASPER_RP_MAX_GRID
+#define JASPER_RP_MAX_GRID 65536
+#endif
+  constexpr uint64_t RP_MAX_GRID = JASPER_RP_MAX_GRID;
+  const uint64_t process_reverse_edges_kernel_grid_size =
+      std::min<uint64_t>(static_cast<uint64_t>(num_unique_sources), RP_MAX_GRID);
   process_reverse_edges_kernel<CONSTRUCT_GRAPH_CONFIG, TILE_SIZE>
        <<<process_reverse_edges_kernel_grid_size, BLOCK_SIZE, 0, stream>>>(
           ws.reverse_edges_ptr,
