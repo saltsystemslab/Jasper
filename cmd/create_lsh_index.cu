@@ -34,11 +34,11 @@ __device__ uint64_t g_phase_clocks[PHASE_COUNT];
 // (CONFIG_ID, INDEX_T, N_NEIGHBORS, DATA_T, DISTANCE_T, DIST_FUNC, K_RANKS, PACKED_T)
 #define JASPER_FOR_EACH_CONFIG(X)                                              \
   X(f16_r64_l2_k4_d128,  uint32_t, 64, __half, float, jasper::distance_func::L2,  4, uint8_t)  \
-  X(f16_r64_l2_k8_d128,  uint32_t, 64, __half, float, jasper::distance_func::L2,  8, uint8_t)  \
-  X(f16_r64_l2_k16_d128, uint32_t, 64, __half, float, jasper::distance_func::L2, 16, uint8_t)  \
+  X(f16_r64_l2_k16_d128,  uint32_t, 64, __half, float, jasper::distance_func::L2,  16, uint8_t)  \
   X(f16_r64_l2_k4_d32678,  uint32_t, 64, __half, float, jasper::distance_func::L2,  4, uint16_t)  \
-  X(f16_r64_l2_k8_d32678,  uint32_t, 64, __half, float, jasper::distance_func::L2,  8, uint16_t)  \
-  X(f16_r64_l2_k16_d32678, uint32_t, 64, __half, float, jasper::distance_func::L2, 16, uint16_t)  \
+  X(f16_r32_ip_k4_d32678,  uint32_t, 32, __half, float, jasper::distance_func::INNER_PRODUCT,  4, uint16_t)  \
+  X(f16_r64_ip_k4_d32678,  uint32_t, 64, __half, float, jasper::distance_func::INNER_PRODUCT,  4, uint16_t)
+
 
 // Graph + construct config types. K_RANKS is now a macro parameter.
 #define DECLARE_CONFIGS(id, IDX, R, DAT, DIST, FUNC, KR, PACKEDT)                       \
@@ -258,6 +258,37 @@ void run_directional_round(
   jasper::print_phase_clocks();
 }
 
+// ── Single PQ directional-search round ─────────────────────────
+template <typename GraphCfg, typename DataT>
+void run_pq_round(
+    jasper::graph<GraphCfg>&                                             graph,
+    jasper::pq_codebooks_view<GraphCfg::pq_m, GraphCfg::pq_k>            codebooks,
+    DataT*    d_queries,
+    uint32_t  n_queries,
+    uint32_t  dim,
+    uint32_t  k,
+    uint32_t  beam_width,
+    uint32_t  limit,
+    const GroundTruth* gt,
+    bool      print_throughput) {
+
+  jasper::vector_view<DataT> query_view(d_queries, dim, n_queries, false);
+  jasper::search_params params{
+    .k           = k,
+    .beam_width  = beam_width,
+    .limit       = limit,
+    .get_visited = false,
+  };
+
+  jasper::reset_phase_clocks();
+  run_round_generic(
+    n_queries, k, beam_width, limit, gt, print_throughput,
+    [&]() {
+      return jasper::pq_search(graph, codebooks, query_view, params);
+    });
+  jasper::print_phase_clocks();
+}
+
 template <typename DataT>
 // Rotate query vectors using the same seed used during construction
 void rotate_queries(DataT* d_queries, uint32_t n_queries, uint32_t dim,
@@ -305,8 +336,9 @@ void rotate_queries(DataT* d_queries, uint32_t n_queries, uint32_t dim,
 // ── Benchmark driver: runs BOTH conventional and directional ───
 template <typename GraphCfg, typename DataT>
 void benchmark_all(
-    jasper::graph<GraphCfg>&                       graph,
-    const jasper::lsh_globals<GraphCfg::k_ranks>&  globals,
+    jasper::graph<GraphCfg>&                                   graph,
+    const jasper::lsh_globals<GraphCfg::k_ranks>&              globals,
+    jasper::pq_codebooks_view<GraphCfg::pq_m, GraphCfg::pq_k>  pq_view,
     const std::string& query_path,
     const std::string& gt_path,
     const std::string& src_dtype,
@@ -379,6 +411,19 @@ void benchmark_all(
   for (auto& [bw, lim] : beam_limit_pairs) {
     run_directional_round<GraphCfg, DataT>(
       graph, globals, d_queries, n_queries, dim, k,
+      bw, lim, has_gt ? &gt : nullptr, true);
+  }
+
+  // ─── PQ directional beam search ─────────────────────────────
+  std::cout << "\n=== PQ Directional Beam Search Benchmark (k=" << k << ") ===" << std::endl;
+  std::cout << "Warmup..." << std::endl;
+  run_pq_round<GraphCfg, DataT>(
+    graph, pq_view, d_queries, n_queries, dim, k,
+    warmup_bw, warmup_limit, nullptr, false);
+
+  for (auto& [bw, lim] : beam_limit_pairs) {
+    run_pq_round<GraphCfg, DataT>(
+      graph, pq_view, d_queries, n_queries, dim, k,
       bw, lim, has_gt ? &gt : nullptr, true);
   }
 
@@ -472,21 +517,38 @@ void construct_and_save(const std::string& filename,
 
   auto t3 = std::chrono::steady_clock::now();
 
+  // ── Train PQ codebooks + encode edges (directional PQ path) ──
+  std::cout << "  Training PQ codebooks..." << std::endl;
+  auto pq_codebooks = g.generate_pq_codebooks(/*n_train=*/40000);
+  cudaDeviceSynchronize();
+  auto t4 = std::chrono::steady_clock::now();
+
+  std::cout << "  Populating edge PQ codes..." << std::endl;
+  g.populate_edge_pq(pq_codebooks);
+  g.compute_vector_norms();  // exact ||v||² for the PQ L2 estimator
+  cudaDeviceSynchronize();
+  auto t5 = std::chrono::steady_clock::now();
+
   auto ms1 = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
   auto ms2 = std::chrono::duration_cast<std::chrono::milliseconds>(t3 - t2).count();
+  auto ms3 = std::chrono::duration_cast<std::chrono::milliseconds>(t4 - t3).count();
+  auto ms4 = std::chrono::duration_cast<std::chrono::milliseconds>(t5 - t4).count();
 
   std::cout << "  generate_lsh_globals: "   << ms1 << " ms\n";
   std::cout << "  populate_edge_lsh: "      << ms2 << " ms\n";
+  std::cout << "  generate_pq_codebooks: "  << ms3 << " ms\n";
+  std::cout << "  populate_edge_pq: "       << ms4 << " ms\n";
 
   // ── Benchmark step ───────────────────────────────────────────
   if (!query_path.empty()) {
     benchmark_all<GraphCfg, DataT>(
-      g, lsh_globals, query_path, gt_path, src_dtype,
+      g, lsh_globals, pq_codebooks.view(), query_path, gt_path, src_dtype,
       dim, k, beam_limit_pairs);
   } else {
     std::cout << "\n  No --queries provided; skipping benchmark." << std::endl;
   }
 
+  pq_codebooks.free();
   cudaFreeHost(h_vecs.data);
   g.deallocate();
 }
@@ -617,8 +679,8 @@ int main(int argc, char** argv) {
   program.add_argument("--k_ranks", "-r")
     .default_value(uint32_t{4})
     .scan<'u', uint32_t>()
-    .choices(4u, 8u, 16u)
-    .help("LSH k_ranks (4, 8, or 16)");
+    .choices(4u, 8u, 16u, 32u)
+    .help("LSH k_ranks (4, 8, 16 or 32)");
 
   try {
     program.parse_args(argc, argv);

@@ -957,6 +957,38 @@ __host__ void construction_round(
   // std::printf("\n[construct] round complete\n");
 }
 
+// Build a Vamana graph into a preallocated graph + workspace, reusing their
+// storage instead of allocating per call. `g` must already have capacity
+// (n_segments * vectors_per_segment) >= params.data_vectors.n_vectors and a
+// matching dim; `ws` must be sized for params.max_batch_size. Prerotate is not
+// supported on this reuse path. Useful when building many graphs (e.g. DiskANN
+// shards) back to back without churning multi-GB allocations.
+template <typename CONSTRUCT_GRAPH_CONFIG>
+__host__ void construct_graph_into(
+  typename CONSTRUCT_GRAPH_CONFIG::graph_t& g,
+  graph_construct_workspace<CONSTRUCT_GRAPH_CONFIG>& ws,
+  graph_construct_params<CONSTRUCT_GRAPH_CONFIG> params,
+  cudaStream_t stream = 0
+){
+  using graph_cfg_t = typename CONSTRUCT_GRAPH_CONFIG::graph_cfg_t;
+
+  // Load the new vector set into the existing buffers (resets edges + medoid).
+  g.reload(params.data_vectors);
+
+  constexpr uint32_t beam_search_tile_size  = 4;
+  constexpr uint32_t beam_search_block_size = 64;
+  using beam_search_cfg = beam_search_config<
+    graph_cfg_t, graph_cfg_t::dist_func,
+    beam_search_block_size,
+    CONSTRUCT_GRAPH_CONFIG::beam_search_max_search_width,
+    beam_search_tile_size>;
+
+  construct_timer timer;
+  construction_round<CONSTRUCT_GRAPH_CONFIG, beam_search_cfg>(
+    g, ws, params.alpha, params.max_batch_size, timer, stream);
+  timer.print();
+}
+
 template <typename CONSTRUCT_GRAPH_CONFIG>
 __host__ graph<typename CONSTRUCT_GRAPH_CONFIG::graph_cfg_t> construct_graph(
   graph_construct_params<CONSTRUCT_GRAPH_CONFIG> params,

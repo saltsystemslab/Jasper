@@ -4,15 +4,18 @@
 #include <vector>
 #include <fstream>
 #include <iostream>
+#include <stdexcept>
 
 #include <cuda_bf16.h>
 #include <thrust/device_vector.h>
 
 #include "jasper/distance/distance.cuh"
-#include "jasper/index/vector.cuh"
 #include "jasper/lsh/edge_lsh.cuh"
 #include "jasper/lsh/lsh_globals.cuh"
 #include "jasper/lsh/lsh_kernels.cuh"
+#include "jasper/pq/edge_pq.cuh"
+#include "jasper/pq/pq_codebooks.cuh"
+#include "jasper/pq/pq_kernels.cuh"
 
 #include "assert.h"
 #include "stdio.h"
@@ -67,7 +70,15 @@ struct graph_config {
   using edge_lsh_list_t = edge_lsh_list<INDEX_T, N_NEIGHBORS, K_RANKS, PACKED_T>;
   using packed_t = PACKED_T;
   using vector_view_t = vector_view<DATA_T>;
-  
+
+  // Product-Quantization (directional PQ path). Reuses K_RANKS as the number of
+  // subquantizers M; K is fixed at 256 (uint8 codes). Shares the use_lsh gate
+  // (all directional configs enable it) and lives alongside the LSH storage so
+  // the two estimators can be benchmarked on the same graph.
+  static constexpr uint32_t pq_m = K_RANKS;
+  static constexpr uint32_t pq_k = 256;
+  using edge_pq_list_t = edge_pq_list<INDEX_T, N_NEIGHBORS, pq_m>;
+
   static constexpr uint8_t n_neighbors = N_NEIGHBORS;
   static constexpr distance_func dist_func = DIST_FUNC;
   static constexpr index_t vectors_per_segment = 1u << 20;
@@ -83,6 +94,7 @@ struct graph_segment {
   using index_t     = typename graph_cfg::index_t;
   using edge_list_t = typename graph_cfg::edge_list_t;
   using edge_lsh_list_t = typename graph_cfg::edge_lsh_list_t;
+  using edge_pq_list_t  = typename graph_cfg::edge_pq_list_t;
   using vector_view_t    = typename graph_cfg::vector_view_t;
 
   static constexpr uint32_t max_vectors = graph_cfg::vectors_per_segment;
@@ -95,6 +107,7 @@ struct graph_segment {
   uint8_t *edge_counts;
   vector_view_t vectors;
   edge_lsh_list_t* edge_lshs; // only enabled if USE_LSH
+  edge_pq_list_t*  edge_pqs;  // PQ codes; only enabled if USE_LSH (directional)
 
   // Deletion support: 1 BIT per slot (packed), 1 = soft-deleted. Word w covers
   // slots [32w, 32w+32); slot i is bit (i & 31) of deleted_bits[i >> 5]. 8x
@@ -144,10 +157,33 @@ struct graph_segment {
 
     seg.vectors = vector_view_t::allocate(dim, max_vectors, on_host);
 
-    // edge_lshs is allocated lazily on the first populate_edge_lsh() call.
+    // edge_lshs / edge_pqs are allocated lazily on the first
+    // populate_edge_lsh() / populate_edge_pq() call.
     seg.edge_lshs = nullptr;
+    seg.edge_pqs  = nullptr;
 
     return seg;
+  }
+
+  // Lazily allocate the PQ code storage. No-op if already allocated or if
+  // use_lsh (directional storage) is disabled. Matches this segment's on_host.
+  void allocate_edge_pq() {
+    if constexpr (graph_cfg::use_lsh) {
+      if (edge_pqs != nullptr) return;
+
+      auto check = [](cudaError_t err, const char* name) {
+        if (err != cudaSuccess)
+          throw std::runtime_error(std::string(name) + " failed: " + cudaGetErrorString(err));
+      };
+
+      if (on_host) {
+        check(cudaMallocHost(&edge_pqs, max_vectors * sizeof(edge_pq_list_t)),
+              "cudaMallocHost(edge_pqs)");
+      } else {
+        check(cudaMalloc(&edge_pqs, max_vectors * sizeof(edge_pq_list_t)),
+              "cudaMalloc(edge_pqs)");
+      }
+    }
   }
 
   // Lazily allocate the edge_lsh storage. No-op if already allocated or if
@@ -187,6 +223,8 @@ struct graph_segment {
     if constexpr (graph_cfg::use_lsh) {
       if (on_host) cudaFreeHost(edge_lshs); else cudaFree(edge_lshs);
       edge_lshs = nullptr;
+      if (on_host) cudaFreeHost(edge_pqs); else cudaFree(edge_pqs);
+      edge_pqs = nullptr;
     }
     vectors.deallocate();
     edges = nullptr;
@@ -213,6 +251,7 @@ struct graph_segment {
     uint32_t*    new_deleted     = nullptr;
     index_t*     new_slot_to_id  = nullptr;
     edge_lsh_list_t* new_edge_lshs = nullptr;
+    edge_pq_list_t*  new_edge_pqs  = nullptr;
 
     if (target_on_host) {
       cudaMallocHost(&new_edges,       max_vectors * sizeof(edge_list_t));
@@ -225,6 +264,8 @@ struct graph_segment {
       if constexpr (graph_cfg::use_lsh) {
         if (edge_lshs != nullptr)
           cudaMallocHost(&new_edge_lshs, max_vectors * sizeof(edge_lsh_list_t));
+        if (edge_pqs != nullptr)
+          cudaMallocHost(&new_edge_pqs, max_vectors * sizeof(edge_pq_list_t));
       }
     } else {
       cudaMalloc(&new_edges,       max_vectors * sizeof(edge_list_t));
@@ -240,6 +281,8 @@ struct graph_segment {
       if constexpr (graph_cfg::use_lsh) {
         if (edge_lshs != nullptr)
           cudaMalloc(&new_edge_lshs, max_vectors * sizeof(edge_lsh_list_t));
+        if (edge_pqs != nullptr)
+          cudaMalloc(&new_edge_pqs, max_vectors * sizeof(edge_pq_list_t));
       }
     }
     vector_view_t new_vectors =
@@ -264,6 +307,10 @@ struct graph_segment {
           cudaMemcpyAsync(new_edge_lshs, edge_lshs,
                           static_cast<size_t>(n_vectors) * sizeof(edge_lsh_list_t),
                           copy_kind, stream);
+        if (edge_pqs != nullptr)
+          cudaMemcpyAsync(new_edge_pqs, edge_pqs,
+                          static_cast<size_t>(n_vectors) * sizeof(edge_pq_list_t),
+                          copy_kind, stream);
       }
       cudaMemcpyAsync(new_vectors.data, vectors.data,
                       static_cast<size_t>(n_vectors) * padded_dim * sizeof(data_t),
@@ -277,22 +324,25 @@ struct graph_segment {
       cudaFreeHost(edge_counts);
       cudaFreeHost(deleted_bits);
       cudaFreeHost(slot_to_id);
-      if constexpr (graph_cfg::use_lsh) cudaFreeHost(edge_lshs);
+      if constexpr (graph_cfg::use_lsh) { cudaFreeHost(edge_lshs); cudaFreeHost(edge_pqs); }
     } else {
       cudaFree(edges);
       cudaFree(edge_counts);
       cudaFree(deleted_bits);
       cudaFree(slot_to_id);
-      if constexpr (graph_cfg::use_lsh) cudaFree(edge_lshs);
+      if constexpr (graph_cfg::use_lsh) { cudaFree(edge_lshs); cudaFree(edge_pqs); }
     }
     vectors.deallocate();
 
     // Install new buffers.
     edges       = new_edges;
     edge_counts = new_edge_counts;
+
     deleted_bits = new_deleted;
     slot_to_id  = new_slot_to_id;
-    if constexpr (graph_cfg::use_lsh) edge_lshs = new_edge_lshs;
+
+    if constexpr (graph_cfg::use_lsh) { edge_lshs = new_edge_lshs; edge_pqs = new_edge_pqs; }
+
     vectors     = new_vectors;
     on_host     = target_on_host;
   }
@@ -452,6 +502,7 @@ struct graph {
   using segment_t   = graph_segment<graph_cfg>;
   using edge_list_t = typename graph_cfg::edge_list_t;
   using edge_lsh_list_t = typename graph_cfg::edge_lsh_list_t;
+  using edge_pq_list_t  = typename graph_cfg::edge_pq_list_t;
   using packed_t = typename graph_cfg::packed_t;
   using vector_view_t    = typename graph_cfg::vector_view_t;
 
@@ -459,6 +510,8 @@ struct graph {
   static constexpr uint32_t vectors_per_segment = graph_cfg::vectors_per_segment;
   static constexpr bool use_lsh = graph_cfg::use_lsh;
   static constexpr uint8_t k_ranks = graph_cfg::k_ranks;
+  static constexpr uint32_t pq_m = graph_cfg::pq_m;
+  static constexpr uint32_t pq_k = graph_cfg::pq_k;
 
   uint32_t dim;
   index_t n_vectors;
@@ -467,6 +520,11 @@ struct graph {
   index_t global_offset = 0;
   bool on_host;
 
+  // Per-vector squared L2 norm ||x||², indexed by local id (gid - global_offset).
+  // Device array, computed post-build via compute_vector_norms(); used by the PQ
+  // L2 estimator to reconstruct ||q-v||² with the exact ||v||². nullptr until set.
+  float* d_vector_norms = nullptr;
+  
   // Deletion bookkeeping. n_deleted counts soft-deleted vectors not yet
   // consolidated away; consolidation_threshold is the n_deleted/n_live ratio
   // above which maybe_consolidate() triggers.
@@ -571,6 +629,58 @@ struct graph {
     return g;
   }
 
+  // Reuse this graph's already-allocated storage for a new (smaller-or-equal)
+  // vector set: overwrite the vectors, reset edge counts to 0, and reset
+  // medoid / global_offset. Requires the current capacity
+  // (n_segments * vectors_per_segment) >= data.n_vectors and matching dim.
+  // Lets a caller build many shards without reallocating the graph each time.
+  __host__ void reload(vector_view_t data) {
+    const uint64_t capacity =
+        static_cast<uint64_t>(n_segments) * vectors_per_segment;
+    if (static_cast<uint64_t>(data.n_vectors) > capacity)
+      throw std::runtime_error("graph::reload: data.n_vectors exceeds capacity");
+    if (data.dim != dim)
+      throw std::runtime_error("graph::reload: dim mismatch");
+
+    const uint32_t padded_dim = vector_view_t::pad(dim);
+    n_vectors     = static_cast<index_t>(data.n_vectors);
+    medoid        = 0;
+    global_offset = 0;
+
+    std::vector<segment_t> h_segments(segments.begin(), segments.end());
+
+    const cudaMemcpyKind copy_kind =
+        data.on_host ? cudaMemcpyHostToDevice : cudaMemcpyDeviceToDevice;
+
+    cudaStream_t stream;
+    cudaStreamCreate(&stream);
+
+    for (uint32_t s = 0; s < n_segments; s++) {
+      const uint64_t seg_begin = static_cast<uint64_t>(s) * vectors_per_segment;
+      const uint32_t seg_count = (seg_begin < static_cast<uint64_t>(n_vectors))
+          ? static_cast<uint32_t>(std::min<uint64_t>(
+                vectors_per_segment, static_cast<uint64_t>(n_vectors) - seg_begin))
+          : 0u;
+
+      h_segments[s].n_vectors = static_cast<index_t>(seg_count);
+      if (seg_count > 0) {
+        cudaMemcpyAsync(h_segments[s].vectors.data,
+                        data.data + seg_begin * padded_dim,
+                        static_cast<size_t>(seg_count) * padded_dim * sizeof(data_t),
+                        copy_kind, stream);
+        cudaMemsetAsync(h_segments[s].edge_counts, 0,
+                        static_cast<size_t>(seg_count) * sizeof(uint8_t), stream);
+      }
+    }
+
+    cudaStreamSynchronize(stream);
+    cudaStreamDestroy(stream);
+
+    // Re-upload segment structs so device-side views see the updated n_vectors.
+    segments = thrust::device_vector<segment_t>(h_segments.begin(), h_segments.end());
+    cudaDeviceSynchronize();
+  }
+
   // load the range of vectors with index [start, end) to a vector view
   // useful for graph construction
   __host__ void load_vectors_to_view(vector_view_t target, index_t start, index_t end) {
@@ -614,6 +724,7 @@ struct graph {
     }
     segments.clear();
     segments.shrink_to_fit();
+    if (d_vector_norms) { cudaFree(d_vector_norms); d_vector_norms = nullptr; }
     n_vectors  = 0;
     n_segments = 0;
   }
@@ -722,10 +833,17 @@ struct graph {
     uint32_t   n_segments;
     index_t    medoid;
     index_t    global_offset;
+    const float* __restrict__ vector_norms;  // per-local-id ||x||² (may be null)
 
     __device__ __forceinline__
     index_t to_local(index_t global_idx) const {
       return global_idx - global_offset;
+    }
+
+    // Exact ||x||² for the vector with this global id (see graph::d_vector_norms).
+    __device__ __forceinline__
+    float get_vector_norm(index_t global_idx) const {
+      return vector_norms[to_local(global_idx)];
     }
 
     __device__ __forceinline__
@@ -853,7 +971,7 @@ struct graph {
         assert(coord <= COORD_MASK && "coord does not fit in packed_t coord bits");
         packed_t& slot = segments[segment_of(local_idx)]
             .edge_lshs[local_of(local_idx)]
-            .rows[edge_idx].packed[rank];
+            .packed[static_cast<uint32_t>(edge_idx) * k_ranks + rank];
         slot = static_cast<packed_t>((slot & SIGN_MASK) | (static_cast<packed_t>(coord) & COORD_MASK));
       } else {
         assert(false && "set_lsh_coord called with use_lsh=false");
@@ -869,7 +987,7 @@ struct graph {
         assert(local_idx < n_vectors && "global_idx out of bounds");
         segments[segment_of(local_idx)]
             .edge_lshs[local_of(local_idx)]
-            .rows[edge_idx].packed[rank] = word;
+            .packed[static_cast<uint32_t>(edge_idx) * k_ranks + rank] = word;
       } else {
         assert(false && "set_lsh_packed called with use_lsh=false");
       }
@@ -898,7 +1016,7 @@ struct graph {
         assert(local_idx < n_vectors && "global_idx out of bounds");
         packed_t& slot = segments[segment_of(local_idx)]
             .edge_lshs[local_of(local_idx)]
-            .rows[edge_idx].packed[rank];
+            .packed[static_cast<uint32_t>(edge_idx) * k_ranks + rank];
         if (is_positive) slot &= COORD_MASK;
         else             slot |= SIGN_MASK;
       } else {
@@ -913,9 +1031,36 @@ struct graph {
         assert(local_idx < n_vectors && "global_idx out of bounds");
         segments[segment_of(local_idx)]
             .edge_lshs[local_of(local_idx)]
-            .rows[edge_idx].mag_sq = mag_sq;
+            .mag_sq[edge_idx] = mag_sq;
       } else {
         assert(false && "set_lsh_mag_sq called with use_lsh=false");
+      }
+    }
+
+    __device__ __forceinline__
+    void set_pq_code(index_t global_idx, uint8_t edge_idx, uint32_t sub, uint8_t c) {
+      if constexpr (use_lsh) {
+        index_t local_idx = to_local(global_idx);
+        assert(local_idx < n_vectors && "global_idx out of bounds");
+        segments[segment_of(local_idx)]
+            .edge_pqs[local_of(local_idx)]
+            .set_code(edge_idx, sub, c);
+      } else {
+        assert(false && "set_pq_code called with use_lsh=false");
+      }
+    }
+
+    __device__ __forceinline__
+    uint8_t get_pq_code(index_t global_idx, uint8_t edge_idx, uint32_t sub) const {
+      if constexpr (use_lsh) {
+        index_t local_idx = to_local(global_idx);
+        assert(local_idx < n_vectors && "global_idx out of bounds");
+        return segments[segment_of(local_idx)]
+            .edge_pqs[local_of(local_idx)]
+            .get_code(edge_idx, sub);
+      } else {
+        assert(false && "get_pq_code called with use_lsh=false");
+        return 0;
       }
     }
   };
@@ -986,8 +1131,22 @@ struct graph {
       n_vectors,
       n_segments,
       medoid,
-      global_offset
+      global_offset,
+      d_vector_norms
     };
+  }
+
+  // Compute exact per-vector ||x||² into d_vector_norms (device), indexed by
+  // local id. Cheap one-pass reduction; call once after vectors are loaded and
+  // before a PQ L2 search. Requires the graph on device.
+  void compute_vector_norms() {
+    if (n_vectors == 0) return;
+    if (d_vector_norms == nullptr)
+      cudaMalloc(&d_vector_norms,
+                 static_cast<size_t>(n_vectors) * sizeof(float));
+    pq_compute_vector_norms<graph_cfg, device_view>
+        <<<static_cast<uint32_t>(n_vectors), 128>>>(view(), d_vector_norms);
+    cudaDeviceSynchronize();
   }
 
   // Given a rotated vector, populate the edge lsh.
@@ -1038,6 +1197,114 @@ struct graph {
     populate_lsh<graph_cfg><<<grid, block_threads, smem_bytes>>>(view());
   }
 
+  // ── Product Quantization (directional PQ path) ───────────────────────────
+
+  // Train the PQ codebooks on a sample of the graph's edge residuals via
+  // per-subspace k-means (Lloyd's). Returns device-resident codebooks; caller
+  // owns them and must call .free(). Mirrors generate_lsh_globals: run while
+  // the graph vectors are accessible (device or host-pinned zero-copy).
+  pq_codebooks<graph_cfg::pq_m, graph_cfg::pq_k> generate_pq_codebooks(
+      uint32_t n_train      = 40000,
+      uint32_t kmeans_iter  = 12,
+      uint64_t seed         = 123) const {
+    static_assert(graph_cfg::use_lsh,
+                  "generate_pq_codebooks requires graph_cfg::use_lsh");
+    if (n_vectors == 0)
+      throw std::runtime_error("generate_pq_codebooks: graph is empty");
+
+    constexpr uint32_t M = graph_cfg::pq_m;
+    constexpr uint32_t K = graph_cfg::pq_k;   // 256
+    const uint32_t padded_dim = get_padded_dim();
+    if (padded_dim % M != 0)
+      throw std::runtime_error(
+          "generate_pq_codebooks: padded_dim (" + std::to_string(padded_dim) +
+          ") must be divisible by M=" + std::to_string(M));
+    const uint32_t dsub = padded_dim / M;
+    if (n_train < K) n_train = K;   // need enough points to seed K centroids
+
+    // ── Sample training residuals ──
+    __half* d_X = nullptr;
+    if (cudaMalloc(&d_X, static_cast<size_t>(n_train) * padded_dim * sizeof(__half))
+        != cudaSuccess)
+      throw std::runtime_error("generate_pq_codebooks: cudaMalloc(d_X) failed");
+    pq_sample_residuals<graph_cfg><<<n_train, 128>>>(view(), d_X, n_train, seed);
+
+    // ── Allocate codebooks + k-means scratch ──
+    auto cb = pq_codebooks<M, K>::allocate(dsub);
+    uint8_t*  d_labels = nullptr;
+    float*    d_sum    = nullptr;
+    uint32_t* d_count  = nullptr;
+    cudaMalloc(&d_labels, static_cast<size_t>(n_train) * M * sizeof(uint8_t));
+    cudaMalloc(&d_sum,    static_cast<size_t>(M) * K * dsub * sizeof(float));
+    cudaMalloc(&d_count,  static_cast<size_t>(M) * K * sizeof(uint32_t));
+
+    const uint64_t init_seed = seed ^ 0xA5A5A5A5ull;
+    pq_kmeans_init<M, K><<<M * K, 128>>>(
+        d_X, n_train, padded_dim, cb.d_centroids, init_seed);
+
+    // assign uses one thread per centroid (blockDim == K).
+    const size_t assign_smem =
+        static_cast<size_t>(padded_dim) * sizeof(float)
+        + (K / 32) * sizeof(float) + (K / 32) * sizeof(int);
+    auto assign_kernel = pq_kmeans_assign<M, K>;
+    if (assign_smem > 48 * 1024)
+      cudaFuncSetAttribute(assign_kernel,
+          cudaFuncAttributeMaxDynamicSharedMemorySize,
+          static_cast<int>(assign_smem));
+
+    for (uint32_t it = 0; it < kmeans_iter; ++it) {
+      cudaMemsetAsync(d_sum, 0, static_cast<size_t>(M) * K * dsub * sizeof(float));
+      cudaMemsetAsync(d_count, 0, static_cast<size_t>(M) * K * sizeof(uint32_t));
+      assign_kernel<<<n_train, K, assign_smem>>>(
+          d_X, n_train, padded_dim, cb.d_centroids, d_labels);
+      pq_kmeans_accumulate<M, K><<<n_train, 128>>>(
+          d_X, n_train, padded_dim, d_labels, d_sum, d_count);
+      pq_kmeans_finalize<M, K><<<M * K, 128>>>(
+          d_X, n_train, padded_dim, d_sum, d_count, cb.d_centroids, init_seed, it);
+    }
+
+    cudaDeviceSynchronize();
+
+    cudaFree(d_labels);
+    cudaFree(d_sum);
+    cudaFree(d_count);
+    cudaFree(d_X);
+    return cb;
+  }
+
+  // Encode every graph edge into its M-byte PQ code using trained codebooks.
+  // Lazily allocates edge_pqs, mirroring populate_edge_lsh.
+  void populate_edge_pq(const pq_codebooks<graph_cfg::pq_m, graph_cfg::pq_k>& cb) {
+    static_assert(graph_cfg::use_lsh,
+                  "populate_edge_pq requires graph_cfg::use_lsh");
+
+    {
+      std::vector<segment_t> h_segs(segments.begin(), segments.end());
+      bool any_allocated = false;
+      for (auto& seg : h_segs) {
+        if (seg.edge_pqs == nullptr) { seg.allocate_edge_pq(); any_allocated = true; }
+      }
+      if (any_allocated)
+        segments = thrust::device_vector<segment_t>(h_segs.begin(), h_segs.end());
+    }
+
+    constexpr uint32_t M = graph_cfg::pq_m;
+    constexpr uint32_t K = graph_cfg::pq_k;
+    const uint32_t padded_dim = get_padded_dim();
+    const size_t smem_bytes =
+        static_cast<size_t>(padded_dim) * sizeof(float)
+        + (K / 32) * sizeof(float) + (K / 32) * sizeof(int);
+
+    auto kernel = pq_populate<graph_cfg, device_view, M, K>;
+    if (smem_bytes > 48 * 1024)
+      cudaFuncSetAttribute(kernel,
+          cudaFuncAttributeMaxDynamicSharedMemorySize,
+          static_cast<int>(smem_bytes));
+
+    const dim3 grid(static_cast<uint32_t>(n_vectors));
+    kernel<<<grid, K, smem_bytes>>>(view(), cb.d_centroids);
+  }
+
   lsh_globals<graph_cfg::k_ranks> generate_lsh_globals(
     uint32_t n_samples = 16384,
     uint64_t seed      = 42
@@ -1045,11 +1312,11 @@ struct graph {
     static_assert(graph_cfg::use_lsh,
                   "generate_lsh_globals requires graph_cfg::use_lsh");
 
-    if (on_host) {
-      throw std::runtime_error(
-          "generate_lsh_globals requires graph on device — "
-          "call move_to(false) first");
-    }
+    // if (on_host) {
+    //   throw std::runtime_error(
+    //       "generate_lsh_globals requires graph on device — "
+    //       "call move_to(false) first");
+    // }
     if (n_vectors == 0) {
       throw std::runtime_error("generate_lsh_globals: graph is empty");
     }
@@ -1157,41 +1424,38 @@ struct graph {
 
 template <typename graph_cfg>
 __host__ graph<graph_cfg> load_graph_from_file(std::string input_fname,
-                                                  uint32_t dim,
-                                                  bool on_host = false) {
+                                               uint32_t dim,
+                                               bool on_host = false
+) {
   std::ifstream inputFile(input_fname, std::ios::binary);
   if (!inputFile.is_open()) {
     std::cerr << "Failed to open " << input_fname << " for graph load\n";
     exit(EXIT_FAILURE);
   }
 
-  using index_t        = typename graph_cfg::index_t;
-  using data_t         = typename graph_cfg::data_t;
-  using edge_list_t    = typename graph_cfg::edge_list_t;
-  using segment_t      = graph_segment<graph_cfg>;
-  using vector_view_t  = typename graph_cfg::vector_view_t;
+  using index_t       = typename graph_cfg::index_t;
+  using data_t        = typename graph_cfg::data_t;
+  using edge_list_t   = typename graph_cfg::edge_list_t;
+  using segment_t     = graph_segment<graph_cfg>;
+  using vector_view_t = typename graph_cfg::vector_view_t;
 
   static constexpr uint32_t vector_per_segment = graph_cfg::vectors_per_segment;
 
-  uint64_t total_file_size;
-  uint64_t big_n_vectors;
-  uint64_t medoid_as_uint64;
-  uint64_t bytes_per_node;
-
-  // Read the metadata
-  inputFile.read(reinterpret_cast<char*>(&total_file_size), sizeof(uint64_t));
-  inputFile.read(reinterpret_cast<char*>(&big_n_vectors),   sizeof(uint64_t));
+  uint64_t total_file_size, big_n_vectors, medoid_as_uint64, bytes_per_node;
+  inputFile.read(reinterpret_cast<char*>(&total_file_size),  sizeof(uint64_t));
+  inputFile.read(reinterpret_cast<char*>(&big_n_vectors),    sizeof(uint64_t));
   inputFile.read(reinterpret_cast<char*>(&medoid_as_uint64), sizeof(uint64_t));
   inputFile.read(reinterpret_cast<char*>(&bytes_per_node),   sizeof(uint64_t));
 
-  std::cout << "total_file_size: " << total_file_size << "\n";
-  std::cout << "big_n_vectors: "   << big_n_vectors << "\n";
-  std::cout << "medoid: "          << medoid_as_uint64 << "\n";
-  std::cout << "bytes_per_node: "  << bytes_per_node << "\n";
-  std::cout << "dim: "             << dim << "\n";
+  std::cout << "total_file_size: " << total_file_size << "\n"
+            << "big_n_vectors: "   << big_n_vectors   << "\n"
+            << "medoid: "          << medoid_as_uint64<< "\n"
+            << "bytes_per_node: "  << bytes_per_node  << "\n"
+            << "dim: "             << dim             << "\n";
 
-  uint32_t padded_dim = vector_view<data_t>::pad(dim);
-  uint32_t n_segments = static_cast<uint32_t>((big_n_vectors + vector_per_segment - 1) / vector_per_segment);
+  const uint32_t padded_dim = vector_view<data_t>::pad(dim);
+  const uint32_t n_segments =
+      static_cast<uint32_t>((big_n_vectors + vector_per_segment - 1) / vector_per_segment);
 
   // Detect per-node columns by bytes_per_node. Layouts that have shipped:
   //   legacy:        vector + edge_count + edge_list
@@ -1199,69 +1463,162 @@ __host__ graph<graph_cfg> load_graph_from_file(std::string input_fname,
   //   +deleted+id:   ... + deleted(1B) + slot_to_id(index_t)          (byte-inline)
   //   bitpacked+id:  ... + slot_to_id(index_t), deletion as a packed  (current)
   //                  ceil(N/8)-byte bitmask block after all records
-  uint64_t bpn_base         = sizeof(data_t) * dim + sizeof(uint8_t) + sizeof(edge_list_t);
-  uint64_t bpn_with_deleted = bpn_base + sizeof(uint8_t);
-  uint64_t bpn_with_id      = bpn_with_deleted + sizeof(index_t);
-  uint64_t bpn_bitpacked    = bpn_base + sizeof(index_t);  // id inline, no deleted byte
-  bool bitpacked_deleted  = (bytes_per_node == bpn_bitpacked);
-  bool has_id_column      = (bytes_per_node == bpn_with_id) || bitpacked_deleted;
-  bool has_inline_deleted = (bytes_per_node == bpn_with_id) || (bytes_per_node == bpn_with_deleted);
-  bool has_deleted_column = has_inline_deleted || bitpacked_deleted;
+  const uint64_t bpn_base         = sizeof(data_t) * dim + sizeof(uint8_t) + sizeof(edge_list_t);
+  const uint64_t bpn_with_deleted = bpn_base + sizeof(uint8_t);
+  const uint64_t bpn_with_id      = bpn_with_deleted + sizeof(index_t);
+  const uint64_t bpn_bitpacked    = bpn_base + sizeof(index_t);  // id inline, no deleted byte
+  const bool bitpacked_deleted  = (bytes_per_node == bpn_bitpacked);
+  const bool has_id_column      = (bytes_per_node == bpn_with_id) || bitpacked_deleted;
+  const bool has_inline_deleted = (bytes_per_node == bpn_with_id) || (bytes_per_node == bpn_with_deleted);
+  const bool has_deleted_column = has_inline_deleted || bitpacked_deleted;
   if (!has_deleted_column && bytes_per_node != bpn_base) {
     std::cerr << "Warning: bytes_per_node=" << bytes_per_node
               << " matches none of legacy(" << bpn_base << ")/+del("
               << bpn_with_deleted << ")/+id(" << bpn_with_id
               << ")/bitpacked(" << bpn_bitpacked << "); assuming legacy layout.\n";
   }
+  // Per-node record size on disk == bytes_per_node itself (the trailing
+  // bit-packed deletion block and next_id counter are file-level, not
+  // per-node).
+  const size_t data_per_node = static_cast<size_t>(bytes_per_node);
 
-  // Pinned host staging buffers (always pinned, regardless of on_host, for fast file I/O)
-  uint8_t*     h_edge_counts;
-  edge_list_t* h_edges;
-  data_t*      h_vectors;
-  uint8_t*     h_deleted;
+  const cudaMemcpyKind copy_kind =
+      on_host ? cudaMemcpyHostToHost : cudaMemcpyHostToDevice;
 
-  index_t*     h_slot_to_id;
+  // ── Reusable scratch sized for ONE segment (not the whole file) ──
+  // raw: interleaved bytes straight off disk
+  std::vector<uint8_t> raw(static_cast<size_t>(vector_per_segment) * data_per_node);
 
-  cudaMallocHost(&h_edge_counts, sizeof(uint8_t)     * big_n_vectors);
-  cudaMallocHost(&h_edges,       sizeof(edge_list_t) * big_n_vectors);
-  cudaMallocHost(&h_vectors,     sizeof(data_t)      * big_n_vectors * padded_dim);
-  cudaMallocHost(&h_deleted,     sizeof(uint8_t)     * big_n_vectors);
-  cudaMallocHost(&h_slot_to_id,  sizeof(index_t)     * big_n_vectors);
-  memset(h_vectors, 0,           sizeof(data_t)      * big_n_vectors * padded_dim);
-  memset(h_deleted, 0,           sizeof(uint8_t)     * big_n_vectors);
+  // Pinned, separated staging — only needed when the segment lands on the GPU.
+  data_t*      h_vectors = nullptr;
+  edge_list_t* h_edges   = nullptr;
+  uint8_t*     h_counts  = nullptr;
+  index_t*     h_ids     = nullptr;
+  if (!on_host) {
+    cudaMallocHost(&h_vectors, sizeof(data_t)      * vector_per_segment * padded_dim);
+    cudaMallocHost(&h_edges,   sizeof(edge_list_t) * vector_per_segment);
+    cudaMallocHost(&h_counts,  sizeof(uint8_t)     * vector_per_segment);
+    cudaMallocHost(&h_ids,     sizeof(index_t)     * vector_per_segment);
+  }
+  // Per-slot inline-deleted byte staging, reused across segments.
+  std::vector<uint8_t> h_deleted_byte(vector_per_segment, 0);
 
   uint64_t n_deleted_loaded = 0;
-  for (uint64_t i = 0; i < big_n_vectors; i++) {
-    inputFile.read(reinterpret_cast<char*>(&h_vectors[i * padded_dim]),
-                   sizeof(data_t) * dim);
-    uint8_t n_neighbors;
-    inputFile.read(reinterpret_cast<char*>(&n_neighbors), sizeof(uint8_t));
-    h_edge_counts[i] = n_neighbors;
-    inputFile.read(reinterpret_cast<char*>(&h_edges[i]), sizeof(edge_list_t));
+  std::vector<segment_t> h_segments(n_segments);
+
+  for (uint32_t s = 0; s < n_segments; s++) {
+    const uint64_t seg_begin = static_cast<uint64_t>(s) * vector_per_segment;
+    const uint32_t seg_count = static_cast<uint32_t>(
+        std::min(static_cast<uint64_t>(vector_per_segment), big_n_vectors - seg_begin));
+
+    // 1. One bulk, sequential read for the whole segment.
+    const std::streamsize want =
+        static_cast<std::streamsize>(seg_count) * data_per_node;
+    inputFile.read(reinterpret_cast<char*>(raw.data()), want);
+    if (inputFile.gcount() != want) {
+      std::cerr << "\nShort read at segment " << s << ": got "
+                << inputFile.gcount() << " of " << want << " bytes\n";
+      exit(EXIT_FAILURE);
+    }
+
+    // 2. Allocate this segment's destination (host or device). Covers
+    //    vectors/edges/edge_counts/deleted_bits/slot_to_id in one shot
+    //    (deleted_bits zeroed, slot_to_id filled with INVALID).
+    segment_t& seg = h_segments[s];
+    seg = segment_t::allocate(dim, on_host);
+    seg.n_vectors = static_cast<index_t>(seg_count);
+
+    // 3. Scatter target: straight into the host segment, or into pinned
+    //    staging when the segment lives on the device.
+    data_t*      vec_dst   = on_host ? seg.vectors.data : h_vectors;
+    edge_list_t* edge_dst  = on_host ? seg.edges        : h_edges;
+    uint8_t*     count_dst = on_host ? seg.edge_counts  : h_counts;
+    index_t*     id_dst    = on_host ? seg.slot_to_id   : h_ids;
+
+    // Zero vector padding + unused tail rows, all edge counts, and mark the
+    // id tail as INVALID (0xFF pattern matches graph_segment::allocate).
+    std::memset(vec_dst,   0,    sizeof(data_t)  * vector_per_segment * padded_dim);
+    std::memset(count_dst, 0,    sizeof(uint8_t) * vector_per_segment);
+    std::memset(id_dst,    0xFF, sizeof(index_t) * vector_per_segment);
+    std::fill(h_deleted_byte.begin(), h_deleted_byte.end(), 0);
+
+    // 4. Scatter interleaved -> separated layout (CPU only, parallel).
+    #pragma omp parallel for schedule(static)
+    for (uint32_t i = 0; i < seg_count; i++) {
+      const uint8_t* p = raw.data() + static_cast<size_t>(i) * data_per_node;
+      std::memcpy(&vec_dst[static_cast<size_t>(i) * padded_dim], p,
+                  sizeof(data_t) * dim);
+      p += sizeof(data_t) * dim;
+      count_dst[i] = *p;
+      p += sizeof(uint8_t);
+      std::memcpy(&edge_dst[i], p, sizeof(edge_list_t));
+      p += sizeof(edge_list_t);
+      if (has_inline_deleted) {
+        h_deleted_byte[i] = *p;
+        p += sizeof(uint8_t);
+      }
+      if (has_id_column) {
+        std::memcpy(&id_dst[i], p, sizeof(index_t));
+      } else {
+        id_dst[i] = static_cast<index_t>(seg_begin + i);  // legacy: identity ids
+      }
+    }
+
+    // Byte-inline deletion layouts: pack this segment's per-slot deletion
+    // bytes into a local bitmask (bit j == local slot j) and copy it in.
+    // (Bit-packed layout is handled in one pass after the segment loop.)
     if (has_inline_deleted) {
-      uint8_t del;
-      inputFile.read(reinterpret_cast<char*>(&del), sizeof(uint8_t));
-      h_deleted[i] = del;
-      if (del) n_deleted_loaded++;
+      std::vector<uint32_t> seg_bits(segment_t::deleted_words(seg_count), 0u);
+      for (uint32_t j = 0; j < seg_count; j++) {
+        if (h_deleted_byte[j]) {
+          seg_bits[j >> 5] |= (1u << (j & 31u));
+          n_deleted_loaded++;
+        }
+      }
+      cudaMemcpy(seg.deleted_bits, seg_bits.data(),
+                 seg_bits.size() * sizeof(uint32_t), copy_kind);
     }
-    if (has_id_column) {
-      inputFile.read(reinterpret_cast<char*>(&h_slot_to_id[i]), sizeof(index_t));
-    } else {
-      h_slot_to_id[i] = static_cast<index_t>(i);  // legacy: identity ids
+
+    // 5. For device segments, push it over in bulk synchronous copies.
+    if (!on_host) {
+      cudaMemcpy(seg.vectors.data, vec_dst,
+                 sizeof(data_t) * vector_per_segment * padded_dim, copy_kind);
+      cudaMemcpy(seg.edges, edge_dst,
+                 sizeof(edge_list_t) * vector_per_segment, copy_kind);
+      cudaMemcpy(seg.edge_counts, count_dst,
+                 sizeof(uint8_t) * vector_per_segment, copy_kind);
+      cudaMemcpy(seg.slot_to_id, id_dst,
+                 sizeof(index_t) * vector_per_segment, copy_kind);
     }
+
+    std::cout << "\r[load] segment " << (s + 1) << "/" << n_segments << std::flush;
   }
-  // Bit-packed deletion block (current format): ceil(N/8) bytes after all node
-  // records, bit i == slot i. Unpack into the per-slot h_deleted byte staging.
+  std::cout << "\n";
+
+  // Bit-packed deletion block (current format): ceil(N/8) bytes after all
+  // node records, bit i == GLOBAL slot i. Read once, then redistribute each
+  // segment's slice into its own deleted_bits.
   if (bitpacked_deleted) {
-    uint64_t nbytes = (big_n_vectors + 7) / 8;
+    const uint64_t nbytes = (big_n_vectors + 7) / 8;
     std::vector<uint8_t> packed(nbytes);
     inputFile.read(reinterpret_cast<char*>(packed.data()), static_cast<std::streamsize>(nbytes));
-    for (uint64_t i = 0; i < big_n_vectors; i++) {
-      uint8_t bit = (packed[i >> 3] >> (i & 7u)) & 1u;
-      h_deleted[i] = bit;
-      if (bit) n_deleted_loaded++;
+    for (uint32_t s = 0; s < n_segments; s++) {
+      const uint64_t seg_begin = static_cast<uint64_t>(s) * vector_per_segment;
+      const uint32_t seg_count = static_cast<uint32_t>(h_segments[s].n_vectors);
+      std::vector<uint32_t> seg_bits(segment_t::deleted_words(seg_count), 0u);
+      for (uint32_t j = 0; j < seg_count; j++) {
+        const uint64_t gidx = seg_begin + j;
+        const uint8_t bit = (packed[gidx >> 3] >> (gidx & 7u)) & 1u;
+        if (bit) {
+          seg_bits[j >> 5] |= (1u << (j & 31u));
+          n_deleted_loaded++;
+        }
+      }
+      cudaMemcpy(h_segments[s].deleted_bits, seg_bits.data(),
+                 seg_bits.size() * sizeof(uint32_t), copy_kind);
     }
   }
+
   // Stable-id counter: persisted as a trailing field when the id column is
   // present; otherwise it's just the vector count (identity ids).
   uint64_t next_id_loaded = big_n_vectors;
@@ -1270,91 +1627,13 @@ __host__ graph<graph_cfg> load_graph_from_file(std::string input_fname,
   }
   inputFile.close();
 
-  // Source is pinned host; destination depends on where the segment lives.
-  const cudaMemcpyKind copy_kind =
-      on_host ? cudaMemcpyHostToHost : cudaMemcpyHostToDevice;
-
-  cudaStream_t stream;
-  cudaStreamCreate(&stream);
-
-  std::vector<segment_t> h_segments(n_segments);
-
-  for (uint32_t s = 0; s < n_segments; s++) {
-    uint64_t seg_begin = static_cast<uint64_t>(s) * vector_per_segment;
-    uint32_t seg_count = static_cast<uint32_t>(
-        std::min(static_cast<uint64_t>(vector_per_segment), big_n_vectors - seg_begin));
-
-    segment_t& seg = h_segments[s];
-    seg.n_vectors = static_cast<index_t>(seg_count);
-
-    // Allocate edges / edge_counts / deleted / slot_to_id on host or device
-    if (on_host) {
-      cudaMallocHost(&seg.edges,       vector_per_segment * sizeof(edge_list_t));
-      cudaMallocHost(&seg.edge_counts, vector_per_segment * sizeof(uint8_t));
-      std::memset(seg.edge_counts, 0,  vector_per_segment * sizeof(uint8_t));
-      cudaMallocHost(&seg.deleted_bits, segment_t::deleted_words(vector_per_segment) * sizeof(uint32_t));
-      std::memset(seg.deleted_bits, 0,  segment_t::deleted_words(vector_per_segment) * sizeof(uint32_t));
-      cudaMallocHost(&seg.slot_to_id,  vector_per_segment * sizeof(index_t));
-      std::memset(seg.slot_to_id, 0xFF, vector_per_segment * sizeof(index_t));
-    } else {
-      cudaMalloc(&seg.edges,       vector_per_segment * sizeof(edge_list_t));
-      cudaMalloc(&seg.edge_counts, vector_per_segment * sizeof(uint8_t));
-      cudaMemsetAsync(seg.edge_counts, 0,
-                      vector_per_segment * sizeof(uint8_t), stream);
-      cudaMalloc(&seg.slot_to_id,  vector_per_segment * sizeof(index_t));
-      cudaMemsetAsync(seg.slot_to_id, 0xFF,
-                      vector_per_segment * sizeof(index_t), stream);
-      cudaMalloc(&seg.deleted_bits, segment_t::deleted_words(vector_per_segment) * sizeof(uint32_t));
-      cudaMemsetAsync(seg.deleted_bits, 0,
-                      segment_t::deleted_words(vector_per_segment) * sizeof(uint32_t), stream);
-    }
-
-    seg.vectors = vector_view_t::allocate(dim, vector_per_segment, on_host);
-    seg.on_host = on_host;
-
-    // Copy this segment's slice (kind picked above)
-    cudaMemcpyAsync(seg.edge_counts,
-                    &h_edge_counts[seg_begin],
-                    seg_count * sizeof(uint8_t),
-                    copy_kind, stream);
-
-    cudaMemcpyAsync(seg.edges,
-                    &h_edges[seg_begin],
-                    seg_count * sizeof(edge_list_t),
-                    copy_kind, stream);
-
-    {
-      // Pack this segment's per-slot deletion bytes into a local bitmask
-      // (bit j == local slot j) and copy it in. Synchronous so the temp
-      // buffer can be released here (no async lifetime concerns).
-      std::vector<uint32_t> seg_bits(segment_t::deleted_words(seg_count), 0u);
-      for (uint32_t j = 0; j < seg_count; j++)
-        if (h_deleted[seg_begin + j]) seg_bits[j >> 5] |= (1u << (j & 31u));
-      cudaMemcpy(seg.deleted_bits, seg_bits.data(),
-                 seg_bits.size() * sizeof(uint32_t), copy_kind);
-    }
-
-    cudaMemcpyAsync(seg.slot_to_id,
-                    &h_slot_to_id[seg_begin],
-                    seg_count * sizeof(index_t),
-                    copy_kind, stream);
-
-    cudaMemcpyAsync(seg.vectors.data,
-                    &h_vectors[seg_begin * padded_dim],
-                    seg_count * padded_dim * sizeof(data_t),
-                    copy_kind, stream);
+  if (!on_host) {
+    cudaFreeHost(h_vectors);
+    cudaFreeHost(h_edges);
+    cudaFreeHost(h_counts);
+    cudaFreeHost(h_ids);
   }
 
-  cudaStreamSynchronize(stream);
-  cudaStreamDestroy(stream);
-
-  cudaFreeHost(h_edge_counts);
-  cudaFreeHost(h_edges);
-  cudaFreeHost(h_vectors);
-  cudaFreeHost(h_deleted);
-  cudaFreeHost(h_slot_to_id);
-
-  // create graph
   graph<graph_cfg> g{};
   g.dim        = dim;
   g.n_vectors  = static_cast<index_t>(big_n_vectors);
@@ -1506,6 +1785,311 @@ __host__ void save_graph_to_file(const graph<graph_cfg>& g,
             << "  medoid          : " << g.medoid        << "\n"
             << "  dim             : " << dim             << "\n"
             << "  total_file_size : " << total_file_size << "\n";
+}
+
+// ── Directional (LSH/PQ) graph persistence ──────────────────────────────────
+// Extends the base on-disk format above with an optional trailer holding
+// whichever of the LSH/PQ artifacts (edge_lshs, edge_pqs, per-vector norms,
+// lsh_globals, pq_codebooks) have been populated on the graph. The trailer is
+// purely additive: save_directional_graph_to_file first writes the exact same
+// byte-for-byte base section save_graph_to_file already produces, then
+// appends the trailer after it. Old files therefore have no trailer (and
+// load_graph_from_file never reads past the base section, so it's unaffected
+// either way), and load_directional_graph_from_file falls back to a
+// base-only bundle whenever the trailer is missing or unrecognized.
+//
+// ⚠ KNOWN GAP: the trailer does NOT persist whether the graph was
+// prerotated, or the rotation seed (graph_construct_params::prerotate /
+// prerotate_seed) — the estimator artifacts above don't need it, but the
+// caller does, to rotate queries at search time the same way the vectors
+// were rotated at build time. Right now the caller (see
+// ffi/jasper_ffi_common.cuh's LoadDirectionalGraph_##id /
+// python/jasper/__init__.py's Graph.load) must
+// re-supply the same prerotate/prerotate_seed used at construction; get it
+// wrong and queries silently search un-rotated against a rotated index —
+// wrong results, no error. Fixing this properly means adding prerotate +
+// prerotate_seed to the trailer (additive, same pattern as everything else
+// here) and having the loader hand them back instead of taking them as
+// parameters.
+inline constexpr uint32_t DIRECTIONAL_TRAILER_MAGIC   = 0x484C5344u;  // arbitrary sentinel
+inline constexpr uint32_t DIRECTIONAL_TRAILER_VERSION = 1u;
+
+// Bundle returned by load_directional_graph_from_file. `codebooks` owns its
+// device centroids (like generate_pq_codebooks) — call .free() on it once
+// has_pq is true and the bundle is no longer needed.
+template <typename graph_cfg>
+struct directional_graph_bundle {
+  graph<graph_cfg> g{};
+  bool has_lsh = false;
+  bool has_pq  = false;
+  lsh_globals<graph_cfg::k_ranks> globals{};
+  pq_codebooks<graph_cfg::pq_m, graph_cfg::pq_k> codebooks{};
+};
+
+template <typename graph_cfg>
+__host__ void save_directional_graph_to_file(
+    const graph<graph_cfg>& g,
+    const lsh_globals<graph_cfg::k_ranks>* globals,                  // nullptr if LSH not built
+    const pq_codebooks<graph_cfg::pq_m, graph_cfg::pq_k>* codebooks, // nullptr if PQ not built
+    std::string output_fname)
+{
+  static_assert(graph_cfg::use_lsh,
+                "save_directional_graph_to_file requires graph_cfg::use_lsh");
+
+  using segment_t       = graph_segment<graph_cfg>;
+  using edge_lsh_list_t = typename graph_cfg::edge_lsh_list_t;
+  using edge_pq_list_t  = typename graph_cfg::edge_pq_list_t;
+  constexpr uint32_t vectors_per_segment = graph_cfg::vectors_per_segment;
+
+  // Base section: identical bytes to save_graph_to_file, so old loaders (and
+  // load_graph_from_file itself) keep working unchanged.
+  save_graph_to_file<graph_cfg>(g, output_fname);
+  if (g.n_vectors == 0) return;
+
+  std::vector<segment_t> h_segments(g.segments.begin(), g.segments.end());
+  const bool has_lsh   = globals != nullptr && h_segments[0].edge_lshs != nullptr;
+  const bool has_pq    = codebooks != nullptr && h_segments[0].edge_pqs != nullptr;
+  const bool has_norms = g.d_vector_norms != nullptr;
+  if (!has_lsh && !has_pq && !has_norms) return;
+
+  std::ofstream outFile(output_fname, std::ios::binary | std::ios::app);
+  if (!outFile.is_open())
+    throw std::runtime_error(
+        "save_directional_graph_to_file: cannot reopen " + output_fname);
+
+  outFile.write(reinterpret_cast<const char*>(&DIRECTIONAL_TRAILER_MAGIC),   sizeof(uint32_t));
+  outFile.write(reinterpret_cast<const char*>(&DIRECTIONAL_TRAILER_VERSION), sizeof(uint32_t));
+  const uint8_t flags = (has_lsh ? 1u : 0u) | (has_pq ? 2u : 0u) | (has_norms ? 4u : 0u);
+  outFile.write(reinterpret_cast<const char*>(&flags), sizeof(uint8_t));
+
+  if (has_lsh) {
+    const uint8_t k_ranks_u8     = graph_cfg::k_ranks;
+    const uint8_t packed_size_u8 = static_cast<uint8_t>(sizeof(typename graph_cfg::packed_t));
+    outFile.write(reinterpret_cast<const char*>(&k_ranks_u8),     sizeof(uint8_t));
+    outFile.write(reinterpret_cast<const char*>(&packed_size_u8), sizeof(uint8_t));
+    outFile.write(reinterpret_cast<const char*>(globals),
+                  sizeof(lsh_globals<graph_cfg::k_ranks>));
+
+    edge_lsh_list_t* h_scratch = nullptr;
+    if (!g.on_host)
+      cudaMallocHost(&h_scratch, sizeof(edge_lsh_list_t) * vectors_per_segment);
+    for (uint32_t s = 0; s < g.n_segments; s++) {
+      const segment_t& seg       = h_segments[s];
+      const uint32_t   seg_count = static_cast<uint32_t>(seg.n_vectors);
+      const edge_lsh_list_t* src = seg.edge_lshs;
+      if (!g.on_host) {
+        cudaMemcpy(h_scratch, src, sizeof(edge_lsh_list_t) * seg_count,
+                  cudaMemcpyDeviceToHost);
+        src = h_scratch;
+      }
+      outFile.write(reinterpret_cast<const char*>(src),
+                    sizeof(edge_lsh_list_t) * seg_count);
+    }
+    if (!g.on_host) cudaFreeHost(h_scratch);
+  }
+
+  if (has_pq) {
+    constexpr uint32_t M = graph_cfg::pq_m;
+    constexpr uint32_t K = graph_cfg::pq_k;
+    const uint32_t m_u32 = M, k_u32 = K, dsub_u32 = codebooks->dsub;
+    outFile.write(reinterpret_cast<const char*>(&m_u32),    sizeof(uint32_t));
+    outFile.write(reinterpret_cast<const char*>(&k_u32),    sizeof(uint32_t));
+    outFile.write(reinterpret_cast<const char*>(&dsub_u32), sizeof(uint32_t));
+
+    const size_t centroid_count = static_cast<size_t>(M) * K * codebooks->dsub;
+    std::vector<float> h_centroids(centroid_count);
+    cudaMemcpy(h_centroids.data(), codebooks->d_centroids,
+               centroid_count * sizeof(float), cudaMemcpyDeviceToHost);
+    outFile.write(reinterpret_cast<const char*>(h_centroids.data()),
+                  static_cast<std::streamsize>(centroid_count * sizeof(float)));
+
+    edge_pq_list_t* h_scratch = nullptr;
+    if (!g.on_host)
+      cudaMallocHost(&h_scratch, sizeof(edge_pq_list_t) * vectors_per_segment);
+    for (uint32_t s = 0; s < g.n_segments; s++) {
+      const segment_t& seg       = h_segments[s];
+      const uint32_t   seg_count = static_cast<uint32_t>(seg.n_vectors);
+      const edge_pq_list_t* src  = seg.edge_pqs;
+      if (!g.on_host) {
+        cudaMemcpy(h_scratch, src, sizeof(edge_pq_list_t) * seg_count,
+                  cudaMemcpyDeviceToHost);
+        src = h_scratch;
+      }
+      outFile.write(reinterpret_cast<const char*>(src),
+                    sizeof(edge_pq_list_t) * seg_count);
+    }
+    if (!g.on_host) cudaFreeHost(h_scratch);
+  }
+
+  if (has_norms) {
+    std::vector<float> h_norms(static_cast<size_t>(g.n_vectors));
+    cudaMemcpy(h_norms.data(), g.d_vector_norms,
+               h_norms.size() * sizeof(float), cudaMemcpyDeviceToHost);
+    outFile.write(reinterpret_cast<const char*>(h_norms.data()),
+                  static_cast<std::streamsize>(h_norms.size() * sizeof(float)));
+  }
+
+  outFile.close();
+
+  std::cout << "Appended directional trailer to " << output_fname
+            << " (lsh=" << has_lsh << ", pq=" << has_pq
+            << ", norms=" << has_norms << ")\n";
+}
+
+template <typename graph_cfg>
+__host__ directional_graph_bundle<graph_cfg> load_directional_graph_from_file(
+    std::string input_fname,
+    uint32_t    dim,
+    bool        on_host = false)
+{
+  static_assert(graph_cfg::use_lsh,
+                "load_directional_graph_from_file requires graph_cfg::use_lsh");
+
+  using data_t          = typename graph_cfg::data_t;
+  using edge_list_t     = typename graph_cfg::edge_list_t;
+  using segment_t       = graph_segment<graph_cfg>;
+  using edge_lsh_list_t = typename graph_cfg::edge_lsh_list_t;
+  using edge_pq_list_t  = typename graph_cfg::edge_pq_list_t;
+  constexpr uint32_t vectors_per_segment = graph_cfg::vectors_per_segment;
+
+  directional_graph_bundle<graph_cfg> bundle;
+  bundle.g = load_graph_from_file<graph_cfg>(input_fname, dim, on_host);
+  if (bundle.g.n_vectors == 0) return bundle;
+
+  // Base section size is exactly what save_graph_to_file/load_graph_from_file
+  // agree on: 4 u64 header fields + n_vectors * bytes_per_node.
+  const uint64_t bytes_per_node =
+      sizeof(data_t) * dim + sizeof(uint8_t) + sizeof(edge_list_t);
+  const uint64_t base_section_size =
+      4 * sizeof(uint64_t) + static_cast<uint64_t>(bundle.g.n_vectors) * bytes_per_node;
+  const uint64_t trailer_prefix_size =
+      2 * sizeof(uint32_t) + sizeof(uint8_t);   // magic + version + flags
+
+  std::ifstream inFile(input_fname, std::ios::binary | std::ios::ate);
+  if (!inFile.is_open())
+    throw std::runtime_error(
+        "load_directional_graph_from_file: cannot reopen " + input_fname);
+  const uint64_t file_size = static_cast<uint64_t>(inFile.tellg());
+
+  if (file_size < base_section_size + trailer_prefix_size) {
+    return bundle;   // no trailer present — plain base graph, nothing more to do
+  }
+
+  inFile.seekg(static_cast<std::streamoff>(base_section_size));
+  uint32_t magic = 0, version = 0;
+  uint8_t  flags = 0;
+  inFile.read(reinterpret_cast<char*>(&magic),   sizeof(uint32_t));
+  inFile.read(reinterpret_cast<char*>(&version), sizeof(uint32_t));
+  inFile.read(reinterpret_cast<char*>(&flags),   sizeof(uint8_t));
+
+  if (magic != DIRECTIONAL_TRAILER_MAGIC || version != DIRECTIONAL_TRAILER_VERSION) {
+    return bundle;   // no (recognizable) trailer — treat as base-only
+  }
+
+  const bool file_has_lsh   = flags & 1u;
+  const bool file_has_pq    = flags & 2u;
+  const bool file_has_norms = flags & 4u;
+
+  std::vector<segment_t> h_segments(bundle.g.segments.begin(), bundle.g.segments.end());
+
+  if (file_has_lsh) {
+    uint8_t k_ranks_u8 = 0, packed_size_u8 = 0;
+    inFile.read(reinterpret_cast<char*>(&k_ranks_u8),     sizeof(uint8_t));
+    inFile.read(reinterpret_cast<char*>(&packed_size_u8), sizeof(uint8_t));
+    if (k_ranks_u8 != graph_cfg::k_ranks ||
+        packed_size_u8 != sizeof(typename graph_cfg::packed_t)) {
+      throw std::runtime_error(
+          "load_directional_graph_from_file: LSH trailer k_ranks/packed_t "
+          "mismatch — file was written with a different graph_cfg");
+    }
+    inFile.read(reinterpret_cast<char*>(&bundle.globals),
+                sizeof(lsh_globals<graph_cfg::k_ranks>));
+
+    for (auto& seg : h_segments) seg.allocate_edge_lsh();  // no-op if already allocated
+
+    edge_lsh_list_t* h_scratch = nullptr;
+    if (!on_host)
+      cudaMallocHost(&h_scratch, sizeof(edge_lsh_list_t) * vectors_per_segment);
+    for (uint32_t s = 0; s < bundle.g.n_segments; s++) {
+      segment_t&     seg       = h_segments[s];
+      const uint32_t seg_count = static_cast<uint32_t>(seg.n_vectors);
+      const std::streamsize want =
+          static_cast<std::streamsize>(seg_count) * sizeof(edge_lsh_list_t);
+      if (on_host) {
+        inFile.read(reinterpret_cast<char*>(seg.edge_lshs), want);
+      } else {
+        inFile.read(reinterpret_cast<char*>(h_scratch), want);
+        cudaMemcpy(seg.edge_lshs, h_scratch, want, cudaMemcpyHostToDevice);
+      }
+    }
+    if (!on_host) cudaFreeHost(h_scratch);
+    bundle.has_lsh = true;
+  }
+
+  if (file_has_pq) {
+    uint32_t m_u32 = 0, k_u32 = 0, dsub_u32 = 0;
+    inFile.read(reinterpret_cast<char*>(&m_u32),    sizeof(uint32_t));
+    inFile.read(reinterpret_cast<char*>(&k_u32),    sizeof(uint32_t));
+    inFile.read(reinterpret_cast<char*>(&dsub_u32), sizeof(uint32_t));
+    if (m_u32 != graph_cfg::pq_m || k_u32 != graph_cfg::pq_k) {
+      throw std::runtime_error(
+          "load_directional_graph_from_file: PQ trailer M/K mismatch — "
+          "file was written with a different graph_cfg");
+    }
+
+    bundle.codebooks = pq_codebooks<graph_cfg::pq_m, graph_cfg::pq_k>::allocate(dsub_u32);
+    const size_t centroid_count = static_cast<size_t>(m_u32) * k_u32 * dsub_u32;
+    std::vector<float> h_centroids(centroid_count);
+    inFile.read(reinterpret_cast<char*>(h_centroids.data()),
+                static_cast<std::streamsize>(centroid_count * sizeof(float)));
+    cudaMemcpy(bundle.codebooks.d_centroids, h_centroids.data(),
+               centroid_count * sizeof(float), cudaMemcpyHostToDevice);
+
+    for (auto& seg : h_segments) seg.allocate_edge_pq();  // no-op if already allocated
+
+    edge_pq_list_t* h_scratch = nullptr;
+    if (!on_host)
+      cudaMallocHost(&h_scratch, sizeof(edge_pq_list_t) * vectors_per_segment);
+    for (uint32_t s = 0; s < bundle.g.n_segments; s++) {
+      segment_t&     seg       = h_segments[s];
+      const uint32_t seg_count = static_cast<uint32_t>(seg.n_vectors);
+      const std::streamsize want =
+          static_cast<std::streamsize>(seg_count) * sizeof(edge_pq_list_t);
+      if (on_host) {
+        inFile.read(reinterpret_cast<char*>(seg.edge_pqs), want);
+      } else {
+        inFile.read(reinterpret_cast<char*>(h_scratch), want);
+        cudaMemcpy(seg.edge_pqs, h_scratch, want, cudaMemcpyHostToDevice);
+      }
+    }
+    if (!on_host) cudaFreeHost(h_scratch);
+    bundle.has_pq = true;
+  }
+
+  // The allocate_edge_lsh()/allocate_edge_pq() calls above only mutate the
+  // host-side `h_segments` copy's pointers; re-upload once so the device-
+  // resident segment structs (what device_view actually reads) see them.
+  if (file_has_lsh || file_has_pq) {
+    bundle.g.segments = thrust::device_vector<segment_t>(h_segments.begin(), h_segments.end());
+  }
+
+  if (file_has_norms) {
+    std::vector<float> h_norms(static_cast<size_t>(bundle.g.n_vectors));
+    inFile.read(reinterpret_cast<char*>(h_norms.data()),
+                static_cast<std::streamsize>(h_norms.size() * sizeof(float)));
+    cudaMalloc(&bundle.g.d_vector_norms, h_norms.size() * sizeof(float));
+    cudaMemcpy(bundle.g.d_vector_norms, h_norms.data(),
+               h_norms.size() * sizeof(float), cudaMemcpyHostToDevice);
+  }
+
+  inFile.close();
+  cudaDeviceSynchronize();
+
+  std::cout << "Loaded directional trailer from " << input_fname
+            << " (lsh=" << bundle.has_lsh << ", pq=" << bundle.has_pq
+            << ", norms=" << file_has_norms << ")\n";
+
+  return bundle;
 }
 
 }

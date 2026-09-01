@@ -8,6 +8,7 @@
 #include <exception>
 #include <numeric>
 #include <algorithm>
+#include <fstream>
 
 #include "jasper/index/construct.cuh"
 #include "jasper/index/construct_scale_kernels.cuh"
@@ -456,87 +457,93 @@ struct intermediate_graph {
     resident->copy_to(partitions[B1]); // offload the last resident partition
   }
 
-  __host__ graph<GRAPH_CFG> concat() {
+  // Average out-degree across all partitions, computed without materializing
+  // the concatenated graph. Partitions are assumed to be on host pinned memory.
+  __host__ double avg_degree() const {
+    using segment_t = graph_segment<GRAPH_CFG>;
+    uint64_t total_edges   = 0;
+    uint64_t total_vectors = 0;
+    for (const auto& p : partitions) {
+      std::vector<segment_t> p_segs(p.segments.begin(), p.segments.end());
+      for (uint32_t ps = 0; ps < p.n_segments; ps++) {
+        const segment_t& seg = p_segs[ps];
+        uint32_t count = static_cast<uint32_t>(seg.n_vectors);
+        for (uint32_t i = 0; i < count; i++) total_edges += seg.edge_counts[i];
+        total_vectors += count;
+      }
+    }
+    return total_vectors == 0
+        ? 0.0
+        : static_cast<double>(total_edges) / static_cast<double>(total_vectors);
+  }
+
+  // Stream the concatenated graph straight to the output file, one partition at
+  // a time, freeing each partition as soon as it is written. This fuses the old
+  // concat() + save_graph_to_file() steps so we never hold a second full copy of
+  // the graph in memory (which would double peak host usage).
+  //
+  // The on-disk format is a flat sequence of nodes in global index order, so the
+  // VPS-segment repacking that concat() performed is irrelevant here: partitions
+  // are already laid out in global order (partition p covers globals
+  // [p*part_size, ...) with global offsets already applied to edges), so writing
+  // them in sequence reproduces the exact same file concat() would have produced.
+  __host__ void save_to_file(const std::string& output_fname) {
     using segment_t   = graph_segment<GRAPH_CFG>;
     using data_t      = typename GRAPH_CFG::data_t;
     using edge_list_t = typename GRAPH_CFG::edge_list_t;
     using index_t     = typename GRAPH_CFG::index_t;
-    constexpr uint32_t VPS = graph<GRAPH_CFG>::vectors_per_segment;
+    using vector_view_t = typename GRAPH_CFG::vector_view_t;
 
     index_t total_vectors = 0;
     for (auto& p : partitions)
       total_vectors += static_cast<index_t>(p.n_vectors);
 
     uint32_t dim        = partitions[0].dim;
-    uint32_t padded_dim = vector_view<data_t>::pad(dim);
+    uint32_t padded_dim = vector_view_t::pad(dim);
 
-    graph<GRAPH_CFG> result = graph<GRAPH_CFG>::allocate(dim, total_vectors, true);
-    result.n_vectors = total_vectors;
-    result.medoid    = partitions[0].medoid;  // partition 0 global_offset==0, already global
-
-    std::vector<segment_t> r_segs(result.segments.begin(), result.segments.end());
-
-    for (uint32_t s = 0; s < result.n_segments; s++) {
-      index_t seg_start    = static_cast<index_t>(s) * VPS;
-      r_segs[s].n_vectors  = std::min(static_cast<index_t>(VPS), total_vectors - seg_start);
+    std::ofstream outFile(output_fname, std::ios::binary);
+    if (!outFile.is_open()) {
+      throw std::runtime_error("Failed to open " + output_fname + " for graph save");
     }
+
+    uint64_t big_n_vectors    = static_cast<uint64_t>(total_vectors);
+    uint64_t medoid_as_uint64 = static_cast<uint64_t>(partitions[0].medoid);  // p0 offset==0
+    uint64_t bytes_per_node   = sizeof(data_t) * dim + sizeof(uint8_t) + sizeof(edge_list_t);
+    uint64_t total_file_size  = 4 * sizeof(uint64_t) + big_n_vectors * bytes_per_node;
+
+    outFile.write(reinterpret_cast<const char*>(&total_file_size),  sizeof(uint64_t));
+    outFile.write(reinterpret_cast<const char*>(&big_n_vectors),    sizeof(uint64_t));
+    outFile.write(reinterpret_cast<const char*>(&medoid_as_uint64), sizeof(uint64_t));
+    outFile.write(reinterpret_cast<const char*>(&bytes_per_node),   sizeof(uint64_t));
 
     for (auto& p : partitions) {
       std::vector<segment_t> p_segs(p.segments.begin(), p.segments.end());
-
       for (uint32_t ps = 0; ps < p.n_segments; ps++) {
-        segment_t& pseg = p_segs[ps];
-        if (pseg.n_vectors == 0) continue;
-
-        index_t first_g = p.global_offset + static_cast<index_t>(ps) * VPS;
-        index_t last_g  = first_g + pseg.n_vectors - 1;
-
-        uint32_t rs_first = graph<GRAPH_CFG>::segment_of(first_g);
-        uint32_t rs_last  = graph<GRAPH_CFG>::segment_of(last_g);
-
-        for (uint32_t rs = rs_first; rs <= rs_last; rs++) {
-          index_t r_seg_start_g = static_cast<index_t>(rs) * VPS;
-
-          index_t  copy_start_g = std::max(first_g, r_seg_start_g);
-          index_t  copy_end_g   = std::min(last_g + 1, r_seg_start_g + static_cast<index_t>(VPS));
-          uint32_t count        = static_cast<uint32_t>(copy_end_g - copy_start_g);
-
-          uint32_t src_off = static_cast<uint32_t>(copy_start_g - first_g);
-          uint32_t dst_off = static_cast<uint32_t>(copy_start_g - r_seg_start_g);
-
-          std::memcpy(r_segs[rs].edges       + dst_off,
-                      pseg.edges             + src_off,
-                      count * sizeof(edge_list_t));
-          std::memcpy(r_segs[rs].edge_counts + dst_off,
-                      pseg.edge_counts       + src_off,
-                      count * sizeof(uint8_t));
-          // Deletion is a packed bitmask; src/dst offsets aren't byte-aligned,
-          // so copy bit-by-bit (host, single-threaded -> no atomics needed).
-          for (uint32_t k = 0; k < count; k++) {
-            uint32_t si = src_off + k, di = dst_off + k;
-            bool v = (pseg.deleted_bits[si >> 5] >> (si & 31u)) & 1u;
-            uint32_t* w = &r_segs[rs].deleted_bits[di >> 5];
-            uint32_t  m = 1u << (di & 31u);
-            if (v) *w |= m; else *w &= ~m;
-          }
-          std::memcpy(r_segs[rs].vectors.data + static_cast<size_t>(dst_off) * padded_dim,
-                      pseg.vectors.data       + static_cast<size_t>(src_off) * padded_dim,
-                      static_cast<size_t>(count) * padded_dim * sizeof(data_t));
+        const segment_t& seg = p_segs[ps];
+        uint32_t count = static_cast<uint32_t>(seg.n_vectors);
+        for (uint32_t i = 0; i < count; i++) {
+          outFile.write(reinterpret_cast<const char*>(seg.vectors.data + static_cast<size_t>(i) * padded_dim),
+                        sizeof(data_t) * dim);
+          outFile.write(reinterpret_cast<const char*>(&seg.edge_counts[i]),
+                        sizeof(uint8_t));
+          outFile.write(reinterpret_cast<const char*>(&seg.edges[i]),
+                        sizeof(edge_list_t));
         }
       }
+      p.deallocate();  // free as we go so peak host memory never doubles
     }
 
-    // Assign identity stable ids (slot global index) host-side; the forward
-    // table is built later on device (e.g. at load).
-    for (uint32_t s = 0; s < result.n_segments; s++) {
-      index_t base = static_cast<index_t>(s) * VPS;
-      for (uint32_t i = 0; i < static_cast<uint32_t>(r_segs[s].n_vectors); i++)
-        r_segs[s].slot_to_id[i] = base + i;
-    }
-    result.next_id = total_vectors;
+    // File omits the slot_to_id/deleted columns (legacy bytes_per_node), which
+    // is fine here: fresh construction has no deletions yet and no prior
+    // stable ids to preserve, and load_graph_from_file's legacy-format path
+    // reconstructs exactly this state (identity ids, zero deletions,
+    // next_id == n_vectors) — see its bpn_base fallback.
+    outFile.close();
 
-    result.segments = thrust::device_vector<segment_t>(r_segs.begin(), r_segs.end());
-    return result;
+    std::cout << "Saved graph to " << output_fname << "\n"
+              << "  n_vectors       : " << big_n_vectors << "\n"
+              << "  medoid          : " << medoid_as_uint64 << "\n"
+              << "  dim             : " << dim << "\n";
   }
 
 };

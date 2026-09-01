@@ -1,9 +1,7 @@
 cmake_minimum_required(VERSION 3.18 FATAL_ERROR)
 project(Jasper LANGUAGES CXX CUDA)
 
-if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-  set(CMAKE_CUDA_ARCHITECTURES native)
-endif()
+set(CMAKE_CUDA_ARCHITECTURES 120 CACHE STRING "CUDA architecture(s) to compile for")
 
 include("cmake/CPM.cmake")
 
@@ -111,7 +109,7 @@ if(JASPER_BUILD_CMD)
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
   )
   set_target_properties(create_index PROPERTIES
-    CUDA_ARCHITECTURES "89;90;120"
+    CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
     CUDA_SEPARABLE_COMPILATION ON
   )
 
@@ -133,7 +131,18 @@ if(JASPER_BUILD_CMD)
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
   )
   set_target_properties(create_scale_index PROPERTIES
-    CUDA_ARCHITECTURES "89;90;120"
+    CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
+    CUDA_SEPARABLE_COMPILATION ON
+  )
+
+  add_executable(create_diskann_index cmd/create_diskann_index.cu)
+  target_link_libraries(create_diskann_index PRIVATE jasper)
+  set_target_properties(create_diskann_index PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+  )
+  set_target_properties(create_diskann_index PROPERTIES
+    CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
     CUDA_SEPARABLE_COMPILATION ON
   )
 
@@ -144,22 +153,11 @@ if(JASPER_BUILD_CMD)
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
   )
   set_target_properties(create_lsh_index PROPERTIES
-    CUDA_ARCHITECTURES "80;120"
+    CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
     CUDA_SEPARABLE_COMPILATION ON
   )
   # target_compile_definitions(create_lsh_index PRIVATE JASPER_PROFILE_CLOCKS)
-
-  add_executable(create_lsh_index_block_tuning cmd/create_lsh_index_block_tuning.cu)
-  target_link_libraries(create_lsh_index_block_tuning PRIVATE jasper)
-  set_target_properties(create_lsh_index_block_tuning PROPERTIES
-    CUDA_SEPARABLE_COMPILATION ON
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
-  )
-  set_target_properties(create_lsh_index_block_tuning PROPERTIES
-    CUDA_ARCHITECTURES "120"
-    CUDA_SEPARABLE_COMPILATION ON
-  )
-
+  
   add_executable(run_query cmd/run_query.cu)
   target_link_libraries(run_query PRIVATE jasper)
   set_target_properties(run_query PROPERTIES
@@ -167,7 +165,7 @@ if(JASPER_BUILD_CMD)
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
   )
   set_target_properties(run_query PROPERTIES
-    CUDA_ARCHITECTURES "89;90;120"
+    CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
     CUDA_SEPARABLE_COMPILATION ON
   )
 
@@ -178,7 +176,7 @@ if(JASPER_BUILD_CMD)
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
   )
   set_target_properties(test_deletion PROPERTIES
-    CUDA_ARCHITECTURES "89;90;120"
+    CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
     CUDA_SEPARABLE_COMPILATION ON
   )
 
@@ -192,7 +190,7 @@ if(JASPER_BUILD_CMD)
       RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
     )
     set_target_properties(test_idmap PROPERTIES
-      CUDA_ARCHITECTURES "89;90;120"
+      CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
       CUDA_SEPARABLE_COMPILATION ON
     )
   endif()
@@ -204,7 +202,7 @@ if(JASPER_BUILD_CMD)
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
   )
   set_target_properties(test_append PROPERTIES
-    CUDA_ARCHITECTURES "89;90;120"
+    CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
     CUDA_SEPARABLE_COMPILATION ON
   )
 
@@ -215,7 +213,7 @@ if(JASPER_BUILD_CMD)
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
   )
   set_target_properties(bench_all PROPERTIES
-    CUDA_ARCHITECTURES "89;90;120"
+    CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
     CUDA_SEPARABLE_COMPILATION ON
   )
 endif()
@@ -234,7 +232,17 @@ if(JASPER_BUILD_FFI)
   find_package(tvm_ffi CONFIG REQUIRED)
 
   # Build the .so
-  add_library(jasper_ffi SHARED ffi/jasper_ffi.cu)
+  # Split across multiple .cu files so nvcc can compile the directional
+  # config buckets (each ~20 real kernel instantiations, see
+  # ffi/jasper_ffi_common.cuh) as independent, parallelizable translation
+  # units instead of one massive one.
+  add_library(jasper_ffi SHARED
+    ffi/jasper_ffi_plain.cu
+    ffi/jasper_ffi_directional_l2_k4.cu
+    ffi/jasper_ffi_directional_l2_k16.cu
+    ffi/jasper_ffi_directional_ip_k4.cu
+    ffi/jasper_ffi_directional_ip_k16.cu
+  )
   target_link_libraries(jasper_ffi PRIVATE 
     jasper 
     CUDA::cublas
@@ -249,9 +257,8 @@ if(JASPER_BUILD_FFI)
   #   - visibility flags so TVM_FFI_DLL_EXPORT_TYPED_FUNC works
   tvm_ffi_configure_target(jasper_ffi)
 
-  # Set CUDA arch — adjust to your target GPU
   set_target_properties(jasper_ffi PROPERTIES
-    CUDA_ARCHITECTURES "80;89;90;120"
+    CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
     CUDA_SEPARABLE_COMPILATION ON
   )
 

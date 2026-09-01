@@ -33,7 +33,7 @@ def main():
         args.graph, 
         dim=args.dim, 
         n_neighbors=args.n_neighbors, 
-        data_type=args.dtype, 
+        data_type="f16", 
         distance=args.distance,
         on_host=args.on_host)
     print(f"Graph loaded.")
