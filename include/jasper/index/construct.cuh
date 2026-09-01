@@ -557,8 +557,25 @@ void get_unique_source_offsets(
   reverse_offsets[num_unique_sources] = n_reversed_edges;
 }
 
+// Optional occupancy tuning for the reverse-prune kernel (the dominant build
+// cost). It is latency-bound and register-limited (~16 blocks/SM by default),
+// so a __launch_bounds__ min-blocks-per-SM hint can raise occupancy and hide
+// latency. The sweet spot is strongly arch-specific and non-monotonic (register
+// cliffs), and the two we measured on bigann10M are mutually exclusive:
+//   - Hopper  (sm_90,  H200):        min-blocks 24  -> ~4% faster construct
+//   - Blackwell (sm_120, RTX 6000):  min-blocks 28  -> ~9% faster construct
+// 24 regresses Blackwell badly and 28 regresses Hopper, so there is no safe
+// universal value -> OFF by default. Override per target GPU at compile time
+// with -DJASPER_RP_MIN_BLOCKS=<n> if you know your arch.
+#ifndef JASPER_RP_MIN_BLOCKS
+#define JASPER_RP_MIN_BLOCKS 0   // 0 = no __launch_bounds__ (baseline)
+#endif
 template <typename CONSTRUCT_GRAPH_CONFIG, uint32_t TILE_SIZE>
-__global__ void process_reverse_edges_kernel(
+__global__ void
+#if JASPER_RP_MIN_BLOCKS > 0
+__launch_bounds__(CONSTRUCT_GRAPH_CONFIG::block_size, JASPER_RP_MIN_BLOCKS)
+#endif
+process_reverse_edges_kernel(
   const edge_pair<typename CONSTRUCT_GRAPH_CONFIG::index_t>* __restrict__ reverse_edges,
   const typename CONSTRUCT_GRAPH_CONFIG::index_t* __restrict__ reverse_offsets,
   typename CONSTRUCT_GRAPH_CONFIG::graph_t::device_view graph,
