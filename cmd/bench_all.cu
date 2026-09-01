@@ -112,9 +112,20 @@ int main(int argc, char** argv){
   uint32_t nq=h_q.n_vectors; auto d_qv=h_q.to_device(); cudaFreeHost(h_q.data); __half* dq=d_qv.data;
   GT gt; if(!gt_path.empty()) gt=read_gt(gt_path,k);
   std::unordered_set<uint32_t> none;
+  const bool have_gt = gt.nq>0;
+  if(!gt_path.empty() && !have_gt)
+    std::printf("[note ]  --gt '%s' could not be read (or was empty) -> recall shown as 'n/a'.\n",
+                gt_path.c_str());
+  else if(!have_gt)
+    std::printf("[note ]  no --gt provided -> recall shown as 'n/a'. Pass --gt <file> in jasper gt\n"
+                "         format [u32 nq][u32 k][u32 ids...] (see jasper.save_groundtruth) to measure it.\n");
 
   auto wall=[](std::function<void()> fn){ auto t0=std::chrono::steady_clock::now(); fn();
     return std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t0).count(); };
+  // Format recall for printing: the <0 sentinel (no ground truth) shows as "n/a".
+  auto rec_str=[](double r){ char b[16];
+    if(r<0) std::snprintf(b,sizeof b,"n/a"); else std::snprintf(b,sizeof b,"%.4f",r);
+    return std::string(b); };
 
   std::printf("\n##### bench_all: n_base=%u dim=%u df=%.2f append=%u #####\n",
               d_base.n_vectors, dim, df, na);
@@ -130,8 +141,8 @@ int main(int argc, char** argv){
 
   // QUERY (baseline)
   float qms; auto r0=timed_search(g,dq,nq,k,bw,qms);
-  std::printf("[QUERY ]  bw=%u: %.2f ms, %.0f QPS, recall@%u=%.4f\n",
-              bw, qms, nq*1000.0/qms, k, recall(gt,r0,k,nq,none));
+  std::printf("[QUERY ]  bw=%u: %.2f ms, %.0f QPS, recall@%u=%s\n",
+              bw, qms, nq*1000.0/qms, k, rec_str(recall(gt,r0,k,nq,none)).c_str());
 
   // DELETION
   uint64_t ndel=(uint64_t)(df*g.n_vectors);
@@ -140,8 +151,8 @@ int main(int argc, char** argv){
   std::vector<uint32_t> del_ids(del.begin(),del.end());
   double del_ms = wall([&]{ jasper::mark_deleted<construct_cfg>(g, del_ids.data(), (uint32_t)del_ids.size()); });
   float qms2; auto r1=timed_search(g,dq,nq,k,bw,qms2);
-  std::printf("[DELETE]  mark_deleted %llu ids: %.1f ms | query %.0f QPS live_recall=%.4f viol=%llu\n",
-              (unsigned long long)ndel, del_ms, nq*1000.0/qms2, recall(gt,r1,k,nq,del),
+  std::printf("[DELETE]  mark_deleted %llu ids: %.1f ms | query %.0f QPS live_recall=%s viol=%llu\n",
+              (unsigned long long)ndel, del_ms, nq*1000.0/qms2, rec_str(recall(gt,r1,k,nq,del)).c_str(),
               (unsigned long long)viols(r1,del));
   double cons_ms = wall([&]{ jasper::consolidate<construct_cfg>(g,1.2f); });
   std::printf("[DELETE]  consolidate: %.1f ms\n", cons_ms);
