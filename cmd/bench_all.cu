@@ -69,16 +69,35 @@ static uint64_t viols(const std::vector<int32_t>& r, const std::unordered_set<ui
 
 int main(int argc, char** argv){
   argparse::ArgumentParser p("bench_all");
-  p.add_argument("--base","-b").required();
-  p.add_argument("--queries","-q").required();
-  p.add_argument("--gt","-g").default_value(std::string{});
-  p.add_argument("--datatype","-t").default_value(std::string{"uint8"}).choices("uint8","float");
-  p.add_argument("--dim").required().scan<'u',uint32_t>();
-  p.add_argument("--k","-k").default_value(uint32_t{10}).scan<'u',uint32_t>();
-  p.add_argument("--beam_width").default_value(uint32_t{64}).scan<'u',uint32_t>();
-  p.add_argument("--delete_fraction","-f").default_value(0.05).scan<'g',double>();
-  p.add_argument("--n_append","-a").default_value(uint64_t{100000}).scan<'u',uint64_t>();
-  try{p.parse_args(argc,argv);}catch(const std::exception&e){std::cerr<<e.what();return 1;}
+  p.add_description(
+      "Build a graph from --base, run queries from --queries, then benchmark "
+      "delete + append.\nVector files are binary: [int32 n][int32 dim][n*dim "
+      "elements], elements typed per --datatype.");
+  p.add_argument("--base","-b").required()
+      .help("(required) base vectors file to build the index from");
+  p.add_argument("--queries","-q").required()
+      .help("(required) query vectors file (same binary format as --base)");
+  p.add_argument("--gt","-g").default_value(std::string{})
+      .help("ground-truth file for recall; omit to skip recall reporting");
+  p.add_argument("--datatype","-t").default_value(std::string{"uint8"}).choices("uint8","float")
+      .help("element type of the vector files: 'uint8' or 'float' (default: uint8)");
+  p.add_argument("--dim").required().scan<'u',uint32_t>()
+      .help("(required) vector dimension");
+  p.add_argument("--k","-k").default_value(uint32_t{10}).scan<'u',uint32_t>()
+      .help("number of nearest neighbors to return (default: 10)");
+  p.add_argument("--beam_width").default_value(uint32_t{64}).scan<'u',uint32_t>()
+      .help("search beam width (default: 64)");
+  p.add_argument("--delete_fraction","-f").default_value(0.05).scan<'g',double>()
+      .help("fraction of vectors to delete in the delete benchmark (default: 0.05)");
+  p.add_argument("--n_append","-a").default_value(uint64_t{100000}).scan<'u',uint64_t>()
+      .help("number of vectors to append in the append benchmark (default: 100000)");
+  try {
+    p.parse_args(argc, argv);
+  } catch (const std::exception& e) {
+    // Clear, actionable error: what went wrong + full usage/options.
+    std::cerr << "bench_all: error: " << e.what() << "\n\n" << p;
+    return 1;
+  }
 
   auto base_path=p.get<std::string>("--base"); auto q_path=p.get<std::string>("--queries");
   auto gt_path=p.get<std::string>("--gt"); auto dt=p.get<std::string>("--datatype");
