@@ -2,11 +2,14 @@
 
 #include <cstdint>
 #include <vector>
+#include <fstream>
+#include <iostream>
 
 #include <cuda_bf16.h>
 #include <thrust/device_vector.h>
 
 #include "jasper/distance/distance.cuh"
+#include "jasper/index/vector.cuh"
 #include "jasper/lsh/edge_lsh.cuh"
 #include "jasper/lsh/lsh_globals.cuh"
 #include "jasper/lsh/lsh_kernels.cuh"
