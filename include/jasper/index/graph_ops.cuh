@@ -265,9 +265,13 @@ __host__ void compact(typename CONSTRUCT_GRAPH_CONFIG::graph_t& g,
                       typename CONSTRUCT_GRAPH_CONFIG::index_t extra_slack = 0) {
 #if !JASPER_ENABLE_COMPACT
   (void)g; (void)extra_slack;
-  throw std::runtime_error(
-      "compact() is disabled in this build (deletion path is mark_deleted + "
-      "consolidate only). Rebuild with -DJASPER_ENABLE_COMPACT=ON to enable.");
+  // Compaction is compiled out of this build. Warn and no-op rather than
+  // throwing, so callers (e.g. the Python FFI) keep running instead of
+  // crashing; the deletion path stays mark_deleted + consolidate.
+  std::cerr << "Warning: compact() is disabled in this build "
+               "(mark_deleted + consolidate only); ignoring the call. "
+               "Rebuild with -DJASPER_ENABLE_COMPACT=ON to enable.\n";
+  return;
 #else
   using graph_cfg_t = typename CONSTRUCT_GRAPH_CONFIG::graph_cfg_t;
   using graph_t     = typename CONSTRUCT_GRAPH_CONFIG::graph_t;
