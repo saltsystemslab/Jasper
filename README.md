@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/jasper-logo-light.svg" alt="Jasper" width="440">
+</p>
+
 # Jasper: Fast and scalable GPU-native ANNS index
 
 [![website](https://img.shields.io/badge/website-blue)](https://saltsystemslab.github.io/Jasper/)
