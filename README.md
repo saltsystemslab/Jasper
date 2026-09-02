@@ -1,5 +1,8 @@
 <p align="center">
-  <img src="assets/jasper-logo-light.svg" alt="Jasper" width="440">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/jasper-logo-dark.svg">
+    <img src="assets/jasper-logo-light.svg" alt="Jasper" width="440">
+  </picture>
 </p>
 
 # Jasper: Fast and scalable GPU-native ANNS index
