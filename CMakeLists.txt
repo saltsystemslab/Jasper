@@ -38,12 +38,15 @@ CPMAddPackage (
   GIT_TAG origin/master
 )
 
-# ── Feature flags (temporary) ──
+# ── Feature flags ──
 # Stable-id "label" layer (WarpSpeed-backed id<->slot map) and graph compaction
-# are both OFF by default: deletion path is mark_deleted + consolidate, and
-# without compaction slot==id so the label layer isn't needed.
-option(JASPER_STABLE_IDS    "Enable WarpSpeed-backed stable-id labels" OFF)
-option(JASPER_ENABLE_COMPACT "Enable graph compaction (compact())"     OFF)
+# are ON by default: every vector gets a stable id, deletion runs by id, and
+# compact() reclaims tombstoned slots. The single-writer concurrency contract
+# (search shared / mutation exclusive) is enforced by a host-side lock
+# (graph<>::rw_mutex). Set either OFF to opt back out (slot==id, no WarpSpeed
+# dependency; deletion stays mark_deleted + consolidate without slot reclaim).
+option(JASPER_STABLE_IDS    "Enable WarpSpeed-backed stable-id labels" ON)
+option(JASPER_ENABLE_COMPACT "Enable graph compaction (compact())"     ON)
 
 # WarpSpeed GPU hash tables — only needed when the stable-id layer is enabled.
 if(JASPER_STABLE_IDS)
