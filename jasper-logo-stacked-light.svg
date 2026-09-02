@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="44 12 240 268" width="240" height="268" role="img" aria-label="Jasper">
+  <title>Jasper</title>
+  <desc>Three mountain peaks with ridge lines, above two lake lines, beneath a four-star constellation connected in a chain.</desc>
+  <polygon points="208,175 240,128 276,175" fill="#1C1B19" opacity="0.5"/>
+  <polygon points="62,175 108,118 152,175" fill="#1C1B19" opacity="0.72"/>
+  <polygon points="124,175 172,80 228,175" fill="#1C1B19"/>
+
+  <g fill="none" stroke="#FFFFFF" stroke-linecap="round">
+    <path d="M172 80 L188 128 L183 175" stroke-width="1.6" opacity="0.8"/>
+    <path d="M172 80 L159 114" stroke-width="1.2" opacity="0.5"/>
+    <path d="M144 140 L155 159" stroke-width="1.2" opacity="0.5"/>
+    <path d="M199 150 L209 167" stroke-width="1.2" opacity="0.5"/>
+    <path d="M108 118 L118 152 L114 175" stroke-width="1.4" opacity="0.68"/>
+    <path d="M240 128 L247 156" stroke-width="1.3" opacity="0.68"/>
+  </g>
+
+  <line x1="56" y1="187" x2="282" y2="187" stroke="#1C1B19" stroke-width="2.5" opacity="0.3"/>
+  <line x1="84" y1="198" x2="254" y2="198" stroke="#1C1B19" stroke-width="2.5" opacity="0.2"/>
+
+  <g fill="none" stroke="#D85A30" stroke-width="1.4" stroke-linecap="round">
+    <path d="M98 58 L140 32"/>
+    <path d="M140 32 L190 50"/>
+    <path d="M190 50 L232 34"/>
+  </g>
+  <circle cx="98" cy="58" r="3.5" fill="#D85A30"/>
+  <circle cx="140" cy="32" r="4.8" fill="#D85A30"/>
+  <circle cx="190" cy="50" r="3.8" fill="#D85A30"/>
+  <circle cx="232" cy="34" r="3.2" fill="#D85A30"/>
+  <text x="164" y="238" text-anchor="middle" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, sans-serif" font-size="44" font-weight="500" letter-spacing="-1.2" fill="#1C1B19">Jasper</text>
+  <text x="164" y="262" text-anchor="middle" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, sans-serif" font-size="11" font-weight="400" letter-spacing="1.5" fill="#6E6C66">GPU-native vector search</text>
+</svg>
