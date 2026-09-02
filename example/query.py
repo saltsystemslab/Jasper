@@ -12,7 +12,7 @@ def parse_args():
 
     # graph settings
     p.add_argument("--dim", type=int, default=128, help="Vector dimension (default: 128)")
-    p.add_argument("--dtype", default="f32", choices=["f32", "u8"], help="Vector data type (default: f32)")
+    p.add_argument("--dtype", default="f32", choices=["f32", "u8"], help="On-disk dtype of the query .bin (default: f32); the graph itself is always float16")
     p.add_argument("--n-neighbors", type=int, default=64, help="Number of neighbors (default: 64)")
     p.add_argument("--distance", default="l2", choices=["l2", "ip"], help="Distance metric (default: l2)")
     p.add_argument("--on_host", action="store_true", help="Construct the graph on host memory")
@@ -30,10 +30,10 @@ def main():
 
     print("Start loading graph")
     g = jasper.Graph.load(
-        args.graph, 
-        dim=args.dim, 
-        n_neighbors=args.n_neighbors, 
-        data_type=args.dtype, 
+        args.graph,
+        dim=args.dim,
+        n_neighbors=args.n_neighbors,
+        data_type="f16",  # graph storage is always float16; --dtype is only the query .bin dtype
         distance=args.distance,
         on_host=args.on_host)
     print(f"Graph loaded.")
