@@ -99,6 +99,7 @@ __host__ void mark_deleted(typename CONSTRUCT_GRAPH_CONFIG::graph_t& g,
   constexpr uint32_t BLOCK = CONSTRUCT_GRAPH_CONFIG::block_size;
 
   if (n_ids == 0) return;
+  auto lk = g.lock_exclusive();  // exclusive: no concurrent search/mutation
 #if JASPER_STABLE_IDS
   if (g.id_map == nullptr)
     throw std::runtime_error("mark_deleted: id_map not built");
@@ -149,9 +150,12 @@ __host__ void clear_deleted_flags(typename CONSTRUCT_GRAPH_CONFIG::graph_t& g) {
 
 // FreshDiskANN-style consolidation: repair edges that route through deleted
 // vertices, drop deleted neighbors from live edge lists, then clear tombstones.
+// Unlocked implementation: assumes the caller already holds g's write lock.
+// compact() / maybe_consolidate() call this directly to avoid re-locking the
+// non-recursive shared_mutex; external callers use consolidate() below.
 template <typename CONSTRUCT_GRAPH_CONFIG>
-__host__ void consolidate(typename CONSTRUCT_GRAPH_CONFIG::graph_t& g,
-                          float alpha = 1.2f) {
+__host__ void consolidate_impl(typename CONSTRUCT_GRAPH_CONFIG::graph_t& g,
+                               float alpha = 1.2f) {
   using graph_cfg_t = typename CONSTRUCT_GRAPH_CONFIG::graph_cfg_t;
   using graph_t     = typename CONSTRUCT_GRAPH_CONFIG::graph_t;
   using index_t     = typename CONSTRUCT_GRAPH_CONFIG::index_t;
@@ -258,6 +262,15 @@ __host__ void consolidate(typename CONSTRUCT_GRAPH_CONFIG::graph_t& g,
   g.n_deleted = 0;
 }
 
+// Repair edges around soft-deleted vertices and clear tombstones. Takes g's
+// write lock (exclusive: no concurrent search or other mutation may overlap).
+template <typename CONSTRUCT_GRAPH_CONFIG>
+__host__ void consolidate(typename CONSTRUCT_GRAPH_CONFIG::graph_t& g,
+                          float alpha = 1.2f) {
+  auto lk = g.lock_exclusive();
+  consolidate_impl<CONSTRUCT_GRAPH_CONFIG>(g, alpha);
+}
+
 // Physically reclaim space: reassign vertex IDs so live vertices occupy
 // [0, n_live) contiguously. Consolidates first if there are pending deletions.
 template <typename CONSTRUCT_GRAPH_CONFIG>
@@ -280,9 +293,10 @@ __host__ void compact(typename CONSTRUCT_GRAPH_CONFIG::graph_t& g,
   constexpr uint32_t BLOCK = CONSTRUCT_GRAPH_CONFIG::block_size;
   constexpr uint32_t VPS   = graph_t::vectors_per_segment;
 
+  auto lk = g.lock_exclusive();  // exclusive: no concurrent search/mutation
   if (g.on_host)
     throw std::runtime_error("compact requires graph on device");
-  if (g.n_deleted > 0) consolidate<CONSTRUCT_GRAPH_CONFIG>(g);
+  if (g.n_deleted > 0) consolidate_impl<CONSTRUCT_GRAPH_CONFIG>(g);
 
   (void)extra_slack;  // in-place compaction reclaims to exactly n_live
   const index_t n = g.n_vectors;
@@ -370,11 +384,12 @@ template <typename CONSTRUCT_GRAPH_CONFIG>
 __host__ bool maybe_consolidate(typename CONSTRUCT_GRAPH_CONFIG::graph_t& g,
                                 float alpha = 1.2f) {
   using index_t = typename CONSTRUCT_GRAPH_CONFIG::index_t;
+  auto lk = g.lock_exclusive();  // exclusive; also guards the ratio read below
   index_t live = g.n_vectors - g.n_deleted;
   if (live == 0) return false;
   double ratio = (double)g.n_deleted / (double)live;
   if (ratio > g.consolidation_threshold) {
-    consolidate<CONSTRUCT_GRAPH_CONFIG>(g, alpha);
+    consolidate_impl<CONSTRUCT_GRAPH_CONFIG>(g, alpha);
     return true;
   }
   return false;

@@ -4,6 +4,9 @@
 #include <vector>
 #include <fstream>
 #include <iostream>
+#include <memory>
+#include <mutex>
+#include <shared_mutex>
 
 #include <cuda_bf16.h>
 #include <thrust/device_vector.h>
@@ -480,6 +483,25 @@ struct graph {
   index_t next_id = 0;
   void*   id_map  = nullptr;
   uint64_t id_map_capacity = 0;  // entries the forward table can hold
+
+  // Host-side single-writer lock that ENFORCES the deletion/compaction
+  // concurrency contract instead of leaving it to callers: search*() take a
+  // shared lock (many concurrent readers stay allowed) while append_batch /
+  // mark_deleted / consolidate / compact take a unique lock (exclusive — no
+  // other mutation and no search may overlap the in-place edge/vector rewrites).
+  // Stored in a shared_ptr because a std::shared_mutex is neither movable nor
+  // copyable and graph<> must stay movable; copies share the one lock, which is
+  // the intended "same logical index" behaviour. Uncontended locks are ~free.
+  std::shared_ptr<std::shared_mutex> rw_mutex =
+      std::make_shared<std::shared_mutex>();
+  // const so search() (which takes a const graph&) can still take the lock;
+  // locking is logically a mutable operation on the mutex, not on graph state.
+  [[nodiscard]] std::unique_lock<std::shared_mutex> lock_exclusive() const {
+    return std::unique_lock<std::shared_mutex>(*rw_mutex);
+  }
+  [[nodiscard]] std::shared_lock<std::shared_mutex> lock_shared() const {
+    return std::shared_lock<std::shared_mutex>(*rw_mutex);
+  }
 
   thrust::device_vector<segment_t> segments;
 

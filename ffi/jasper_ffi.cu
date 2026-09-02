@@ -356,6 +356,9 @@ void ReserveIds(int64_t handle, ffi::TensorView out_ids, int64_t count) {
     using T = std::decay_t<decltype(g)>;
     if constexpr (!std::is_same_v<T, std::monostate>) {
       using index_t = typename T::index_t;
+      // Same write lock append_batch uses, so the next_id bump can't race a
+      // concurrent append (both advance the monotonic id counter).
+      auto rwlk = g.lock_exclusive();
       index_t start = g.next_id;
       g.next_id += static_cast<index_t>(count);
       std::vector<int32_t> host(count);

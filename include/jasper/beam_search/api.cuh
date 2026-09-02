@@ -59,6 +59,7 @@ beam_search_result<GRAPH_CFG> search(
     const graph<GRAPH_CFG>&           g,
     typename GRAPH_CFG::vector_view_t d_queries,
     const search_params&              params = {}) {
+  auto lk = g.lock_shared();  // shared: concurrent searches OK, blocks mutations
   const uint32_t bw = params.beam_width;
   if      (bw + 64 < 128)  return search_dispatch_width<GRAPH_CFG, BLOCK_SIZE, 128,  TILE_SIZE>(g, d_queries, params);
   else if (bw + 64 < 256)  return search_dispatch_width<GRAPH_CFG, BLOCK_SIZE, 256,  TILE_SIZE>(g, d_queries, params);
@@ -124,6 +125,7 @@ beam_search_result<GRAPH_CFG> directional_search(
   static_assert(GRAPH_CFG::use_lsh,
                 "directional_search requires graph_cfg::use_lsh");
 
+  auto lk = g.lock_shared();  // shared: concurrent searches OK, blocks mutations
   const uint32_t bw = params.beam_width;
   if      (bw + 64 < 128)  return directional_search_dispatch_width<GRAPH_CFG, BLOCK_SIZE, 128,  TILE_SIZE>(g, globals, d_queries, params);
   else if (bw + 64 < 256)  return directional_search_dispatch_width<GRAPH_CFG, BLOCK_SIZE, 256,  TILE_SIZE>(g, globals, d_queries, params);

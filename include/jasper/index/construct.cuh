@@ -1179,6 +1179,7 @@ append_batch(typename CONSTRUCT_GRAPH_CONFIG::graph_t& g,
   const index_t count = static_cast<index_t>(new_vectors.n_vectors);
   std::vector<index_t> ids;
   if (count == 0) return ids;
+  auto lk = g.lock_exclusive();  // exclusive: no concurrent search/mutation
   if (g.on_host)        throw std::runtime_error("append_batch requires graph on device");
   if (g.global_offset != 0) throw std::runtime_error("append_batch requires global_offset == 0");
   if (new_vectors.dim != g.dim) throw std::runtime_error("append_batch: dim mismatch");
