@@ -10,6 +10,7 @@
 #include <thrust/device_vector.h>
 
 #include "jasper/distance/distance.cuh"
+#include "jasper/index/vector.cuh"   // vector_view, used by graph_config
 #include "jasper/lsh/edge_lsh.cuh"
 #include "jasper/lsh/lsh_globals.cuh"
 #include "jasper/lsh/lsh_kernels.cuh"
@@ -1798,21 +1799,149 @@ __host__ void save_graph_to_file(const graph<graph_cfg>& g,
 // either way), and load_directional_graph_from_file falls back to a
 // base-only bundle whenever the trailer is missing or unrecognized.
 //
-// ⚠ KNOWN GAP: the trailer does NOT persist whether the graph was
-// prerotated, or the rotation seed (graph_construct_params::prerotate /
-// prerotate_seed) — the estimator artifacts above don't need it, but the
-// caller does, to rotate queries at search time the same way the vectors
-// were rotated at build time. Right now the caller (see
-// ffi/jasper_ffi_common.cuh's LoadDirectionalGraph_##id /
-// python/jasper/__init__.py's Graph.load) must
-// re-supply the same prerotate/prerotate_seed used at construction; get it
-// wrong and queries silently search un-rotated against a rotated index —
-// wrong results, no error. Fixing this properly means adding prerotate +
-// prerotate_seed to the trailer (additive, same pattern as everything else
-// here) and having the loader hand them back instead of taking them as
-// parameters.
+// The trailer carries no back-pointer, so the reader locates it by recomputing
+// where the base section ends (base_section_bytes, from the file's own header).
+// Both sides must agree on that offset: the saver asserts it, and any change to
+// the base layout has to be reflected in base_section_bytes or the trailer
+// becomes invisible — the loader would just report a base-only bundle.
+//
+// Rotation provenance (flag bit 3) records whether the stored vectors were
+// prerotated and with which seed, so a reader can rotate queries the same way
+// instead of being told out of band. Writers that don't know (the vectors came
+// from somewhere else) leave `known` false and the block is omitted, which is
+// also what every pre-existing file looks like — callers then have to supply
+// prerotate/seed themselves, as they always did.
+//
+// This is a new flag bit rather than a version bump on purpose. The reader
+// rejects the whole trailer on an unrecognized version, so bumping would make
+// new indexes lose their LSH/PQ artifacts under an older binary; an unknown
+// flag bit is instead ignored, and the block sits after everything else so an
+// older reader never reads into it. That keeps the format additive in both
+// directions.
+//
+// The rotation block is therefore, by definition, the LAST block in the
+// trailer — anything new goes before it. read_rotation_info depends on that:
+// it locates the block from EOF so a reader that cannot size the estimator
+// blocks (a non-directional config) can still find out which space the stored
+// vectors are in.
 inline constexpr uint32_t DIRECTIONAL_TRAILER_MAGIC   = 0x484C5344u;  // arbitrary sentinel
 inline constexpr uint32_t DIRECTIONAL_TRAILER_VERSION = 1u;
+
+// Was the index built in a rotated space, and with which seed. `known == false`
+// means the file said nothing — distinct from "known and not rotated", which is
+// a definitive instruction not to rotate queries.
+struct directional_rotation_info {
+  bool     known     = false;
+  bool     prerotate = false;
+  uint64_t seed      = 0;     // matches set_rotation_matrix's seed width
+};
+
+// Byte size of the base section for a file whose header declares
+// `bytes_per_node` — i.e. the offset at which a directional trailer begins.
+//
+// This MUST mirror the column detection in load_graph_from_file (see its
+// bpn_* ladder): which per-node columns are present, and therefore whether the
+// trailing packed-deletion block and next_id field exist, is inferred purely
+// from bytes_per_node. Deriving the offset from the file's own header rather
+// than recomputing a fixed formula is what keeps saver and loader in agreement
+// when a writer chooses a different layout — save_graph_to_file writes the
+// bitpacked+id layout, while construct_diskann's saver writes the legacy one.
+template <typename graph_cfg>
+__host__ inline uint64_t base_section_bytes(uint32_t dim,
+                                            uint64_t n_vectors,
+                                            uint64_t bytes_per_node) {
+  using data_t      = typename graph_cfg::data_t;
+  using edge_list_t = typename graph_cfg::edge_list_t;
+  using index_t     = typename graph_cfg::index_t;
+
+  const uint64_t bpn_base =
+      sizeof(data_t) * dim + sizeof(uint8_t) + sizeof(edge_list_t);
+  const uint64_t bpn_with_deleted = bpn_base + sizeof(uint8_t);
+  const uint64_t bpn_with_id      = bpn_with_deleted + sizeof(index_t);
+  const uint64_t bpn_bitpacked    = bpn_base + sizeof(index_t);
+
+  const bool bitpacked_deleted = (bytes_per_node == bpn_bitpacked);
+  const bool has_id_column     = (bytes_per_node == bpn_with_id) || bitpacked_deleted;
+
+  uint64_t bytes = 4 * sizeof(uint64_t) + n_vectors * bytes_per_node;
+  if (bitpacked_deleted) bytes += (n_vectors + 7) / 8;   // packed deletion block
+  if (has_id_column)     bytes += sizeof(uint64_t);      // trailing next_id
+  return bytes;
+}
+
+// Same, reading n_vectors and bytes_per_node from the file's own 4-u64 header
+// ([total_file_size, n_vectors, medoid, bytes_per_node]).
+template <typename graph_cfg>
+__host__ inline uint64_t directional_trailer_offset(const std::string& fname,
+                                                    uint32_t dim) {
+  std::ifstream f(fname, std::ios::binary);
+  if (!f.is_open())
+    throw std::runtime_error("directional_trailer_offset: cannot open " + fname);
+  uint64_t hdr[4] = {0, 0, 0, 0};
+  f.read(reinterpret_cast<char*>(hdr), sizeof(hdr));
+  if (!f)
+    throw std::runtime_error(
+        "directional_trailer_offset: " + fname + " is too short for a header");
+  return base_section_bytes<graph_cfg>(dim, /*n_vectors=*/hdr[1],
+                                       /*bytes_per_node=*/hdr[3]);
+}
+
+// Read ONLY the rotation record, without parsing the estimator blocks.
+//
+// This is the piece a non-directional reader needs: rotation is
+// distance-preserving, so a conventional search over a rotated index is
+// perfectly valid — but only if the queries are rotated to match. Otherwise it
+// silently measures nonsense. Non-directional configs can't call
+// load_directional_graph_from_file at all (it requires use_lsh), and couldn't
+// size the edge_lsh/edge_pq blocks even if they could, so they need this.
+//
+// It works by reading from EOF: the rotation block is defined to be the LAST
+// block in the trailer, which is also what keeps it invisible to readers that
+// predate flag bit 3. Locating it that way avoids walking the variable-size
+// blocks in between, whose layout depends on the writer's k_ranks / packed_t /
+// M rather than on this config.
+//
+// Returns `known == false` for a file with no trailer, no rotation block, or an
+// unrecognized trailer — i.e. "this file says nothing", never a guess.
+template <typename graph_cfg>
+__host__ inline directional_rotation_info read_rotation_info(
+    const std::string& fname, uint32_t dim) {
+  directional_rotation_info info;   // known == false
+
+  const uint64_t base = directional_trailer_offset<graph_cfg>(fname, dim);
+  const uint64_t prefix = 2 * sizeof(uint32_t) + sizeof(uint8_t);
+  const uint64_t block  = sizeof(uint8_t) + sizeof(uint64_t);
+
+  std::ifstream f(fname, std::ios::binary | std::ios::ate);
+  if (!f.is_open())
+    throw std::runtime_error("read_rotation_info: cannot open " + fname);
+  const uint64_t file_size = static_cast<uint64_t>(f.tellg());
+  if (file_size < base + prefix + block) return info;   // no room for both
+
+  f.seekg(static_cast<std::streamoff>(base));
+  uint32_t magic = 0, version = 0;
+  uint8_t  flags = 0;
+  f.read(reinterpret_cast<char*>(&magic),   sizeof(uint32_t));
+  f.read(reinterpret_cast<char*>(&version), sizeof(uint32_t));
+  f.read(reinterpret_cast<char*>(&flags),   sizeof(uint8_t));
+  if (!f || magic != DIRECTIONAL_TRAILER_MAGIC ||
+      version != DIRECTIONAL_TRAILER_VERSION || !(flags & 8u))
+    return info;
+
+  f.seekg(static_cast<std::streamoff>(file_size - block));
+  uint8_t  rot  = 0;
+  uint64_t seed = 0;
+  f.read(reinterpret_cast<char*>(&rot),  sizeof(uint8_t));
+  f.read(reinterpret_cast<char*>(&seed), sizeof(uint64_t));
+  if (!f)
+    throw std::runtime_error(
+        "read_rotation_info: rotation block flagged but unreadable in " + fname);
+
+  info.known     = true;
+  info.prerotate = (rot != 0);
+  info.seed      = seed;
+  return info;
+}
 
 // Bundle returned by load_directional_graph_from_file. `codebooks` owns its
 // device centroids (like generate_pq_codebooks) — call .free() on it once
@@ -1824,6 +1953,7 @@ struct directional_graph_bundle {
   bool has_pq  = false;
   lsh_globals<graph_cfg::k_ranks> globals{};
   pq_codebooks<graph_cfg::pq_m, graph_cfg::pq_k> codebooks{};
+  directional_rotation_info rotation{};   // .known == false for older files
 };
 
 template <typename graph_cfg>
@@ -1831,7 +1961,8 @@ __host__ void save_directional_graph_to_file(
     const graph<graph_cfg>& g,
     const lsh_globals<graph_cfg::k_ranks>* globals,                  // nullptr if LSH not built
     const pq_codebooks<graph_cfg::pq_m, graph_cfg::pq_k>* codebooks, // nullptr if PQ not built
-    std::string output_fname)
+    std::string output_fname,
+    directional_rotation_info rotation = directional_rotation_info{})
 {
   static_assert(graph_cfg::use_lsh,
                 "save_directional_graph_to_file requires graph_cfg::use_lsh");
@@ -1846,11 +1977,29 @@ __host__ void save_directional_graph_to_file(
   save_graph_to_file<graph_cfg>(g, output_fname);
   if (g.n_vectors == 0) return;
 
+  // The trailer is appended wherever the base section ends, but the loader
+  // finds it by recomputing that offset from the header. Check they agree here
+  // rather than silently writing a trailer no loader will ever find — which is
+  // exactly what happened while the base section carried a slot_to_id column
+  // and a packed-deletion block that the offset math didn't account for.
+  {
+    const uint64_t expected =
+        directional_trailer_offset<graph_cfg>(output_fname, g.dim);
+    std::ifstream chk(output_fname, std::ios::binary | std::ios::ate);
+    const uint64_t actual = static_cast<uint64_t>(chk.tellg());
+    if (actual != expected)
+      throw std::runtime_error(
+          "save_directional_graph_to_file: base section is " +
+          std::to_string(actual) + " bytes but the header implies " +
+          std::to_string(expected) +
+          " — base_section_bytes() is out of sync with save_graph_to_file");
+  }
+
   std::vector<segment_t> h_segments(g.segments.begin(), g.segments.end());
   const bool has_lsh   = globals != nullptr && h_segments[0].edge_lshs != nullptr;
   const bool has_pq    = codebooks != nullptr && h_segments[0].edge_pqs != nullptr;
   const bool has_norms = g.d_vector_norms != nullptr;
-  if (!has_lsh && !has_pq && !has_norms) return;
+  if (!has_lsh && !has_pq && !has_norms && !rotation.known) return;
 
   std::ofstream outFile(output_fname, std::ios::binary | std::ios::app);
   if (!outFile.is_open())
@@ -1859,7 +2008,8 @@ __host__ void save_directional_graph_to_file(
 
   outFile.write(reinterpret_cast<const char*>(&DIRECTIONAL_TRAILER_MAGIC),   sizeof(uint32_t));
   outFile.write(reinterpret_cast<const char*>(&DIRECTIONAL_TRAILER_VERSION), sizeof(uint32_t));
-  const uint8_t flags = (has_lsh ? 1u : 0u) | (has_pq ? 2u : 0u) | (has_norms ? 4u : 0u);
+  const uint8_t flags = (has_lsh ? 1u : 0u) | (has_pq ? 2u : 0u) | (has_norms ? 4u : 0u)
+                      | (rotation.known ? 8u : 0u);
   outFile.write(reinterpret_cast<const char*>(&flags), sizeof(uint8_t));
 
   if (has_lsh) {
@@ -1929,11 +2079,22 @@ __host__ void save_directional_graph_to_file(
                   static_cast<std::streamsize>(h_norms.size() * sizeof(float)));
   }
 
+  // Last, so a reader that doesn't know flag bit 3 never reads into it.
+  if (rotation.known) {
+    const uint8_t rot = rotation.prerotate ? 1u : 0u;
+    outFile.write(reinterpret_cast<const char*>(&rot),           sizeof(uint8_t));
+    outFile.write(reinterpret_cast<const char*>(&rotation.seed), sizeof(uint64_t));
+  }
+
   outFile.close();
 
   std::cout << "Appended directional trailer to " << output_fname
             << " (lsh=" << has_lsh << ", pq=" << has_pq
-            << ", norms=" << has_norms << ")\n";
+            << ", norms=" << has_norms;
+  if (rotation.known)
+    std::cout << ", prerotate=" << rotation.prerotate
+              << " seed=" << rotation.seed;
+  std::cout << ")\n";
 }
 
 template <typename graph_cfg>
@@ -1945,8 +2106,6 @@ __host__ directional_graph_bundle<graph_cfg> load_directional_graph_from_file(
   static_assert(graph_cfg::use_lsh,
                 "load_directional_graph_from_file requires graph_cfg::use_lsh");
 
-  using data_t          = typename graph_cfg::data_t;
-  using edge_list_t     = typename graph_cfg::edge_list_t;
   using segment_t       = graph_segment<graph_cfg>;
   using edge_lsh_list_t = typename graph_cfg::edge_lsh_list_t;
   using edge_pq_list_t  = typename graph_cfg::edge_pq_list_t;
@@ -1956,12 +2115,11 @@ __host__ directional_graph_bundle<graph_cfg> load_directional_graph_from_file(
   bundle.g = load_graph_from_file<graph_cfg>(input_fname, dim, on_host);
   if (bundle.g.n_vectors == 0) return bundle;
 
-  // Base section size is exactly what save_graph_to_file/load_graph_from_file
-  // agree on: 4 u64 header fields + n_vectors * bytes_per_node.
-  const uint64_t bytes_per_node =
-      sizeof(data_t) * dim + sizeof(uint8_t) + sizeof(edge_list_t);
+  // Where the base section ends — derived from the file's own header, so it
+  // tracks whichever per-node columns and trailing blocks the writer chose
+  // (see base_section_bytes).
   const uint64_t base_section_size =
-      4 * sizeof(uint64_t) + static_cast<uint64_t>(bundle.g.n_vectors) * bytes_per_node;
+      directional_trailer_offset<graph_cfg>(input_fname, dim);
   const uint64_t trailer_prefix_size =
       2 * sizeof(uint32_t) + sizeof(uint8_t);   // magic + version + flags
 
@@ -1986,9 +2144,10 @@ __host__ directional_graph_bundle<graph_cfg> load_directional_graph_from_file(
     return bundle;   // no (recognizable) trailer — treat as base-only
   }
 
-  const bool file_has_lsh   = flags & 1u;
-  const bool file_has_pq    = flags & 2u;
-  const bool file_has_norms = flags & 4u;
+  const bool file_has_lsh      = flags & 1u;
+  const bool file_has_pq       = flags & 2u;
+  const bool file_has_norms    = flags & 4u;
+  const bool file_has_rotation = flags & 8u;
 
   std::vector<segment_t> h_segments(bundle.g.segments.begin(), bundle.g.segments.end());
 
@@ -2082,12 +2241,32 @@ __host__ directional_graph_bundle<graph_cfg> load_directional_graph_from_file(
                h_norms.size() * sizeof(float), cudaMemcpyHostToDevice);
   }
 
+  if (file_has_rotation) {
+    uint8_t  rot  = 0;
+    uint64_t seed = 0;
+    inFile.read(reinterpret_cast<char*>(&rot),  sizeof(uint8_t));
+    inFile.read(reinterpret_cast<char*>(&seed), sizeof(uint64_t));
+    if (!inFile)
+      throw std::runtime_error(
+          "load_directional_graph_from_file: rotation block flagged but "
+          "truncated in " + input_fname);
+    bundle.rotation.known     = true;
+    bundle.rotation.prerotate = (rot != 0);
+    bundle.rotation.seed      = seed;
+  }
+
   inFile.close();
   cudaDeviceSynchronize();
 
   std::cout << "Loaded directional trailer from " << input_fname
             << " (lsh=" << bundle.has_lsh << ", pq=" << bundle.has_pq
-            << ", norms=" << file_has_norms << ")\n";
+            << ", norms=" << file_has_norms;
+  if (bundle.rotation.known)
+    std::cout << ", prerotate=" << bundle.rotation.prerotate
+              << " seed=" << bundle.rotation.seed;
+  else
+    std::cout << ", rotation=unknown";
+  std::cout << ")\n";
 
   return bundle;
 }

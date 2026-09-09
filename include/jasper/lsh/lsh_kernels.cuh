@@ -1,16 +1,31 @@
 #pragma once
 
 #include <cassert>
+#include <limits>
+#include <type_traits>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
 namespace jasper {
+
+// Zero one edge slot's LSH payload (all K_RANKS packed words + mag_sq). Called
+// on slots that carry no edge, so the persisted codes never expose whatever
+// bytes the buffer held before. Single-threaded: the caller picks one thread.
+template <typename graph_cfg, typename graph_t>
+__device__ __forceinline__ void clear_lsh_slot(
+    graph_t& g, typename graph_cfg::index_t gid, uint8_t edge_idx) {
+  using packed_t = typename graph_cfg::packed_t;
+  for (uint8_t r = 0; r < graph_cfg::k_ranks; ++r)
+    g.set_lsh_packed(gid, edge_idx, r, static_cast<packed_t>(0));
+  g.set_lsh_mag_sq(gid, edge_idx, __float2bfloat16(0.0f));
+}
 
 template <typename graph_cfg, typename graph_t>
 __global__ void populate_lsh(graph_t g) {
   using index_t = typename graph_cfg::index_t;
   using data_t  = typename graph_cfg::data_t;
   constexpr uint32_t n_neighbors = graph_cfg::n_neighbors;
+  constexpr index_t  INVALID     = std::numeric_limits<index_t>::max();
   static_assert(std::is_same_v<data_t, __half>,
                 "populate_lsh requires data_t == __half");
 
@@ -43,9 +58,23 @@ __global__ void populate_lsh(graph_t g) {
 
   data_t *query_vec = g.get_vector(query_gid);
 
-  for (uint32_t neighbor_idx = 0; neighbor_idx < n_neighbors; ++neighbor_idx) {
+  // Only slots [0, cnt) hold an edge. Reading past cnt would dereference
+  // whatever id happens to occupy the unused slot: graph::allocate never
+  // initializes `edges`, and graph::reload — the DiskANN shard path, which
+  // rebuilds many graphs into one preallocated buffer — leaves the previous
+  // build's ids in place, so a stale id from a larger graph indexes out of
+  // range. cnt is read identically by every thread, so both this bound and the
+  // INVALID branch below are block-uniform.
+  const uint8_t cnt = g.get_edge_count(query_gid);
+
+  for (uint32_t neighbor_idx = 0; neighbor_idx < cnt; ++neighbor_idx) {
     const index_t neighbor_gid =
         g.get_neighbor(query_gid, static_cast<uint8_t>(neighbor_idx));
+    if (neighbor_gid == INVALID) {
+      if (threadIdx.x == 0)
+        clear_lsh_slot<graph_cfg>(g, query_gid, static_cast<uint8_t>(neighbor_idx));
+      continue;
+    }
     data_t *neighbor_vec = g.get_vector(neighbor_gid);
 
     // ─── Build Δ, packed keys, AND accumulate ||Δ||² in one pass ─────
@@ -129,6 +158,13 @@ __global__ void populate_lsh(graph_t g) {
     }
     __syncthreads();
   }
+
+  // ─── Zero the unused tail slots [cnt, n_neighbors) ───────────────
+  // The estimator only scores the first `edge_count` slots, so these are never
+  // read at search time; zeroing them keeps a reused graph buffer from carrying
+  // a previous build's codes into the persisted trailer.
+  for (uint32_t e = cnt + threadIdx.x; e < n_neighbors; e += blockDim.x)
+    clear_lsh_slot<graph_cfg>(g, query_gid, static_cast<uint8_t>(e));
 }
 
 }

@@ -85,7 +85,7 @@ struct graph_construct_params {
   bool prerotate = false;
 
   // Prerotate seed
-  uint32_t prerotate_seed = 42;
+  uint64_t prerotate_seed = 42;
 };
 
 template <typename INDEX_T>

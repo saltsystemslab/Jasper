@@ -137,6 +137,9 @@ struct dir_meta {
   bool has_lsh   = false;
   bool has_pq    = false;
   bool prerotate = false;
+  // Kept alongside d_rotation so save can record it in the trailer; a loader
+  // then gets the rotation from the file instead of from its caller.
+  uint64_t prerotate_seed = 0;
   typename GRAPH_T::data_t* d_rotation = nullptr;  // dim x dim, col-major, device; owned
   jasper::lsh_globals<GRAPH_T::k_ranks> globals{};
   jasper::pq_codebooks<GRAPH_T::pq_m, GRAPH_T::pq_k> codebooks{};  // owns d_centroids
@@ -466,13 +469,14 @@ int64_t ConstructDirectionalGraph_##id(ffi::TensorView vectors,                \
   params.max_batch_size = max_batch_size;                                   \
   params.on_host        = on_host;                                          \
   params.prerotate      = prerotate;                                        \
-  params.prerotate_seed = static_cast<uint32_t>(prerotate_seed);            \
+  params.prerotate_seed = static_cast<uint64_t>(prerotate_seed);            \
                                                                                \
   auto g = jasper::construct_graph<construct_cfg_##id>(params);              \
                                                                                \
   using graph_t = jasper::graph<cfg_##id>;                                   \
   dir_meta<graph_t> meta;                                                    \
-  meta.prerotate = prerotate;                                               \
+  meta.prerotate      = prerotate;                                          \
+  meta.prerotate_seed = static_cast<uint64_t>(prerotate_seed);              \
   if (prerotate) {                                                          \
     meta.d_rotation = make_device_rotation_matrix(                          \
         d, static_cast<uint64_t>(prerotate_seed));                         \
@@ -701,11 +705,15 @@ void SaveDirectionalGraph_##id(int64_t handle, ffi::String path) {          \
         << "Handle " << handle << " has no directional metadata";           \
     meta = mit->second;                                                     \
   }                                                                          \
+  jasper::directional_rotation_info rot;                                    \
+  rot.known     = true;   /* this process built or loaded it; it knows */   \
+  rot.prerotate = meta.prerotate;                                           \
+  rot.seed      = meta.prerotate_seed;                                      \
   jasper::save_directional_graph_to_file<cfg_##id>(                         \
       *gp,                                                                  \
       meta.has_lsh ? &meta.globals   : nullptr,                            \
       meta.has_pq  ? &meta.codebooks : nullptr,                            \
-      std::string(path));                                                   \
+      std::string(path), rot);                                              \
 }                                                                             \
                                                                                \
 int64_t LoadDirectionalGraph_##id(ffi::String path, int64_t dim, bool on_host, \
@@ -719,10 +727,18 @@ int64_t LoadDirectionalGraph_##id(ffi::String path, int64_t dim, bool on_host, \
   meta.has_pq    = bundle.has_pq;                                           \
   meta.globals   = bundle.globals;                                          \
   meta.codebooks = bundle.codebooks;                                        \
-  meta.prerotate = prerotate;                                              \
-  if (prerotate) {                                                         \
-    meta.d_rotation = make_device_rotation_matrix(                         \
-        static_cast<uint32_t>(dim), static_cast<uint64_t>(prerotate_seed)); \
+  /* The file's own record wins over the caller's arguments: passing the    \
+     wrong prerotate/seed searches unrotated queries against a rotated     \
+     index, which returns plausible nonsense with no error. Files written   \
+     before the rotation block say nothing, and then the arguments stand. */ \
+  meta.prerotate      = bundle.rotation.known ? bundle.rotation.prerotate   \
+                                              : prerotate;                  \
+  meta.prerotate_seed = bundle.rotation.known                               \
+                            ? bundle.rotation.seed                          \
+                            : static_cast<uint64_t>(prerotate_seed);        \
+  if (meta.prerotate) {                                                     \
+    meta.d_rotation = make_device_rotation_matrix(                          \
+        static_cast<uint32_t>(dim), meta.prerotate_seed);                   \
   }                                                                          \
                                                                                \
   std::lock_guard<std::mutex> lock(g_mutex);                                \
@@ -762,16 +778,19 @@ void GetVectorDirectional_##id(int64_t handle, int64_t index,                \
       cudaMemcpyDeviceToDevice);                                          \
 }                                                                             \
                                                                                \
-/* bit0 = has_lsh, bit1 = has_pq. 0 if the handle has no directional        \
-   metadata at all (shouldn't happen for a directional-config handle, but   \
-   keeps this query total rather than throwing). */                        \
+/* bit0 = has_lsh, bit1 = has_pq, bit2 = queries are being rotated (which  \
+   for a loaded graph is what the trailer said, not what the caller passed).\
+   0 if the handle has no directional metadata at all (shouldn't happen for \
+   a directional-config handle, but keeps this query total rather than      \
+   throwing). */                                                            \
 int64_t GetDirectionalFlags_##id(int64_t handle) {                          \
   using graph_t = jasper::graph<cfg_##id>;                                   \
   std::lock_guard<std::mutex> lock(g_mutex);                                \
   auto& dm = dir_meta_map<graph_t>();                                       \
   auto it = dm.find(handle);                                                \
   if (it == dm.end()) return 0;                                            \
-  return (it->second.has_lsh ? 1 : 0) | (it->second.has_pq ? 2 : 0);        \
+  return (it->second.has_lsh ? 1 : 0) | (it->second.has_pq ? 2 : 0)         \
+       | (it->second.prerotate ? 4 : 0);                                    \
 }
 
 // ── Free / info (config-agnostic; defined once in ffi/jasper_ffi_plain.cu) ──

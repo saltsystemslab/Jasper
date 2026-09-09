@@ -429,7 +429,7 @@ static void rotate_device_vectors(__half* d_vectors,
                                   uint32_t n_vectors,
                                   uint32_t dim,
                                   uint32_t padded_dim,
-                                  uint32_t seed,
+                                  uint64_t seed,
                                   cublasHandle_t handle) {
   if (n_vectors == 0) return;
 
@@ -476,7 +476,7 @@ static void rotate_device_vectors(__half* d_vectors,
 // on host- or device-resident graphs (host segments are staged to device for
 // the cuBLAS GEMM, then copied back).
 template <typename GraphCfg>
-void rotate_graph_vectors(jasper::graph<GraphCfg>& g, uint32_t seed) {
+void rotate_graph_vectors(jasper::graph<GraphCfg>& g, uint64_t seed) {
   using data_t    = typename GraphCfg::data_t;
   using segment_t = jasper::graph_segment<GraphCfg>;
   static_assert(std::is_same<data_t, __half>::value,
@@ -510,6 +510,45 @@ void rotate_graph_vectors(jasper::graph<GraphCfg>& g, uint32_t seed) {
   cublasDestroy(handle);
 }
 
+// Let the index's own trailer decide how queries get rotated. Files written
+// before the rotation block (or by a writer that didn't know) leave
+// `rotation.known` false, in which case the CLI flags stand as they always did.
+//
+// Taking the file's word over the flags is the point: getting this wrong
+// searches an unrotated query against a rotated index, which returns plausible
+// nonsense with no error.
+void apply_trailer_rotation(const jasper::directional_rotation_info& rotation,
+                            bool& do_rotate, uint64_t& rotate_seed) {
+  if (!rotation.known) {
+    std::cout << "  index does not record its rotation; using --rotate"
+              << (do_rotate ? "" : "/--no_rotate") << " as given"
+              << (do_rotate ? " (seed " + std::to_string(rotate_seed) + ")" : "")
+              << std::endl;
+    return;
+  }
+
+  const uint64_t file_seed = rotation.seed;
+  if (rotation.prerotate) {
+    if (do_rotate && rotate_seed != file_seed)
+      std::cout << "  note: --rotate_seed " << rotate_seed
+                << " overridden by the index's recorded seed " << file_seed
+                << std::endl;
+    if (!do_rotate)
+      std::cout << "  note: --no_rotate ignored; the index records that it IS "
+                   "prerotated (seed " << file_seed << "), so queries must be "
+                   "rotated to match" << std::endl;
+    do_rotate   = true;
+    rotate_seed = file_seed;
+    std::cout << "  rotating queries with the index's seed " << file_seed
+              << std::endl;
+  } else {
+    if (do_rotate)
+      std::cout << "  note: rotation disabled; the index records that it is NOT "
+                   "prerotated" << std::endl;
+    do_rotate = false;
+  }
+}
+
 // ── Load graph + populate LSH + run directional benchmark ──────
 template <typename GraphCfg, typename DataT>
 void load_and_bench_lsh(const std::string& index_path,
@@ -518,45 +557,71 @@ void load_and_bench_lsh(const std::string& index_path,
                         const std::string& src_dtype,
                         uint32_t dim,
                         uint32_t k,
-                        uint32_t rotate_seed,
+                        uint64_t rotate_seed,
                         bool do_rotate,
                         bool on_host,
+                        bool prepopulated,
                         const std::vector<std::pair<uint32_t, uint32_t>>& beam_limit_pairs) {
 
   // Load graph (LSH config; edge_lsh storage is allocated lazily below).
   // Rotation, generate_lsh_globals and populate_edge_lsh all work on host now,
   // so honor --on_host directly at load time.
+  //
+  // --prepopulated reads the codes + calibration straight out of the index's
+  // directional trailer (create_diskann_index --lsh) instead of recomputing
+  // them. The stored vectors are then already in the rotated space the codes
+  // were built in, so only the queries still need rotating.
   std::cout << "Loading index..." << std::endl;
-  auto graph = jasper::load_graph_from_file<GraphCfg>(index_path, dim, on_host);
-  // load_graph_from_file doesn't build the forward stable_id -> slot table
-  // (see graph.cuh) — rebuild it here (device-resident graphs only).
-  if (!on_host) jasper::rebuild_id_map<GraphCfg>(graph);
-  std::cout << "  " << graph.n_vectors << " vectors, dim=" << graph.dim << std::endl;
+  jasper::graph<GraphCfg> graph{};
+  jasper::lsh_globals<GraphCfg::k_ranks> lsh_globals{};
 
-  // Rotate stored vectors so the LSH hashing matches create_lsh_index's
-  // prerotate. Distance-preserving, so graph edges are unaffected.
-  if (do_rotate) {
-    std::cout << "Rotating stored vectors (seed=" << rotate_seed << ")..." << std::endl;
-    rotate_graph_vectors<GraphCfg>(graph, rotate_seed);
+  if (prepopulated) {
+    auto bundle = jasper::load_directional_graph_from_file<GraphCfg>(
+        index_path, dim, on_host);
+    if (!bundle.has_lsh)
+      throw std::runtime_error(
+          "--prepopulated: " + index_path + " has no LSH artifacts in its "
+          "directional trailer (build it with create_diskann_index --lsh, or "
+          "drop --prepopulated to populate at load time)");
+    graph       = std::move(bundle.g);
+    lsh_globals = bundle.globals;
+    if (bundle.has_pq) bundle.codebooks.free();   // not used on the LSH path
+    if (!on_host) jasper::rebuild_id_map<GraphCfg>(graph);
+    std::cout << "  " << graph.n_vectors << " vectors, dim=" << graph.dim
+              << " (LSH codes read from trailer)" << std::endl;
+    apply_trailer_rotation(bundle.rotation, do_rotate, rotate_seed);
+  } else {
+    graph = jasper::load_graph_from_file<GraphCfg>(index_path, dim, on_host);
+    // load_graph_from_file doesn't build the forward stable_id -> slot table
+    // (see graph.cuh) — rebuild it here (device-resident graphs only).
+    if (!on_host) jasper::rebuild_id_map<GraphCfg>(graph);
+    std::cout << "  " << graph.n_vectors << " vectors, dim=" << graph.dim << std::endl;
+
+    // Rotate stored vectors so the LSH hashing matches create_lsh_index's
+    // prerotate. Distance-preserving, so graph edges are unaffected.
+    if (do_rotate) {
+      std::cout << "Rotating stored vectors (seed=" << rotate_seed << ")..." << std::endl;
+      rotate_graph_vectors<GraphCfg>(graph, rotate_seed);
+      cudaDeviceSynchronize();
+    }
+
+    // Build LSH globals + per-edge LSH coords from the (rotated) graph.
+    std::cout << "Sampling for LSH globals..." << std::endl;
+    auto t0 = std::chrono::steady_clock::now();
+    lsh_globals = graph.generate_lsh_globals(/*n_samples=*/32768);
     cudaDeviceSynchronize();
+    auto t1 = std::chrono::steady_clock::now();
+
+    std::cout << "Populating edge LSH..." << std::endl;
+    graph.populate_edge_lsh();
+    cudaDeviceSynchronize();
+    auto t2 = std::chrono::steady_clock::now();
+
+    std::cout << "  generate_lsh_globals: "
+              << std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count() << " ms\n";
+    std::cout << "  populate_edge_lsh:    "
+              << std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count() << " ms\n";
   }
-
-  // Build LSH globals + per-edge LSH coords from the (rotated) graph.
-  std::cout << "Sampling for LSH globals..." << std::endl;
-  auto t0 = std::chrono::steady_clock::now();
-  auto lsh_globals = graph.generate_lsh_globals(/*n_samples=*/32768);
-  cudaDeviceSynchronize();
-  auto t1 = std::chrono::steady_clock::now();
-
-  std::cout << "Populating edge LSH..." << std::endl;
-  graph.populate_edge_lsh();
-  cudaDeviceSynchronize();
-  auto t2 = std::chrono::steady_clock::now();
-
-  std::cout << "  generate_lsh_globals: "
-            << std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count() << " ms\n";
-  std::cout << "  populate_edge_lsh:    "
-            << std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count() << " ms\n";
 
   // Load queries, casting src_dtype -> DataT (__half)
   std::cout << "Loading queries..." << std::endl;
@@ -630,45 +695,70 @@ void load_and_bench_pq(const std::string& index_path,
                        const std::string& src_dtype,
                        uint32_t dim,
                        uint32_t k,
-                       uint32_t rotate_seed,
+                       uint64_t rotate_seed,
                        bool do_rotate,
                        uint32_t pq_train,
                        bool on_host,
+                       bool prepopulated,
                        const std::vector<std::pair<uint32_t, uint32_t>>& beam_limit_pairs) {
 
   // Load graph (LSH config; edge_pqs storage is allocated lazily below).
+  // See load_and_bench_lsh for what --prepopulated changes.
   std::cout << "Loading index..." << std::endl;
-  auto graph = jasper::load_graph_from_file<GraphCfg>(index_path, dim, on_host);
-  // load_graph_from_file doesn't build the forward stable_id -> slot table
-  // (see graph.cuh) — rebuild it here (device-resident graphs only).
-  if (!on_host) jasper::rebuild_id_map<GraphCfg>(graph);
-  std::cout << "  " << graph.n_vectors << " vectors, dim=" << graph.dim << std::endl;
+  jasper::graph<GraphCfg> graph{};
+  jasper::pq_codebooks<GraphCfg::pq_m, GraphCfg::pq_k> pq_codebooks{};
 
-  // Rotate stored vectors so the PQ residuals match create_lsh_index's
-  // prerotate. Distance-preserving, so graph edges are unaffected.
-  if (do_rotate) {
-    std::cout << "Rotating stored vectors (seed=" << rotate_seed << ")..." << std::endl;
-    rotate_graph_vectors<GraphCfg>(graph, rotate_seed);
+  if (prepopulated) {
+    auto bundle = jasper::load_directional_graph_from_file<GraphCfg>(
+        index_path, dim, on_host);
+    if (!bundle.has_pq)
+      throw std::runtime_error(
+          "--prepopulated: " + index_path + " has no PQ artifacts in its "
+          "directional trailer (build it with create_diskann_index --pq, or "
+          "drop --prepopulated to train at load time)");
+    graph        = std::move(bundle.g);
+    pq_codebooks = bundle.codebooks;
+    if (graph.d_vector_norms == nullptr)
+      throw std::runtime_error(
+          "--prepopulated: trailer has PQ codes but no vector norms; the L2 "
+          "estimator needs them (rebuild with a newer create_diskann_index)");
+    if (!on_host) jasper::rebuild_id_map<GraphCfg>(graph);
+    std::cout << "  " << graph.n_vectors << " vectors, dim=" << graph.dim
+              << " (PQ codes + norms read from trailer)" << std::endl;
+    apply_trailer_rotation(bundle.rotation, do_rotate, rotate_seed);
+  } else {
+    graph = jasper::load_graph_from_file<GraphCfg>(index_path, dim, on_host);
+    // load_graph_from_file doesn't build the forward stable_id -> slot table
+    // (see graph.cuh) — rebuild it here (device-resident graphs only).
+    if (!on_host) jasper::rebuild_id_map<GraphCfg>(graph);
+    std::cout << "  " << graph.n_vectors << " vectors, dim=" << graph.dim << std::endl;
+
+    // Rotate stored vectors so the PQ residuals match create_lsh_index's
+    // prerotate. Distance-preserving, so graph edges are unaffected.
+    if (do_rotate) {
+      std::cout << "Rotating stored vectors (seed=" << rotate_seed << ")..." << std::endl;
+      rotate_graph_vectors<GraphCfg>(graph, rotate_seed);
+      cudaDeviceSynchronize();
+    }
+
+    // Train PQ codebooks on sampled edge residuals, then encode every edge.
+    std::cout << "Training PQ codebooks..." << std::endl;
+    auto t0 = std::chrono::steady_clock::now();
+    pq_codebooks = graph.generate_pq_codebooks(pq_train);
     cudaDeviceSynchronize();
+    auto t1 = std::chrono::steady_clock::now();
+
+    std::cout << "Populating edge PQ codes..." << std::endl;
+    graph.populate_edge_pq(pq_codebooks);
+    graph.compute_vector_norms();  // exact ||v||² for the PQ L2 estimator
+    cudaDeviceSynchronize();
+    auto t2 = std::chrono::steady_clock::now();
+
+    std::cout << "  generate_pq_codebooks: "
+              << std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count() << " ms\n";
+    std::cout << "  populate_edge_pq:      "
+              << std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count() << " ms\n";
   }
-
-  // Train PQ codebooks on sampled edge residuals, then encode every edge.
-  std::cout << "Training PQ codebooks..." << std::endl;
-  auto t0 = std::chrono::steady_clock::now();
-  auto pq_codebooks = graph.generate_pq_codebooks(pq_train);
-  cudaDeviceSynchronize();
-  auto t1 = std::chrono::steady_clock::now();
-
-  std::cout << "Populating edge PQ codes..." << std::endl;
-  graph.populate_edge_pq(pq_codebooks);
-  graph.compute_vector_norms();  // exact ||v||² for the PQ L2 estimator
-  cudaDeviceSynchronize();
-  auto t2 = std::chrono::steady_clock::now();
-
-  std::cout << "  generate_pq_codebooks: "
-            << std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count() << " ms\n";
-  std::cout << "  populate_edge_pq:      "
-            << std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count() << " ms\n";
 
   // Load queries, casting src_dtype -> DataT (__half)
   std::cout << "Loading queries..." << std::endl;
@@ -754,6 +844,10 @@ void load_and_bench(const std::string& index_path,
   if (!on_host) jasper::rebuild_id_map<GraphCfg>(graph);
   std::cout << "  " << graph.n_vectors << " vectors, dim=" << graph.dim << std::endl;
 
+  // Which space are the stored vectors in? Read before the queries, so a
+  // mangled trailer fails before the expensive load.
+  const auto rotation = jasper::read_rotation_info<GraphCfg>(index_path, dim);
+
   // Load queries, casting src_dtype -> DataT (__half)
   std::cout << "Loading queries..." << std::endl;
   jasper::vector_view<DataT> h_queries_view;
@@ -779,6 +873,21 @@ void load_and_bench(const std::string& index_path,
   auto d_queries_view = h_queries_view.to_device();
   cudaFreeHost(h_queries_view.data);
   DataT* d_queries = d_queries_view.data;
+
+  // An index built with prerotation stores rotated vectors. Rotation is
+  // orthogonal, so conventional search over it is perfectly valid — but only
+  // with queries rotated the same way; otherwise this silently benchmarks
+  // garbage. The index records which space it is in (read_rotation_info), so
+  // honor it here rather than making the caller remember.
+  if (rotation.known && rotation.prerotate) {
+    std::cout << "  index is prerotated (seed " << rotation.seed
+              << "); rotating queries to match" << std::endl;
+    cublasHandle_t handle;
+    cublasCreate(&handle);
+    rotate_device_vectors(d_queries, n_queries, dim,
+                          d_queries_view.padded_dim, rotation.seed, handle);
+    cublasDestroy(handle);
+  }
 
   // Load ground truth
   GroundTruth gt;
@@ -905,6 +1014,15 @@ int main(int argc, char** argv) {
     .implicit_value(true)
     .help("Move the loaded graph to host before querying.");
 
+  program.add_argument("--prepopulated")
+    .default_value(false)
+    .implicit_value(true)
+    .help("Read the LSH/PQ codes and calibration from the index's directional "
+          "trailer (create_diskann_index --lsh/--pq) instead of computing them "
+          "at load time. The stored vectors are then already rotated, so only "
+          "the queries are rotated — pass the build's --prerotate_seed as "
+          "--rotate_seed.");
+
   program.add_argument("--no_rotate")
     .default_value(false)
     .implicit_value(true)
@@ -912,8 +1030,8 @@ int main(int argc, char** argv) {
           "both are rotated (seed 42) to match create_lsh_index's prerotate.");
 
   program.add_argument("--rotate_seed")
-    .default_value(uint32_t{42})
-    .scan<'u', uint32_t>()
+    .default_value(uint64_t{42})
+    .scan<'u', uint64_t>()
     .help("Rotation seed for --lsh mode (must match construction). Default 42.");
 
   try {
@@ -939,7 +1057,8 @@ int main(int argc, char** argv) {
   auto k_ranks      = program.get<uint32_t>("--k_ranks");
   auto pq_train     = program.get<uint32_t>("--pq_train");
   auto no_rotate    = program.get<bool>("--no_rotate");
-  auto rotate_seed  = program.get<uint32_t>("--rotate_seed");
+  auto rotate_seed  = program.get<uint64_t>("--rotate_seed");
+  auto prepopulated = program.get<bool>("--prepopulated");
 
   if (use_lsh && use_pq) {
     std::cerr << "Error: --lsh and --pq are mutually exclusive" << std::endl;
@@ -972,9 +1091,12 @@ int main(int argc, char** argv) {
   std::cout << "  on_host:      " << (on_host ? "true" : "false") << std::endl;
   if (use_lsh || use_pq) {
     std::cout << "  k_ranks:      " << k_ranks << std::endl;
-    if (use_pq)
+    if (use_pq && !prepopulated)
       std::cout << "  pq_train:     " << pq_train << std::endl;
-    std::cout << "  rotate:       " << (no_rotate ? "false" : "true") << std::endl;
+    std::cout << "  prepopulated: " << (prepopulated ? "true" : "false") << std::endl;
+    std::cout << "  rotate:       " << (no_rotate ? "false" : "true");
+    if (prepopulated && !no_rotate) std::cout << " (queries only)";
+    std::cout << std::endl;
     if (!no_rotate)
       std::cout << "  rotate_seed:  " << rotate_seed << std::endl;
   }
@@ -993,7 +1115,7 @@ int main(int argc, char** argv) {
           load_and_bench_pq<cfg_##id, DAT>(                                    \
               index_path, query_path, gt_path, datatype,                       \
               dim, k, rotate_seed, !no_rotate, pq_train, on_host,             \
-              beam_limit_pairs);                                               \
+              prepopulated, beam_limit_pairs);                                 \
           dispatched = true;                                                   \
         }
 
@@ -1015,7 +1137,8 @@ int main(int argc, char** argv) {
           std::cout << "  Config: " #id << std::endl;                          \
           load_and_bench_lsh<cfg_##id, DAT>(                                   \
               index_path, query_path, gt_path, datatype,                       \
-              dim, k, rotate_seed, !no_rotate, on_host, beam_limit_pairs);    \
+              dim, k, rotate_seed, !no_rotate, on_host, prepopulated,          \
+              beam_limit_pairs);                                               \
           dispatched = true;                                                   \
         }
 

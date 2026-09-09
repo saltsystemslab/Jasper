@@ -33,6 +33,54 @@ __global__ void subtract_mean_kernel(
   }
 }
 
+// ─── Exact per-vector squared L2 norm over a raw vector chunk ────────────────
+//
+// The PQ L2 estimator reconstructs ||q-v||² from the edge codes plus each
+// vector's EXACT ||v||² (graph::d_vector_norms), so a PQ index has to ship
+// those norms. graph.cuh's pq_compute_vector_norms does the same job but reads
+// through a graph device_view; the DiskANN builder never holds the full dataset
+// as a graph, so it streams raw chunks through this instead.
+//
+// One block per vector, block-reduced over padded_dim. Pad lanes are zero and
+// contribute nothing, so the loop can ignore the dim/padded_dim distinction.
+template <typename DATA_T>
+__global__ void vector_norms_kernel(
+    const DATA_T* __restrict__ v,     // [n * padded_dim]
+    uint32_t n,
+    uint32_t padded_dim,
+    float* __restrict__ out           // [n]
+) {
+  static_assert(std::is_same_v<DATA_T, __half>,
+                "vector_norms_kernel requires data_t == __half");
+  const uint32_t i = blockIdx.x;
+  if (i >= n) return;
+
+  const DATA_T* __restrict__ row = v + static_cast<size_t>(i) * padded_dim;
+  float local = 0.0f;
+  for (uint32_t d = threadIdx.x; d < padded_dim; d += blockDim.x) {
+    const float x = __half2float(row[d]);
+    local += x * x;
+  }
+
+  #pragma unroll
+  for (int o = 16; o > 0; o >>= 1)
+    local += __shfl_xor_sync(0xFFFFFFFFu, local, o);
+
+  __shared__ float s_warp[32];
+  const uint32_t lane = threadIdx.x & 31u;
+  const uint32_t wid  = threadIdx.x >> 5;
+  const uint32_t nw   = (blockDim.x + 31u) / 32u;
+  if (lane == 0) s_warp[wid] = local;
+  __syncthreads();
+  if (wid == 0) {
+    float t = (lane < nw) ? s_warp[lane] : 0.0f;
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1)
+      t += __shfl_xor_sync(0xFFFFFFFFu, t, o);
+    if (lane == 0) out[i] = t;
+  }
+}
+
 // ─── Polytope (cross-polytope) LSH shard assignment ──────────────────────────
 //
 // Cross-polytope LSH hashes a vector to the nearest vertex of the scaled

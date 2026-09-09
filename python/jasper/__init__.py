@@ -264,21 +264,18 @@ class Graph:
                            directional_search()/pq_search() have their
                            artifacts present become usable. Leave None to
                            load a plain graph.
-            prerotate:     Must match what build() used for this graph — not
-                           stored in the file. Only relevant when k_ranks is
-                           given.
-                           FOOTGUN: build()'s default is
-                           `prerotate = build_lsh or build_pq` (usually True),
-                           but this default is False. If you built with
-                           prerotate on (the common case) and load() without
-                           passing prerotate=True, queries silently skip
-                           rotation against a rotated index — results are
-                           wrong with no error. Always pass the same
-                           prerotate/prerotate_seed used at build() time.
-                           (Not stored in the trailer yet — see
-                           save_directional_graph_to_file/
-                           load_directional_graph_from_file in graph.cuh.)
-            prerotate_seed: Must match what build() used for this graph.
+            prerotate:     Fallback only. Indexes saved by this version record
+                           their own rotation in the trailer, and the loader
+                           uses that in preference to these arguments — check
+                           `graph.prerotate` after loading to see what it
+                           settled on.
+                           This argument (and prerotate_seed) is still used for
+                           files written before that record existed, which say
+                           nothing about their rotation. For those, passing the
+                           wrong value means queries silently skip rotation
+                           against a rotated index — wrong results, no error —
+                           so pass what build() used.
+            prerotate_seed: Fallback only, as above.
         """
         if isinstance(data_type, str):
             data_type = DataType(data_type)
@@ -302,7 +299,9 @@ class Graph:
             handle, config_id, data_type, distance, n_neighbors, dim,
             is_directional=True, k_ranks=k_ranks,
             has_lsh=bool(flags & 1), has_pq=bool(flags & 2),
-            prerotate=prerotate, prerotate_seed=prerotate_seed,
+            # bit2 is what the loader actually settled on: the index's own
+            # recorded rotation when it has one, else the argument above.
+            prerotate=bool(flags & 4), prerotate_seed=prerotate_seed,
         )
     
     def save(self, path: str) -> None:
@@ -360,9 +359,8 @@ class Graph:
                              Defaults to True iff build_lsh or build_pq is
                              set, since LSH/PQ estimator quality relies on
                              it — pass False explicitly to disable.
-                             NOTE: this choice (and prerotate_seed) is NOT
-                             persisted by save()/load() — see the
-                             ⚠ FOOTGUN note on Graph.load's prerotate arg.
+                             This choice and prerotate_seed are recorded in
+                             the file by save(), and load() honors them.
             prerotate_seed:   Seed for the rotation matrix.
             lsh_samples:      Edge samples used to calibrate LSH globals.
             lsh_seed:         Seed for LSH global sampling.

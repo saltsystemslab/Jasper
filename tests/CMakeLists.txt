@@ -11,6 +11,8 @@ set(TEST_SOURCES
   test_distance.cu
   test_rotation.cu
   test_rabitq.cu
+  test_graph_format.cu
+  test_diskann_merge.cu
   #test_beam_search.cu
   #test_config.cu
 )

@@ -246,6 +246,15 @@ __global__ void pq_compute_vector_norms(graph_t g, float* __restrict__ norms) {
   }
 }
 
+// Zero one edge slot's M PQ codes. Called on slots that carry no edge, so the
+// persisted codes never expose whatever bytes the buffer held before.
+// Single-threaded: the caller picks one thread.
+template <typename graph_cfg, typename graph_t, uint32_t M>
+__device__ __forceinline__ void clear_pq_slot(
+    graph_t& g, typename graph_cfg::index_t gid, uint8_t edge_idx) {
+  for (uint32_t j = 0; j < M; ++j) g.set_pq_code(gid, edge_idx, j, uint8_t{0});
+}
+
 // ─── encode: assign every graph edge to its PQ code ───────────────────────
 // grid = n_vectors blocks, blockDim = K. Mirrors pq_kmeans_assign but loops
 // over a node's out-edges and writes the M-byte code into edge_pqs.
@@ -256,6 +265,7 @@ __global__ void pq_populate(graph_t g, const float* __restrict__ centroids) {
   static_assert(std::is_same_v<data_t, __half>,
                 "pq_populate requires data_t == __half");
   constexpr uint32_t n_neighbors = graph_cfg::n_neighbors;
+  constexpr index_t  INVALID     = std::numeric_limits<index_t>::max();
 
   const uint32_t padded_dim = g.get_padded_dim();
   const uint32_t dsub       = padded_dim / M;
@@ -270,9 +280,16 @@ __global__ void pq_populate(graph_t g, const float* __restrict__ centroids) {
   const data_t* __restrict__ uv = g.get_vector(u_gid);
   const uint8_t cnt = g.get_edge_count(u_gid);
 
-  for (uint32_t e = 0; e < n_neighbors; ++e) {
-    if (e >= cnt) break;
+  // cnt and nb are read identically by every thread, so the loop bound and the
+  // INVALID branch are block-uniform — required, since pq_block_argmin below
+  // syncs the whole block.
+  for (uint32_t e = 0; e < cnt; ++e) {
     const index_t nb = g.get_neighbor(u_gid, static_cast<uint8_t>(e));
+    if (nb == INVALID) {
+      if (threadIdx.x == 0)
+        clear_pq_slot<graph_cfg, graph_t, M>(g, u_gid, static_cast<uint8_t>(e));
+      continue;
+    }
     const data_t* __restrict__ nv = g.get_vector(nb);
 
     for (uint32_t i = threadIdx.x; i < padded_dim; i += blockDim.x)
@@ -292,6 +309,12 @@ __global__ void pq_populate(graph_t g, const float* __restrict__ centroids) {
       __syncthreads();
     }
   }
+
+  // Zero the unused tail slots [cnt, n_neighbors). Never read at search time
+  // (the ADC loop stops at edge_count); this keeps a reused graph buffer from
+  // carrying a previous build's codes into the persisted trailer.
+  for (uint32_t e = cnt + threadIdx.x; e < n_neighbors; e += blockDim.x)
+    clear_pq_slot<graph_cfg, graph_t, M>(g, u_gid, static_cast<uint8_t>(e));
 }
 
 }  // namespace jasper

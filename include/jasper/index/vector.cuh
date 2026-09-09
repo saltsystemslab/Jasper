@@ -155,10 +155,19 @@ __host__ vector_view<DATA_T> load_vectors_from_file(std::string filename) {
   std::streamsize file_size = file.tellg();
   file.seekg(0, std::ios::beg);
 
-  int32_t n_data_points;
-  int32_t n_dimensions;
+  // Zero-initialized and stream-checked: is_open() succeeds on a directory (and
+  // the header read then fails), so without this the "negative dimension" check
+  // below would be reading uninitialized stack and reporting a bogus header
+  // instead of the real problem.
+  int32_t n_data_points = 0;
+  int32_t n_dimensions  = 0;
   file.read(reinterpret_cast<char*>(&n_data_points), sizeof(int32_t));
   file.read(reinterpret_cast<char*>(&n_dimensions), sizeof(int32_t));
+  if (!file) {
+    throw std::runtime_error(
+        "could not read an [int32 count][int32 dim] header from " + filename +
+        " (is it a directory, or empty?)");
+  }
 
   if (n_dimensions < 0 || n_data_points < 0) {
     throw std::runtime_error("negative dimension or count read from file");
@@ -234,10 +243,17 @@ __host__ vector_view<DATA_T> load_vectors_from_file_cast(std::string filename) {
   std::streamsize file_size = file.tellg();
   file.seekg(0, std::ios::beg);
 
-  int32_t n_data_points;
-  int32_t n_dimensions;
+  // See the note in load_vectors_from_file: is_open() succeeds on a directory,
+  // so the header read has to be checked or these stay uninitialized.
+  int32_t n_data_points = 0;
+  int32_t n_dimensions  = 0;
   file.read(reinterpret_cast<char*>(&n_data_points), sizeof(int32_t));
   file.read(reinterpret_cast<char*>(&n_dimensions), sizeof(int32_t));
+  if (!file) {
+    throw std::runtime_error(
+        "could not read an [int32 count][int32 dim] header from " + filename +
+        " (is it a directory, or empty?)");
+  }
 
   if (n_dimensions < 0 || n_data_points < 0) {
     throw std::runtime_error("negative dimension or count read from file");
