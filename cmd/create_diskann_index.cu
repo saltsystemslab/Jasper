@@ -19,7 +19,9 @@
   X(f16_r32_32_l2,  uint32_t, 32,  32, __half, float, jasper::distance_func::L2)          \
   X(f16_r32_32_ip,  uint32_t, 32,  32, __half, float, jasper::distance_func::INNER_PRODUCT) \
   X(f16_r32_64_l2,  uint32_t, 32,  64, __half, float, jasper::distance_func::L2)          \
-  X(f16_r32_64_ip,  uint32_t, 32,  64, __half, float, jasper::distance_func::INNER_PRODUCT)
+  X(f16_r32_64_ip,  uint32_t, 32,  64, __half, float, jasper::distance_func::INNER_PRODUCT) \
+  X(f16_r64_64_l2,  uint32_t, 64,  64, __half, float, jasper::distance_func::L2)          \
+  X(f16_r64_64_ip,  uint32_t, 64,  64, __half, float, jasper::distance_func::INNER_PRODUCT)
 
 #define DECLARE_CONFIGS(id, IDX, RINT, RFIN, DAT, DIST, FUNC)                            \
   using int_cfg_##id = jasper::graph_construct_config<                                    \
@@ -53,7 +55,11 @@ JASPER_FOR_EACH_CONFIG(DECLARE_CONFIGS)
   X(d_r32_32_ip_k4_d128,   uint32_t, 32, 32, __half, float, jasper::distance_func::INNER_PRODUCT, 4, uint8_t)  \
   X(d_r32_64_ip_k4_d128,   uint32_t, 32, 64, __half, float, jasper::distance_func::INNER_PRODUCT, 4, uint8_t)  \
   X(d_r32_32_ip_k4_dbig,   uint32_t, 32, 32, __half, float, jasper::distance_func::INNER_PRODUCT, 4, uint16_t) \
-  X(d_r32_64_ip_k4_dbig,   uint32_t, 32, 64, __half, float, jasper::distance_func::INNER_PRODUCT, 4, uint16_t)
+  X(d_r32_64_ip_k4_dbig,   uint32_t, 32, 64, __half, float, jasper::distance_func::INNER_PRODUCT, 4, uint16_t) \
+  X(d_r64_64_l2_k4_d128,   uint32_t, 64, 64, __half, float, jasper::distance_func::L2,            4, uint8_t)  \
+  X(d_r64_64_l2_k4_dbig,   uint32_t, 64, 64, __half, float, jasper::distance_func::L2,            4, uint16_t) \
+  X(d_r64_64_ip_k4_d128,   uint32_t, 64, 64, __half, float, jasper::distance_func::INNER_PRODUCT, 4, uint8_t)  \
+  X(d_r64_64_ip_k4_dbig,   uint32_t, 64, 64, __half, float, jasper::distance_func::INNER_PRODUCT, 4, uint16_t)
 
 #define DECLARE_DIR_CONFIGS(id, IDX, RINT, RFIN, DAT, DIST, FUNC, KR, PACKEDT)           \
   using int_cfg_##id = jasper::graph_construct_config<                                    \
@@ -217,7 +223,8 @@ void dispatch(
       ", r_final=" + std::to_string(r_final) +
       ", k_ranks=" + std::to_string(k_ranks) +
       ", dim=" + std::to_string(dim) +
-      " (compiled in: (r_int,r_final) in {(32,32),(32,64)}, k_ranks=4, l2|ip). "
+      " (compiled in: (r_int,r_final) in {(32,32),(32,64),(64,64)}, k_ranks=4, "
+      "l2|ip). "
       "Add a row to JASPER_FOR_EACH_DIR_CONFIG for anything else.");
   }
 
@@ -237,7 +244,7 @@ void dispatch(
     "Unsupported config: datatype=" + datatype + ", distance=" + distance +
     ", r_intermediate=" + std::to_string(r_int) +
     ", r_final=" + std::to_string(r_final) +
-    " (supported (r_int,r_final): (32,32), (32,64))");
+    " (supported (r_int,r_final): (32,32), (32,64), (64,64))");
 }
 
 int main(int argc, char** argv) {

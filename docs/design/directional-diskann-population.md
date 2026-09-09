@@ -389,24 +389,31 @@ Two independent observations from this table:
   subquantizer). Raising M to 16 for PQ quality drags `k_ranks` to 16 with it and
   pushes the build to ~478 GiB.
 
-### 4.3 Host memory, transient (per shard of *s* nodes)
+### 4.3 Host memory, transient
 
-- gather buffers: `2 * s * padded_dim * 2` — one shard building, one prefetched
-  (`construct_diskann.cuh:574-591`).
-- in-flight merge jobs: `(MERGE_QCAP + 2) * s * job_bytes_per_node`, where
-  `job_bytes_per_node = 6*R_int + 1 + 4 + lsh_int + pq_int`; `MERGE_QCAP = 2`
-  (`construct_diskann.cuh:539`) plus one being built plus one in the worker.
+- gather buffers: `2 * s * padded_dim * 2` for a shard of *s* nodes — one shard
+  building, one prefetched. Scales with shard size and can't easily be chunked:
+  `graph::reload` uploads a shard's vectors as one contiguous copy, which is the
+  whole reason they're gathered into a buffer first.
+- in-flight merge jobs: `(MERGE_QCAP + 2) * min(s, 2^20) * job_bytes_per_node`,
+  with `job_bytes_per_node = 6*R_int + 1 + 4 + lsh_int + pq_int` and
+  `MERGE_QCAP = 8`. **Independent of shard size** — see below.
 
-| | job B/node today | job B/node with LSH+PQ | at s = 4M: gather | jobs | total |
-| --- | --- | --- | --- | --- | --- |
-| A | 197 | 517 | 1.5 GB | 8.3 GB | ~9.8 GB |
-| B | 197 | 645 | 12.3 GB | 10.3 GB | ~22.6 GB |
+| | job B/node | gather at s = 100M | merge jobs | total |
+| --- | --- | --- | --- | --- |
+| A (d96, R_int 32, LSH+PQ) | 517 | 35.8 GiB | 5.0 GiB | ~41 GiB |
+| A (d96, R_int 32, PQ only) | 325 | 35.8 GiB | 3.2 GiB | ~39 GiB |
 
-`MERGE_QCAP = 2` was chosen when a job was only edges + counts + ids. With
-payloads a job is 2.6-3.3x larger, and the queue cost scales with shard size —
-so pick `n_parts` for a shard of a few million nodes rather than accepting
-whatever `max_shard` allows, and consider `MERGE_QCAP = 1` for directional
-builds.
+**A merge job is one graph segment, not one shard.** It didn't start that way,
+and the difference decides whether large shards are affordable. With
+shard-sized jobs the queue cost was `(MERGE_QCAP + 2) * s * ~500 B` — over
+120 GiB at *s* = 100M — which forced `n_parts` up and shards down purely to
+bound host memory, costing graph quality for nothing. Since `build_from_buf`
+already copies back one `vectors_per_segment` (2²⁰) chunk at a time, and merge
+rows are independent (a global id appears at most once per shard), each segment
+is enqueued as its own job the moment its copy lands. The queue is then a few
+GiB regardless of shard size, and `n_parts` can be chosen purely from device
+capacity — which is what it should have been all along.
 
 ### 4.4 Device memory
 

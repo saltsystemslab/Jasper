@@ -4,7 +4,12 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=128
 #SBATCH --nodelist=d4067
-#SBATCH --mem=900GB
+#SBATCH --mem=987842M
+# ^ d4067's full RealMemory. SLURM's documented suffixes are K|M|G|T, so use M
+# rather than "GB". --mem=0 (all memory on the node) works too. This matters:
+# the cgroup limit, not the node's free memory, is what OOM-kills the job, and
+# the budget table below reads SLURM_MEM_PER_NODE precisely so it checks against
+# the number that can actually kill you.
 #SBATCH --gres=gpu:1
 #SBATCH --job-name=deep_scaling
 #SBATCH --output=deep_scaling_%j.log
@@ -24,9 +29,10 @@
 # ── Read this before launching 1B ──────────────────────────────────────────
 # Host RAM, not GPU memory, is the binding constraint. The builder holds, for
 # every vector, the dataset row plus the final edge list plus (when requested)
-# the per-edge LSH and PQ codes — see section 4 of the design doc. At 1B x d96,
-# R_fin=32, both estimators, that is ~668 GiB resident, ~178 GiB of which is
-# PINNED (load_vectors_from_file_cast uses cudaMallocHost).
+# the per-edge LSH and PQ codes — see section 4 of the design doc. At the
+# defaults (1B x d96, R=64, PQ) that is ~787 GiB resident, ~178 GiB of which is
+# PINNED (load_vectors_from_file_cast uses cudaMallocHost), plus ~32 GiB of
+# transient buffers. Adding LSH on top does NOT fit on this node.
 #
 # So: run with DRY_RUN=1 first. It prints the budget for every stage against
 # what this node actually has and exits without building anything.
@@ -50,13 +56,24 @@ set -euo pipefail
 
 # ── Tunables (all overridable from the environment) ────────────────────────
 SCALES="${SCALES:-10M 100M 200M 1B}"
-ESTIMATORS="${ESTIMATORS:-lsh+pq}"   # lsh | pq | lsh+pq | none
+# pq rather than lsh+pq by default: at R_fin=64 the LSH codes add 384 B/vector,
+# which puts 1B past this node's memory (see the R64 rows in section 4 of the
+# design doc). PQ also measured ~2x LSH's recall on text2image at fewer bytes
+# per node. ESTIMATORS=lsh is fine at R_fin=32.
+ESTIMATORS="${ESTIMATORS:-pq}"       # lsh | pq | lsh+pq | none
 QUERY_MODES="${QUERY_MODES:-conventional lsh pq}"
 STAGE_MODE="${STAGE_MODE:-build+query}"    # build+query | build | query
 INDEX="${INDEX:-}"                         # query an explicit file instead of
                                            # the derived $WORK/deep<scale>_... name
-R_INT="${R_INT:-32}"
-R_FIN="${R_FIN:-32}"                 # 64 nearly doubles host RAM; see doc 4.2
+# R_int == R_fin == 64. Both matter, and they have to move together:
+#   R_fin=64 is the degree the final graph is searched at.
+#   R_int=64 is what makes that degree mean anything. Each shard contributes at
+#   most R_int neighbors per node, so with R_int=32 and n_dup=2 the union is
+#   <= 64 == R_fin and the merge's "keep the R_fin closest" step selects
+#   nothing — you'd pay for degree 64 and get whatever the shards happened to
+#   find. At R_int=64 the union is up to 128 and the merge actually prunes.
+R_INT="${R_INT:-64}"
+R_FIN="${R_FIN:-64}"                 # see doc section 4.2 for the RAM cost
 K_RANKS="${K_RANKS:-4}"
 N_DUP="${N_DUP:-2}"
 ALPHA="${ALPHA:-1.2}"
@@ -342,7 +359,11 @@ for s in $SCALES; do
 
   hb=$(( n * HPV ))                          # resident for the whole build
   gb=$(( 2 * shard * PADDED * 2 ))           # gather buffer + its prefetch
-  mb=$(( 4 * shard * MJPN ))                 # MERGE_QCAP=2, +1 building, +1 in worker
+  # Merge jobs are one GRAPH SEGMENT each (2^20 rows), not one shard, so this is
+  # a constant rather than something that scales with shard size:
+  # MERGE_QCAP=8 queued, +1 being filled, +1 in the worker.
+  chunk=$shard; [ "$chunk" -gt 1048576 ] && chunk=1048576
+  mb=$(( 10 * chunk * MJPN ))
   db=$(( n * DPV ))
   ram_total=$(( hb + gb + mb ))
 
@@ -408,12 +429,11 @@ if [ "$DRY_RUN" != "0" ]; then
   echo "  SHARD_FILL=40       smaller shards: less gather+merge RAM, some recall"
   echo "  WORKSPACE_BUDGET=5GB  bigger max_shard, so fewer shards"
   echo
-  echo "If the merge_GiB column is ever what blocks a stage: the merge queue"
-  echo "holds up to four whole shards of edges+payload at once"
-  echo "(construct_diskann.cuh MERGE_QCAP), and build_from_buf already copies"
-  echo "back one 2^20-row graph segment at a time. Enqueueing per segment"
-  echo "instead of per shard would make that column a ~2 GiB constant, since"
-  echo "merge rows are independent. Not worth doing until it binds."
+  echo "merge_GiB is a constant, not a function of shard size: a merge job is one"
+  echo "2^20-row graph segment, so the queue costs the same whether shards are 10M"
+  echo "or 100M nodes. That is what lets n_parts be chosen purely from device"
+  echo "capacity. gather_GiB does still scale with shard size — graph::reload"
+  echo "wants a shard's vectors as one contiguous upload."
   exit 0
 fi
 [ -n "${FEASIBLE// /}" ] || { echo "No stage fits on this node; aborting." >&2; exit 1; }

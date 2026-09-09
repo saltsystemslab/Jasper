@@ -964,105 +964,22 @@ struct diskann_intermediate_graph {
       }
     };
 
-    // Build one task from an already-gathered buffer into the reused graph `g`,
-    // returning its edges + counts (+ directional payload) on host. Frees `buf`.
-    auto build_from_buf = [&](data_t* buf, const std::vector<index_t>& ids,
-                              std::vector<int_edge_list_t>& se,
-                              std::vector<uint8_t>& sc,
-                              shard_payload_t& pay) {
-      const uint32_t count = static_cast<uint32_t>(ids.size());
-      const auto tb1 = clk::now();
-      vector_view_t shard_vecs(buf, dim, count, /*on_host=*/true);
-
-      graph_construct_params<INT_CFG> sp;
-      sp.data_vectors   = shard_vecs;
-      sp.alpha          = params.alpha;
-      sp.max_batch_size = std::max<uint32_t>(1, std::min(batch_cap, count));
-      sp.on_host        = false;
-      sp.prerotate      = false;   // shards must share one space; no per-shard rotation
-
-      construct_graph_into<INT_CFG>(g, ws, sp);
-      std::free(buf);              // vectors are on device now; drop the gather buffer
-      const auto tb2 = clk::now();
-      t_construct += secs(tb1, tb2);
-
-      // ⚠ Directional population MUST happen here: after the build, before the
-      // remap below. It resolves each edge's neighbor vector via
-      // g.get_vector(neighbor), which only works while the stored ids are still
-      // shard-local — once remapped to global ids they are outside this shard
-      // graph's index range and the reads run off the end of its segments.
-      if constexpr (USE_LSH) {
-        if (opts.any()) {
-          if (!models_trained) { train_models(); models_trained = true; }
-          const auto tp0 = clk::now();
-          if (opts.build_lsh) g.populate_edge_lsh();
-          if (opts.build_pq)  g.populate_edge_pq(ig.dir.codebooks);
-          check(cudaGetLastError(), "populate_edge_* launch");
-          check(cudaDeviceSynchronize(), "populate_edge_* sync");
-          t_populate += secs(tp0, clk::now());
-        }
-      }
-      const auto tb3 = clk::now();   // remap + copy-back are timed from here
-
-      // Remap neighbor ids shard-local -> global on the device.
-      index_t* d_idmap = nullptr;
-      check(cudaMalloc(&d_idmap, static_cast<size_t>(count) * sizeof(index_t)),
-            "cudaMalloc d_idmap (shard)");
-      check(cudaMemcpy(d_idmap, ids.data(),
-                       static_cast<size_t>(count) * sizeof(index_t),
-                       cudaMemcpyHostToDevice), "cudaMemcpy d_idmap (shard)");
-      constexpr uint32_t rblock = 256;
-      const uint32_t rgrid = std::min<uint32_t>((count + rblock - 1) / rblock, 65535u);
-      remap_shard_edges_kernel<int_graph_cfg><<<rgrid, rblock>>>(g.view(), d_idmap, count);
-      check(cudaGetLastError(), "remap_shard_edges_kernel launch");
-      check(cudaDeviceSynchronize(), "remap_shard_edges_kernel sync");
-      cudaFree(d_idmap);
-
-      // Copy this shard's edges + counts (+ payload) back to host. Vectors stay
-      // on device; they are overwritten by the next shard's reload().
-      se.resize(count);
-      sc.resize(count);
-      if constexpr (USE_LSH) {
-        if (ig.dir.has_lsh) pay.lsh.resize(count);
-        if (ig.dir.has_pq)  pay.pq.resize(count);
-      }
-      using seg_t = graph_segment<int_graph_cfg>;
-      std::vector<seg_t> segs(g.segments.begin(), g.segments.end());
-      uint32_t off = 0;
-      for (uint32_t s = 0; s < g.n_segments; s++) {
-        const seg_t& seg = segs[s];
-        const uint32_t seg_count = static_cast<uint32_t>(seg.n_vectors);
-        if (seg_count == 0) continue;
-        cudaMemcpy(se.data() + off, seg.edges,
-                   static_cast<size_t>(seg_count) * sizeof(int_edge_list_t),
-                   cudaMemcpyDeviceToHost);
-        cudaMemcpy(sc.data() + off, seg.edge_counts,
-                   static_cast<size_t>(seg_count) * sizeof(uint8_t),
-                   cudaMemcpyDeviceToHost);
-        if constexpr (USE_LSH) {
-          if (ig.dir.has_lsh)
-            cudaMemcpy(pay.lsh.data() + off, seg.edge_lshs,
-                       static_cast<size_t>(seg_count) * sizeof(int_edge_lsh_t),
-                       cudaMemcpyDeviceToHost);
-          if (ig.dir.has_pq)
-            cudaMemcpy(pay.pq.data() + off, seg.edge_pqs,
-                       static_cast<size_t>(seg_count) * sizeof(int_edge_pq_t),
-                       cudaMemcpyDeviceToHost);
-        }
-        off += seg_count;
-      }
-      cudaDeviceSynchronize();
-      t_post += secs(tb3, clk::now());
-    };
-
+    // ── Merge pipeline ────────────────────────────────────────────────────
     // Distance-only merges must be serialized (a global id can appear in several
     // shards, so two concurrent merges could write the same final row). Rather
     // than join the previous merge before starting the next — which blocks the
     // main/GPU thread and idles the GPU between shards — run all merges on one
-    // persistent worker fed by a bounded queue. The main thread enqueues a
-    // finished shard and immediately proceeds to the next GPU build; it blocks
-    // only when the queue is full (MERGE_QCAP bounds host memory). Truncating to
-    // R_final each step is associative in distance, so merge order is irrelevant.
+    // persistent worker fed by a bounded queue. Truncating to R_final each step
+    // is associative in distance, so merge order is irrelevant.
+    //
+    // A job is ONE GRAPH SEGMENT of a shard, not a whole shard. That bound
+    // matters at scale: a job holds its rows' edges plus directional payload, so
+    // shard-sized jobs made the queue cost (MERGE_QCAP + 2) x shard x ~500 B —
+    // over 120 GiB for 100M-node shards, which forced shards to be kept small
+    // and cost graph quality. Per segment it is a constant few GiB no matter how
+    // large the shards get. Rows are independent (a global id appears at most
+    // once per shard), so slicing a shard this way changes nothing about the
+    // result.
     struct merge_job_t {
       std::vector<int_edge_list_t> se;
       std::vector<uint8_t>         sc;
@@ -1073,7 +990,9 @@ struct diskann_intermediate_graph {
     std::mutex              merge_mtx;
     std::condition_variable merge_cv_push, merge_cv_pop;
     bool                    merge_done = false;
-    constexpr size_t        MERGE_QCAP = 2;  // in-flight shards; lower if host OOM
+    // Segment-sized jobs are ~500 MB each, so a deeper queue is affordable and
+    // keeps the GPU from stalling on backpressure mid-copy.
+    constexpr size_t        MERGE_QCAP = 8;
 
     std::thread merge_worker([&]() {
       for (;;) {
@@ -1106,17 +1025,115 @@ struct diskann_intermediate_graph {
       }
     });
 
-    auto enqueue_merge = [&](std::vector<int_edge_list_t>&& se,
-                             std::vector<uint8_t>&& sc,
-                             std::vector<index_t>&& ids,
-                             shard_payload_t&& pay) {
+    auto enqueue_merge = [&](merge_job_t&& job) {
       const auto tw0 = clk::now();
       std::unique_lock<std::mutex> lk(merge_mtx);
       merge_cv_push.wait(lk, [&] { return merge_q.size() < MERGE_QCAP; });
       t_merge_wait += secs(tw0, clk::now());
-      merge_q.push_back(merge_job_t{std::move(se), std::move(sc), std::move(ids),
-                                    std::move(pay)});
+      merge_q.push_back(std::move(job));
       merge_cv_pop.notify_one();
+    };
+
+    // Build one task from an already-gathered buffer into the reused graph `g`,
+    // handing each segment's rows to the merge worker as they come back off the
+    // device. Frees `buf`.
+    auto build_and_enqueue = [&](data_t* buf, const std::vector<index_t>& ids) {
+      const uint32_t count = static_cast<uint32_t>(ids.size());
+      const auto tb1 = clk::now();
+      vector_view_t shard_vecs(buf, dim, count, /*on_host=*/true);
+
+      graph_construct_params<INT_CFG> sp;
+      sp.data_vectors   = shard_vecs;
+      sp.alpha          = params.alpha;
+      sp.max_batch_size = std::max<uint32_t>(1, std::min(batch_cap, count));
+      sp.on_host        = false;
+      sp.prerotate      = false;   // shards must share one space; no per-shard rotation
+
+      construct_graph_into<INT_CFG>(g, ws, sp);
+      std::free(buf);              // vectors are on device now; drop the gather buffer
+      const auto tb2 = clk::now();
+      t_construct += secs(tb1, tb2);
+
+      // ⚠ Directional population MUST happen here: after the build, before the
+      // remap below. It resolves each edge's neighbor vector via
+      // g.get_vector(neighbor), which only works while the stored ids are still
+      // shard-local — once remapped to global ids they are outside this shard
+      // graph's index range and the reads run off the end of its segments.
+      if constexpr (USE_LSH) {
+        if (opts.any()) {
+          if (!models_trained) { train_models(); models_trained = true; }
+          const auto tp0 = clk::now();
+          if (opts.build_lsh) g.populate_edge_lsh();
+          if (opts.build_pq)  g.populate_edge_pq(ig.dir.codebooks);
+          check(cudaGetLastError(), "populate_edge_* launch");
+          check(cudaDeviceSynchronize(), "populate_edge_* sync");
+          t_populate += secs(tp0, clk::now());
+        }
+      }
+      auto tb3 = clk::now();   // remap + copy-back are timed from here, and the
+                               // clock is restarted after each enqueue so the
+                               // queue wait lands in t_merge_wait instead
+
+      // Remap neighbor ids shard-local -> global on the device.
+      index_t* d_idmap = nullptr;
+      check(cudaMalloc(&d_idmap, static_cast<size_t>(count) * sizeof(index_t)),
+            "cudaMalloc d_idmap (shard)");
+      check(cudaMemcpy(d_idmap, ids.data(),
+                       static_cast<size_t>(count) * sizeof(index_t),
+                       cudaMemcpyHostToDevice), "cudaMemcpy d_idmap (shard)");
+      constexpr uint32_t rblock = 256;
+      const uint32_t rgrid = std::min<uint32_t>((count + rblock - 1) / rblock, 65535u);
+      remap_shard_edges_kernel<int_graph_cfg><<<rgrid, rblock>>>(g.view(), d_idmap, count);
+      check(cudaGetLastError(), "remap_shard_edges_kernel launch");
+      check(cudaDeviceSynchronize(), "remap_shard_edges_kernel sync");
+      cudaFree(d_idmap);
+
+      // Copy this shard's edges + counts (+ payload) back to host and hand each
+      // segment straight to the merge worker. Vectors stay on device; they are
+      // overwritten by the next shard's reload().
+      //
+      // cudaMemcpy into pageable host memory is synchronous, so a segment's rows
+      // are complete once its copies return and the job is safe to enqueue.
+      using seg_t = graph_segment<int_graph_cfg>;
+      std::vector<seg_t> segs(g.segments.begin(), g.segments.end());
+      uint32_t off = 0;
+      for (uint32_t s = 0; s < g.n_segments; s++) {
+        const seg_t& seg = segs[s];
+        const uint32_t seg_count = static_cast<uint32_t>(seg.n_vectors);
+        if (seg_count == 0) continue;
+
+        merge_job_t job;
+        job.se.resize(seg_count);
+        job.sc.resize(seg_count);
+        job.ids.assign(ids.begin() + off, ids.begin() + off + seg_count);
+        if constexpr (USE_LSH) {
+          if (ig.dir.has_lsh) job.pay.lsh.resize(seg_count);
+          if (ig.dir.has_pq)  job.pay.pq.resize(seg_count);
+        }
+
+        cudaMemcpy(job.se.data(), seg.edges,
+                   static_cast<size_t>(seg_count) * sizeof(int_edge_list_t),
+                   cudaMemcpyDeviceToHost);
+        cudaMemcpy(job.sc.data(), seg.edge_counts,
+                   static_cast<size_t>(seg_count) * sizeof(uint8_t),
+                   cudaMemcpyDeviceToHost);
+        if constexpr (USE_LSH) {
+          if (ig.dir.has_lsh)
+            cudaMemcpy(job.pay.lsh.data(), seg.edge_lshs,
+                       static_cast<size_t>(seg_count) * sizeof(int_edge_lsh_t),
+                       cudaMemcpyDeviceToHost);
+          if (ig.dir.has_pq)
+            cudaMemcpy(job.pay.pq.data(), seg.edge_pqs,
+                       static_cast<size_t>(seg_count) * sizeof(int_edge_pq_t),
+                       cudaMemcpyDeviceToHost);
+        }
+        off += seg_count;
+
+        // t_post covers only the copy; the wait for queue space is t_merge_wait.
+        t_post += secs(tb3, clk::now());
+        enqueue_merge(std::move(job));
+        tb3 = clk::now();
+      }
     };
 
     // Pipeline: prefetch task t+1's gather (background) while task t builds on the
@@ -1140,11 +1157,7 @@ struct diskann_intermediate_graph {
         pending_buf = std::async(std::launch::async, gather, std::cref(pending_ids));
       }
 
-      std::vector<int_edge_list_t> se;
-      std::vector<uint8_t>         sc;
-      shard_payload_t              pay;
-      build_from_buf(buf, ids, se, sc, pay);
-      enqueue_merge(std::move(se), std::move(sc), std::move(ids), std::move(pay));
+      build_and_enqueue(buf, ids);   // enqueues one job per graph segment
     }
 
     // Drain: signal the worker and wait for the last queued merges to finish.
