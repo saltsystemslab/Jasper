@@ -49,13 +49,17 @@ JASPER_FOR_EACH_CONFIG(DECLARE_CONFIGS)
 // (CONFIG_ID, INDEX_T, R_INT, R_FINAL, DATA_T, DISTANCE_T, DIST_FUNC, K_RANKS, PACKED_T)
 #define JASPER_FOR_EACH_DIR_CONFIG(X)                                                    \
   X(d_r32_32_l2_k4_d128,   uint32_t, 32, 32, __half, float, jasper::distance_func::L2,            4, uint8_t)  \
-  X(d_r32_64_l2_k4_d128,   uint32_t, 32, 64, __half, float, jasper::distance_func::L2,            4, uint8_t)  \
   X(d_r32_32_l2_k4_dbig,   uint32_t, 32, 32, __half, float, jasper::distance_func::L2,            4, uint16_t) \
-  X(d_r32_64_l2_k4_dbig,   uint32_t, 32, 64, __half, float, jasper::distance_func::L2,            4, uint16_t) \
   X(d_r32_32_ip_k4_d128,   uint32_t, 32, 32, __half, float, jasper::distance_func::INNER_PRODUCT, 4, uint8_t)  \
-  X(d_r32_64_ip_k4_d128,   uint32_t, 32, 64, __half, float, jasper::distance_func::INNER_PRODUCT, 4, uint8_t)  \
   X(d_r32_32_ip_k4_dbig,   uint32_t, 32, 32, __half, float, jasper::distance_func::INNER_PRODUCT, 4, uint16_t) \
-  X(d_r32_64_ip_k4_dbig,   uint32_t, 32, 64, __half, float, jasper::distance_func::INNER_PRODUCT, 4, uint16_t) \
+  X(d_r32_32_l2_k8_d128,   uint32_t, 32, 32, __half, float, jasper::distance_func::L2,            8, uint8_t)  \
+  X(d_r32_32_l2_k8_dbig,   uint32_t, 32, 32, __half, float, jasper::distance_func::L2,            8, uint16_t) \
+  X(d_r32_32_ip_k8_d128,   uint32_t, 32, 32, __half, float, jasper::distance_func::INNER_PRODUCT, 8, uint8_t)  \
+  X(d_r32_32_ip_k8_dbig,   uint32_t, 32, 32, __half, float, jasper::distance_func::INNER_PRODUCT, 8, uint16_t) \
+  X(d_r32_32_l2_k16_d128,   uint32_t, 32, 32, __half, float, jasper::distance_func::L2,            16, uint8_t)  \
+  X(d_r32_32_l2_k16_dbig,   uint32_t, 32, 32, __half, float, jasper::distance_func::L2,            16, uint16_t) \
+  X(d_r32_32_ip_k16_d128,   uint32_t, 32, 32, __half, float, jasper::distance_func::INNER_PRODUCT, 16, uint8_t)  \
+  X(d_r32_32_ip_k16_dbig,   uint32_t, 32, 32, __half, float, jasper::distance_func::INNER_PRODUCT, 16, uint16_t) \
   X(d_r64_64_l2_k4_d128,   uint32_t, 64, 64, __half, float, jasper::distance_func::L2,            4, uint8_t)  \
   X(d_r64_64_l2_k4_dbig,   uint32_t, 64, 64, __half, float, jasper::distance_func::L2,            4, uint16_t) \
   X(d_r64_64_ip_k4_d128,   uint32_t, 64, 64, __half, float, jasper::distance_func::INNER_PRODUCT, 4, uint8_t)  \

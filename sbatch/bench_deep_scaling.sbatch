@@ -2,14 +2,9 @@
 #SBATCH --partition=SaltSystemsLab
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=128
+#SBATCH --cpus-per-task=64
 #SBATCH --nodelist=d4067
 #SBATCH --mem=987842M
-# ^ d4067's full RealMemory. SLURM's documented suffixes are K|M|G|T, so use M
-# rather than "GB". --mem=0 (all memory on the node) works too. This matters:
-# the cgroup limit, not the node's free memory, is what OOM-kills the job, and
-# the budget table below reads SLURM_MEM_PER_NODE precisely so it checks against
-# the number that can actually kill you.
 #SBATCH --gres=gpu:1
 #SBATCH --job-name=deep_scaling
 #SBATCH --output=deep_scaling_%j.log
@@ -87,8 +82,19 @@ N_PARTS="${N_PARTS:-0}"                    # 0 = derive from device capacity.
                                            # with the estimators, so the derived
                                            # value would differ too and you'd be
                                            # comparing different graphs.
-K="${K:-10}"
-BEAM_LIMITS="${BEAM_LIMITS:-16:128 32:128 64:128 128:256 256:512 512:1024 1024:2048}"
+# A LIST, run in order. k=10 first so a job that runs out of time still leaves a
+# complete set of the headline numbers. run_query takes one k per invocation and
+# each invocation reloads the whole index, so every extra k costs another full
+# load — at 1B under --on_host that is the dominant term, not the search. Use
+# K=10 alone there if you don't need both.
+K="${K:-10 100}"
+BEAM_LIMITS="${BEAM_LIMITS:-16:128 32:128 64:128 128:256 256:512 512:1024 1024:2048 1536:2048 1982:2048}"
+# auto: use --on_host only when the loaded index won't fit on the device.
+# 1: always pass --on_host — useful to measure the PCIe-resident path at a scale
+#    that would otherwise fit, or when the device is shared and the auto
+#    estimate (which assumes the whole card is free) is too optimistic.
+# 0: never pass it, even when the estimate says it won't fit.
+ON_HOST="${ON_HOST:-auto}"           # auto | 1 | 0
 DRY_RUN="${DRY_RUN:-0}"
 KEEP_INDEX="${KEEP_INDEX:-1}"        # 0 = delete each index after querying
 
@@ -307,7 +313,7 @@ echo "  scales:      $SCALES"
 echo "  estimators:  $ESTIMATORS (lsh=$BUILD_LSH pq=$BUILD_PQ, k_ranks=$K_RANKS)"
 echo "  degrees:     R_int=$R_INT R_fin=$R_FIN  n_dup=$N_DUP  alpha=$ALPHA"
 echo "  distance:    $DIST   dim=$DIM (packed_t=${PACKED_BYTES}B)"
-echo "  query modes: $QUERY_MODES"
+echo "  query modes: $QUERY_MODES   (k = $K, in that order)"
 echo "  workdir:     $WORK"
 echo "  logs:        $LOGDIR"
 
@@ -396,8 +402,16 @@ echo "  feasible stages:${FEASIBLE:- none}"
 for s in $FEASIBLE; do
   n=$(scale_n "$s")
   r=$(( n * $(query_resident_per_node) ))
-  [ "$r" -gt "$DEVICE_FREE_BYTES" ] && \
-    echo "  $s: loaded index is $(gib "$r") GiB > device, so queries use --on_host (slow)"
+  case "$ON_HOST" in
+    1|yes|true|on|force)
+      echo "  $s: ON_HOST=$ON_HOST, queries forced onto the host ($(gib "$r") GiB, slow)";;
+    0|no|false|off|device)
+      [ "$r" -gt "$DEVICE_FREE_BYTES" ] && \
+        echo "  $s: ON_HOST=$ON_HOST but the index is $(gib "$r") GiB > device — queries will OOM";;
+    *)
+      [ "$r" -gt "$DEVICE_FREE_BYTES" ] && \
+        echo "  $s: loaded index is $(gib "$r") GiB > device, so queries use --on_host (slow)";;
+  esac
 done
 if [ "$KEEP_INDEX" = "1" ] && [ "$RETAINED" -gt 0 ]; then
   echo "  indexes retained across the run: $(gib "$RETAINED") GiB"
@@ -520,13 +534,34 @@ run_stage() {
   # fall back to --on_host, which keeps the graph in pinned host memory and
   # reaches it over PCIe. Correct, but far slower per hop — and page-locking
   # hundreds of GiB takes minutes on its own, so expect a long startup.
+  #
+  # ON_HOST overrides the estimate in either direction. It is an estimate: it
+  # assumes the whole card is free (DEVICE_FREE_BYTES is sampled once, at
+  # startup) and rounds segment allocation down, so it can be wrong both ways.
   local resident=$(( n * $(query_resident_per_node) ))
   local host_arg=()
-  if [ "$resident" -gt "$DEVICE_FREE_BYTES" ]; then
-    host_arg=(--on_host)
-    echo "  loaded index is $(gib "$resident") GiB vs $(gib "$DEVICE_FREE_BYTES") GiB of device"
-    echo "  -> querying with --on_host (pinned host memory, PCIe-resident)"
-  fi
+  case "$ON_HOST" in
+    1|yes|true|on|force)
+      host_arg=(--on_host)
+      echo "  ON_HOST=$ON_HOST: forcing --on_host"
+      echo "  (index would need $(gib "$resident") GiB resident; device has"
+      echo "   $(gib "$DEVICE_FREE_BYTES") GiB)"
+      ;;
+    0|no|false|off|device)
+      echo "  ON_HOST=$ON_HOST: forcing a device-resident query"
+      if [ "$resident" -gt "$DEVICE_FREE_BYTES" ]; then
+        echo "  WARNING: the index needs $(gib "$resident") GiB but the device has"
+        echo "           $(gib "$DEVICE_FREE_BYTES") GiB — this will almost certainly OOM"
+      fi
+      ;;
+    *)
+      if [ "$resident" -gt "$DEVICE_FREE_BYTES" ]; then
+        host_arg=(--on_host)
+        echo "  loaded index is $(gib "$resident") GiB vs $(gib "$DEVICE_FREE_BYTES") GiB of device"
+        echo "  -> querying with --on_host (pinned host memory, PCIe-resident)"
+      fi
+      ;;
+  esac
 
   # Conventional search is the baseline the directional numbers are a fraction
   # of. It works on a prerotated index because run_query reads the rotation out
@@ -536,23 +571,30 @@ run_stage() {
   # index from disk and (on the --on_host path) page-locks it again. At 1B that
   # is the dominant cost of the query phase, not the search itself.
   [ "$do_query" = "1" ] || { echo "  (STAGE_MODE=$STAGE_MODE, no queries)"; echo; return 0; }
-  for mode in $QUERY_MODES; do
-    local mode_arg=()
-    case "$mode" in
-      conventional) mode_arg=();;
-      lsh) [ "$BUILD_LSH" = "1" ] || { echo "  skip lsh query (not built)"; continue; }
-           mode_arg=(--lsh --prepopulated --k_ranks "$K_RANKS");;
-      pq)  [ "$BUILD_PQ" = "1" ]  || { echo "  skip pq query (not built)"; continue; }
-           mode_arg=(--pq --prepopulated --k_ranks "$K_RANKS");;
-      *) echo "  unknown query mode: $mode"; continue;;
-    esac
-    echo "  [$( stamp )] query: $mode"
-    ./build/bin/run_query -i "$idx" --dim "$DIM" -d "$DIST" -t "$SRC_DTYPE" \
-        -n "$R_FIN" -k "$K" "${mode_arg[@]}" "${host_arg[@]}" \
-        -q "$QUERIES" "${gt_arg[@]}" --beam_limits $BEAM_LIMITS 2>&1 \
-      | tee -a "$log" \
-      | grep -E "beam_width|Recall|prerotated|rotating queries|trailer" \
-      || echo "  QUERY FAILED ($mode) — see $log"
+  # k outermost so all modes are covered at the smaller k before anything is
+  # spent on the larger one.
+  for kk in $K; do
+    echo "  ===== k=$kk ====="
+    for mode in $QUERY_MODES; do
+      local mode_arg=()
+      case "$mode" in
+        conventional) mode_arg=();;
+        lsh) [ "$BUILD_LSH" = "1" ] || { echo "  skip lsh query (not built)"; continue; }
+             mode_arg=(--lsh --prepopulated --k_ranks "$K_RANKS");;
+        pq)  [ "$BUILD_PQ" = "1" ]  || { echo "  skip pq query (not built)"; continue; }
+             mode_arg=(--pq --prepopulated --k_ranks "$K_RANKS");;
+        *) echo "  unknown query mode: $mode"; continue;;
+      esac
+      echo "  [$( stamp )] query: $mode (k=$kk)"
+      # A failure here is usually the ground truth: read_groundtruth rejects a k
+      # larger than the file's own gt_k. Non-fatal, the next k still runs.
+      ./build/bin/run_query -i "$idx" --dim "$DIM" -d "$DIST" -t "$SRC_DTYPE" \
+          -n "$R_FIN" -k "$kk" "${mode_arg[@]}" "${host_arg[@]}" \
+          -q "$QUERIES" "${gt_arg[@]}" --beam_limits $BEAM_LIMITS 2>&1 \
+        | tee -a "$log" \
+        | grep -E "beam_width|Recall|prerotated|rotating queries|trailer" \
+        || echo "  QUERY FAILED ($mode, k=$kk) — see $log"
+    done
   done
 
   if [ "$KEEP_INDEX" = "0" ]; then
@@ -568,15 +610,3 @@ done
 
 echo "=== done: $(stamp) ==="
 echo "Per-stage logs in $LOGDIR/deep<scale>_<estimators>.log"
-echo
-echo "What to look at:"
-echo "  1. Recall@10 of 'conventional' vs the single-graph create_lsh_index"
-echo "     baseline at the same beam width. That ratio is the cost of the"
-echo "     shard-and-merge build, separate from any estimator."
-echo "  2. lsh and pq recall as a FRACTION of this index's own conventional"
-echo "     recall — that isolates estimator quality from graph quality."
-echo "  3. Whether either ratio degrades as N grows. Both should be roughly"
-echo "     flat; a ratio that falls with N points at the merge (try N_DUP=3"
-echo "     or a larger R_INT) rather than at the codes."
-echo "  4. The 'phase totals' line in the build log — populate and rotate are"
-echo "     the phases this work added; everything else predates it."

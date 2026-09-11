@@ -411,7 +411,6 @@ __global__ void robust_prune_kernel(
   __shared__ index_t    s_selected[R];
   __shared__ distance_t s_selected_dist[R];
   __shared__ uint32_t   s_n_selected;
-  __shared__ bool       s_pruned;
 
   if (threadIdx.x == 0) s_n_selected = 0;
   __syncthreads();
@@ -427,29 +426,27 @@ __global__ void robust_prune_kernel(
 
     data_t* cand_vec = graph.get_vector(cand_id);
 
-    // Reset prune flag
-    if (threadIdx.x == 0) s_pruned = false;
-    __syncthreads();
-
-    // Each tile checks one already-selected neighbor in parallel.
-    // Tiles round-robin over selected neighbors.
+    // Each tile checks one already-selected neighbor, in chunks of n_tiles,
+    // stopping at the first that prunes this candidate — see the longer note in
+    // process_reverse_edges_kernel, which runs the identical loop over far more
+    // vertices. Result is unchanged; only the wasted comparisons after the
+    // answer is known go away.
     uint32_t n_sel = s_n_selected;
-    for (uint32_t j = tile_id; j < n_sel; j += n_tiles) {
-      data_t* sel_vec = graph.get_vector(s_selected[j]);
-
-      distance_t d = compute_distance<CONSTRUCT_GRAPH_CONFIG::graph_cfg_t::dist_func, data_t, distance_t, TILE_SIZE>(
-        cand_vec, sel_vec, dim, my_tile);
-
-      if (my_tile.thread_rank() == 0) {
-        if (d * alpha < cand_dist) {
-          s_pruned = true;
-        }
+    bool pruned = false;
+    for (uint32_t base = 0; base < n_sel; base += static_cast<uint32_t>(n_tiles)) {
+      const uint32_t j = base + static_cast<uint32_t>(tile_id);
+      int local_pruned = 0;
+      if (j < n_sel) {
+        data_t* sel_vec = graph.get_vector(s_selected[j]);
+        distance_t d = compute_distance<CONSTRUCT_GRAPH_CONFIG::graph_cfg_t::dist_func, data_t, distance_t, TILE_SIZE>(
+          cand_vec, sel_vec, dim, my_tile);
+        if (my_tile.thread_rank() == 0 && d * alpha < cand_dist) local_pruned = 1;
       }
+      if (__syncthreads_or(local_pruned)) { pruned = true; break; }
     }
-    __syncthreads();
 
     // If not pruned, add to selected set
-    if (!s_pruned) {
+    if (!pruned) {
       if (threadIdx.x == 0) {
         uint32_t slot = s_n_selected;
         if (slot < R) {
@@ -600,7 +597,6 @@ __global__ void process_reverse_edges_kernel(
   __shared__ index_t    s_selected[R];
   __shared__ distance_t s_selected_dist[R];
   __shared__ uint32_t   s_n_selected;
-  __shared__ bool       s_pruned;
 
   // block merge sort state
   entry_t items[ITEMS_PER_THREAD];
@@ -693,25 +689,39 @@ __global__ void process_reverse_edges_kernel(
 
       data_t* cand_vec = graph.get_vector(cand_id);
 
-      if (threadIdx.x == 0) s_pruned = false;
-      __syncthreads();
-
+      // Stop at the FIRST already-selected neighbor that prunes this candidate.
+      //
+      // `s_pruned` is a pure OR over the selected set, so the answer is fixed
+      // the moment one tile sets it — but the old loop had every tile run to
+      // completion regardless, doing the full O(n_sel) distance computations
+      // even for a candidate rejected by the very first neighbor. That is the
+      // bulk of this kernel's work: the reverse pass touches up to R distinct
+      // vertices per batch vertex (num_unique_sources vs batch_size for the
+      // forward pass), and most candidates are rejected rather than kept.
+      //
+      // Candidates are sorted by distance from the source and selected in that
+      // order, so s_selected is ordered too and the neighbor that prunes is
+      // usually near the front. Walking the tiles in chunks lets
+      // __syncthreads_or do the reduction and the loop exit in one step.
+      // Same result, strictly fewer distance computations.
       uint32_t n_sel = s_n_selected;
-      for (uint32_t j=tile_id; j<n_sel; j+=n_tiles) {
-        data_t* selected_vec = graph.get_vector(s_selected[j]);
-        distance_t d = compute_distance<CONSTRUCT_GRAPH_CONFIG::graph_cfg_t::dist_func, data_t, distance_t, TILE_SIZE>(
-          cand_vec, selected_vec, dim, my_tile
-        );
-
-        if (my_tile.thread_rank() == 0) {
-          if (d * alpha < cand_dist) {
-            s_pruned = true;
-          }
+      bool pruned = false;
+      for (uint32_t base = 0; base < n_sel; base += static_cast<uint32_t>(n_tiles)) {
+        const uint32_t j = base + static_cast<uint32_t>(tile_id);
+        int local_pruned = 0;
+        if (j < n_sel) {
+          data_t* selected_vec = graph.get_vector(s_selected[j]);
+          distance_t d = compute_distance<CONSTRUCT_GRAPH_CONFIG::graph_cfg_t::dist_func, data_t, distance_t, TILE_SIZE>(
+            cand_vec, selected_vec, dim, my_tile
+          );
+          if (my_tile.thread_rank() == 0 && d * alpha < cand_dist) local_pruned = 1;
         }
+        // Barrier + block-wide OR. The trip count and the result are uniform
+        // across the block, so every thread breaks on the same iteration.
+        if (__syncthreads_or(local_pruned)) { pruned = true; break; }
       }
-      __syncthreads();
 
-      if (!s_pruned) {
+      if (!pruned) {
         if (threadIdx.x == 0) {
           uint32_t slot = s_n_selected;
           if (slot < R) {
