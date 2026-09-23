@@ -1,12 +1,20 @@
 #include <gtest/gtest.h>
 #include "helpers.cuh"
+#include "jasper/beam_search/api.cuh"
+#include "jasper/index/graph.cuh"
+#include "jasper/rabitq/edge_rq.cuh"
 #include "jasper/rabitq/layout.cuh"
 #include "jasper/rabitq/quantize.cuh"
+#include "jasper/rabitq/rq_kernels.cuh"
 #include "jasper/rotation/rotation.cuh"
 
+#include <algorithm>
 #include <cmath>
+#include <cstring>
+#include <limits>
 #include <numeric>
 #include <random>
+#include <set>
 #include <vector>
 
 namespace jasper::test {
@@ -437,6 +445,401 @@ TEST_F(QuantizeTest, InnerProduct_DifferentFactors) {
   cudaFree(store_ip.data);
   cudaFreeHost(h_l2.data);
   cudaFreeHost(h_ip.data);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Directional (per-edge) RaBitQ
+//   storage layout  — rabitq/edge_rq.cuh
+//   encode          — rabitq/rq_kernels.cuh  (graph::populate_edge_rq)
+//   estimator math  — beam_search/rq_beam_search.cuh
+// ═══════════════════════════════════════════════════════════════
+
+using rq_row_t = edge_rq_list<uint32_t, /*N_NEIGHBORS=*/32, /*RQ_DIM=*/32, /*RQ_BITS=*/1>;
+
+class EdgeRqLayoutTest : public ::testing::Test {};
+
+TEST_F(EdgeRqLayoutTest, Constants_1bit_d32) {
+  EXPECT_EQ(rq_row_t::n_words, 1u);
+  EXPECT_EQ(rq_row_t::dims_per_word, 32u);
+  EXPECT_EQ(rq_row_t::level_mask, 1u);
+  // Per edge: one 32-bit code word + fp16 rescale + bf16 mag² = 8 bytes.
+  EXPECT_EQ(sizeof(rq_row_t), 32u * 8u);
+}
+
+TEST_F(EdgeRqLayoutTest, WordsAreIndexedPerEdge) {
+  rq_row_t row{};
+  for (uint32_t e = 0; e < 32; e++)
+    row.set_word(static_cast<uint8_t>(e), 0, e * 2654435761u);
+  for (uint32_t e = 0; e < 32; e++)
+    EXPECT_EQ(row.get_word(static_cast<uint8_t>(e), 0), e * 2654435761u)
+        << "edge " << e;
+}
+
+TEST_F(EdgeRqLayoutTest, GetLevelIsOneBitPerDimension) {
+  rq_row_t row{};
+  row.set_word(3, 0, 0xA5A5A5A5u);
+  for (uint32_t d = 0; d < 32; d++)
+    EXPECT_EQ(row.get_level(3, d), (0xA5A5A5A5u >> d) & 1u) << "dim " << d;
+}
+
+TEST_F(EdgeRqLayoutTest, TwoBitLevelsPackFourPerByte) {
+  using row2_t = edge_rq_list<uint32_t, 4, 32, 2>;
+  EXPECT_EQ(row2_t::n_words, 2u);
+  EXPECT_EQ(row2_t::dims_per_word, 16u);
+  EXPECT_EQ(row2_t::level_mask, 3u);
+
+  row2_t row{};
+  row.set_word(1, 0, 0xE4u);  // 0b11'10'01'00 → dims 0..3 = 0,1,2,3
+  EXPECT_EQ(row.get_level(1, 0), 0u);
+  EXPECT_EQ(row.get_level(1, 1), 1u);
+  EXPECT_EQ(row.get_level(1, 2), 2u);
+  EXPECT_EQ(row.get_level(1, 3), 3u);
+}
+
+TEST_F(EdgeRqLayoutTest, CbMatchesBitWidth) {
+  EXPECT_FLOAT_EQ((rq_globals<32, 1>::cb()), -0.5f);
+  EXPECT_FLOAT_EQ((rq_globals<32, 2>::cb()), -1.5f);
+  EXPECT_FLOAT_EQ((rq_globals<32, 4>::cb()), -7.5f);
+}
+
+// ── The JL projection P_d ──────────────────────────────────────
+
+class ProjectionMatrixTest : public ::testing::Test {};
+
+TEST_F(ProjectionMatrixTest, RowsAreOrthonormal) {
+  constexpr int D = 96, d = 32;
+  std::vector<float> P(static_cast<size_t>(D) * d);
+  set_projection_matrix<float>(D, d, P.data(), /*seed=*/7);
+
+  // Row j occupies P[j*D .. j*D+D): P·Pᵀ must be the identity.
+  for (int a = 0; a < d; a++) {
+    for (int b = 0; b < d; b++) {
+      double dot = 0.0;
+      for (int i = 0; i < D; i++)
+        dot += static_cast<double>(P[a * D + i]) * P[b * D + i];
+      EXPECT_NEAR(dot, a == b ? 1.0 : 0.0, 1e-4)
+          << "row " << a << " · row " << b;
+    }
+  }
+}
+
+TEST_F(ProjectionMatrixTest, DeterministicInSeed) {
+  constexpr int D = 64, d = 16;
+  std::vector<float> a(static_cast<size_t>(D) * d), b(a.size()), c(a.size());
+  set_projection_matrix<float>(D, d, a.data(), 11);
+  set_projection_matrix<float>(D, d, b.data(), 11);
+  set_projection_matrix<float>(D, d, c.data(), 12);
+  EXPECT_EQ(a, b) << "same seed must give the same P_d on both sides";
+  EXPECT_NE(a, c);
+}
+
+TEST_F(ProjectionMatrixTest, PreservesNormsInExpectation) {
+  // E||P_d x||² = (d/D)||x||²; the estimator relies on this only through the
+  // unit vectors, but a gross scale error here would break everything.
+  constexpr int D = 128, d = 32;
+  std::vector<float> P(static_cast<size_t>(D) * d);
+  set_projection_matrix<float>(D, d, P.data(), 3);
+
+  std::mt19937 rng(5);
+  std::normal_distribution<float> nd(0.0f, 1.0f);
+  double ratio_sum = 0.0;
+  constexpr int kTrials = 200;
+  for (int t = 0; t < kTrials; t++) {
+    std::vector<float> x(D);
+    double xn = 0.0;
+    for (int i = 0; i < D; i++) { x[i] = nd(rng); xn += double(x[i]) * x[i]; }
+    double pn = 0.0;
+    for (int j = 0; j < d; j++) {
+      double acc = 0.0;
+      for (int i = 0; i < D; i++) acc += double(P[j * D + i]) * x[i];
+      pn += acc * acc;
+    }
+    ratio_sum += pn / xn;
+  }
+  EXPECT_NEAR(ratio_sum / kTrials, double(d) / D, 0.02);
+}
+
+// ── GPU fixtures ───────────────────────────────────────────────
+// dim 64 with k_ranks 4 puts rq_dim at 32, so P_d genuinely reduces the
+// dimension (rq_dim == dim would make it a plain rotation).
+namespace {
+
+constexpr uint32_t RQ_R        = 32;   // out-degree
+constexpr uint32_t RQ_DIM_DATA = 64;   // data dimension
+
+using rq_cfg = jasper::graph_config<uint32_t, RQ_R, __half, float,
+                                    jasper::distance_func::L2, true, 4, uint8_t>;
+static_assert(rq_cfg::rq_dim == 32, "expected rq_dim = 8 * k_ranks");
+static_assert(rq_cfg::rq_bits == 1, "expected 1-bit RaBitQ");
+
+using rq_edge_t = rq_cfg::edge_rq_list_t;
+
+struct RqTestGraph {
+  jasper::graph<rq_cfg> g{};
+  std::vector<float>    vecs;    // [n * padded_dim] — exactly what the halves hold
+  std::vector<uint32_t> nbrs;    // [n * RQ_R]
+  uint32_t n = 0, dim = 0, padded_dim = 0;
+
+  const float* vec(uint32_t i) const {
+    return vecs.data() + static_cast<size_t>(i) * padded_dim;
+  }
+  float dist_sq(const float* a, const float* b) const {
+    float s = 0.0f;
+    for (uint32_t d = 0; d < padded_dim; d++) { const float df = a[d] - b[d]; s += df * df; }
+    return s;
+  }
+};
+
+// Random Gaussian vectors plus each node's RQ_R nearest neighbors by brute
+// force. No explicit rotation: an i.i.d. Gaussian vector is already isotropic,
+// so its first rq_dim coordinates are as good a random projection as a rotated
+// vector's would be — the prerotate exists for real data with structured axes.
+RqTestGraph build_rq_test_graph(uint32_t n, uint32_t dim, uint32_t seed) {
+  RqTestGraph t;
+  t.n = n;
+  t.dim = dim;
+  t.padded_dim = jasper::vector_view<__half>::pad(dim);
+
+  auto h_view = jasper::vector_view<__half>::allocate(dim, n, /*on_host=*/true);
+  std::memset(h_view.data, 0, h_view.size_bytes());  // pad lanes must read zero
+
+  std::mt19937 rng(seed);
+  std::normal_distribution<float> nd(0.0f, 1.0f);
+  t.vecs.assign(static_cast<size_t>(n) * t.padded_dim, 0.0f);
+  for (uint32_t i = 0; i < n; i++) {
+    __half* row = h_view[i];
+    for (uint32_t d = 0; d < dim; d++) {
+      const __half h = __float2half(nd(rng));
+      row[d] = h;
+      t.vecs[static_cast<size_t>(i) * t.padded_dim + d] = __half2float(h);
+    }
+  }
+
+  t.nbrs.assign(static_cast<size_t>(n) * RQ_R, 0);
+  std::vector<std::pair<float, uint32_t>> cand(n);
+  for (uint32_t i = 0; i < n; i++) {
+    for (uint32_t j = 0; j < n; j++)
+      cand[j] = {i == j ? std::numeric_limits<float>::max()
+                        : t.dist_sq(t.vec(i), t.vec(j)), j};
+    std::partial_sort(cand.begin(), cand.begin() + RQ_R, cand.end());
+    for (uint32_t e = 0; e < RQ_R; e++)
+      t.nbrs[static_cast<size_t>(i) * RQ_R + e] = cand[e].second;
+  }
+
+  t.g = jasper::graph<rq_cfg>::allocate_and_load(h_view, /*on_host=*/false);
+  t.g.medoid = 0;
+  h_view.deallocate();
+
+  // Install the edge lists directly (n fits in one segment).
+  using segment_t   = jasper::graph_segment<rq_cfg>;
+  using edge_list_t = rq_cfg::edge_list_t;
+  std::vector<segment_t> h_segs(t.g.segments.begin(), t.g.segments.end());
+  std::vector<edge_list_t> h_edges(n);
+  std::vector<uint8_t>     h_counts(n, static_cast<uint8_t>(RQ_R));
+  for (uint32_t i = 0; i < n; i++) {
+    for (uint32_t e = 0; e < RQ_R; e++) {
+      const uint32_t v = t.nbrs[static_cast<size_t>(i) * RQ_R + e];
+      h_edges[i].edges[e] = v;
+      h_edges[i].dist[e]  = __float2bfloat16(t.dist_sq(t.vec(i), t.vec(v)));
+    }
+  }
+  cudaMemcpy(h_segs[0].edges, h_edges.data(),
+             sizeof(edge_list_t) * n, cudaMemcpyHostToDevice);
+  cudaMemcpy(h_segs[0].edge_counts, h_counts.data(), n, cudaMemcpyHostToDevice);
+  return t;
+}
+
+std::vector<rq_edge_t> read_edge_rqs(jasper::graph<rq_cfg>& g, uint32_t n) {
+  using segment_t = jasper::graph_segment<rq_cfg>;
+  std::vector<segment_t> h_segs(g.segments.begin(), g.segments.end());
+  std::vector<rq_edge_t> out(n);
+  cudaMemcpy(out.data(), h_segs[0].edge_rqs,
+             sizeof(rq_edge_t) * n, cudaMemcpyDeviceToHost);
+  return out;
+}
+
+}  // namespace
+
+// populate_edge_rq must store, for every edge: the sign pattern of the
+// projected residual (v-u)[:rq_dim] (1-bit RaBitQ), the EXACT full-dimension
+// ||v-u||², and rescale = 1/<x̄,û> = 2·||r_d|| / ||r_d||₁.
+TEST(EdgeRqEncodeTest, CodeMagnitudeAndRescaleMatchHostReference) {
+  auto t = build_rq_test_graph(64, RQ_DIM_DATA, 7);
+  auto globals = t.g.generate_rq_globals();
+  t.g.populate_edge_rq(globals);
+  CUDA_CHECK(cudaDeviceSynchronize());
+  CUDA_CHECK(cudaGetLastError());
+  auto rows = read_edge_rqs(t.g, t.n);
+
+  constexpr uint32_t D = rq_cfg::rq_dim;
+  for (uint32_t u = 0; u < t.n; u++) {
+    for (uint32_t e = 0; e < RQ_R; e++) {
+      const uint32_t v = t.nbrs[static_cast<size_t>(u) * RQ_R + e];
+
+      // Magnitude is a full-dimension quantity...
+      double mag_sq = 0.0;
+      for (uint32_t d = 0; d < t.padded_dim; d++) {
+        const double r = static_cast<double>(t.vec(v)[d]) - t.vec(u)[d];
+        mag_sq += r * r;
+      }
+      // ...while the code sees only the first rq_dim coordinates. t.vecs holds
+      // exactly the half values the kernel reads, and the residual is one
+      // float subtraction on both sides, so the sign comparison is exact
+      // rather than a near-zero coin flip.
+      double proj_sq = 0.0, proj_l1 = 0.0;
+      for (uint32_t d = 0; d < D; d++) {
+        const float rf = t.vec(v)[d] - t.vec(u)[d];
+        proj_sq += static_cast<double>(rf) * rf;
+        proj_l1 += std::fabs(static_cast<double>(rf));
+        ASSERT_EQ(rows[u].get_level(static_cast<uint8_t>(e), d),
+                  rf >= 0.0f ? 1u : 0u)
+            << "u=" << u << " edge=" << e << " dim=" << d;
+      }
+
+      const float want_mag = static_cast<float>(mag_sq);
+      EXPECT_NEAR(rows[u].get_mag_sq(static_cast<uint8_t>(e)), want_mag,
+                  0.01f * want_mag + 1e-3f)
+          << "u=" << u << " edge=" << e;   // bf16 storage → ~0.4% relative
+
+      const float want_rescale =
+          static_cast<float>(2.0 * std::sqrt(proj_sq) / proj_l1);
+      EXPECT_NEAR(rows[u].get_rescale(static_cast<uint8_t>(e)), want_rescale,
+                  0.01f * want_rescale)
+          << "u=" << u << " edge=" << e;
+    }
+  }
+  t.g.deallocate();
+}
+
+// The estimate itself: A + mag² − (2√A/||r_d||)·mag·rescale·<x̄, r_d>, with
+// r_d = P_d·q − P_d·u.
+// Sanity bounds, not tight numerics — what they pin down is that the stored
+// factors combine into something near-unbiased and clearly better than the
+// magnitude-only fallback (A + mag², i.e. assuming the residual is orthogonal
+// to the query direction).
+TEST(EdgeRqEstimatorTest, NearUnbiasedAndBeatsMagnitudeOnlyBaseline) {
+  auto t = build_rq_test_graph(64, RQ_DIM_DATA, 11);
+  auto globals = t.g.generate_rq_globals();
+  t.g.populate_edge_rq(globals);
+  CUDA_CHECK(cudaDeviceSynchronize());
+  CUDA_CHECK(cudaGetLastError());
+  auto rows = read_edge_rqs(t.g, t.n);
+
+  constexpr uint32_t D  = rq_cfg::rq_dim;
+  constexpr float    CB = rq_globals<rq_cfg::rq_dim, rq_cfg::rq_bits>::cb();
+
+  std::mt19937 rng(99);
+  std::normal_distribution<float> nd(0.0f, 1.0f);
+  std::vector<float> q(t.padded_dim, 0.0f);
+
+  double sum_rel = 0.0, sum_abs = 0.0, sum_abs_base = 0.0;
+  uint32_t cnt = 0;
+
+  for (uint32_t trial = 0; trial < 32; trial++) {
+    for (uint32_t d = 0; d < t.dim; d++) q[d] = __half2float(__float2half(nd(rng)));
+
+    for (uint32_t u = 0; u < t.n; u += 4) {
+      // A over the full dimension; the residual prefix is the projected side.
+      double A = 0.0, proj_sq = 0.0;
+      std::vector<double> rd(D);
+      for (uint32_t d = 0; d < t.padded_dim; d++) {
+        const double r = static_cast<double>(q[d]) - t.vec(u)[d];
+        A += r * r;
+        if (d < D) { rd[d] = r; proj_sq += r * r; }
+      }
+      const double node_scale = 2.0 * std::sqrt(A) / std::sqrt(proj_sq);
+
+      for (uint32_t e = 0; e < RQ_R; e++) {
+        const uint32_t v = t.nbrs[static_cast<size_t>(u) * RQ_R + e];
+        const uint8_t  e8 = static_cast<uint8_t>(e);
+
+        double dot = 0.0;
+        for (uint32_t d = 0; d < D; d++)
+          dot += (static_cast<double>(rows[u].get_level(e8, d)) + CB) * rd[d];
+
+        const double mag_sq = rows[u].get_mag_sq(e8);
+        const double est    = A + mag_sq
+            - node_scale * std::sqrt(mag_sq) * rows[u].get_rescale(e8) * dot;
+        const double truth  = t.dist_sq(q.data(), t.vec(v));
+
+        sum_rel      += (est - truth) / truth;
+        sum_abs      += std::fabs(est - truth) / truth;
+        sum_abs_base += std::fabs((A + mag_sq) - truth) / truth;
+        cnt++;
+      }
+    }
+  }
+  ASSERT_GT(cnt, 0u);
+  const double bias     = sum_rel / cnt;
+  const double mae      = sum_abs / cnt;
+  const double mae_base = sum_abs_base / cnt;
+
+  EXPECT_LT(std::fabs(bias), 0.05)
+      << "mean relative error " << bias << " — estimator should be near-unbiased";
+  EXPECT_LT(mae, 0.6 * mae_base)
+      << "mae " << mae << " vs magnitude-only baseline " << mae_base;
+}
+
+// End-to-end through the real kernel: this is what type-checks rq_estimator
+// inside graph_beam_search_kernel. The frontier records EXACT distances for
+// visited nodes, so with a navigable graph and a wide enough beam the estimator
+// only has to rank sensibly for recall to come out near 1.
+TEST(RqBeamSearchTest, RecallAgainstBruteForce) {
+  constexpr uint32_t NQ = 32;
+  constexpr uint32_t K  = 10;
+
+  auto t = build_rq_test_graph(256, RQ_DIM_DATA, 13);
+  auto globals = t.g.generate_rq_globals();
+  t.g.populate_edge_rq(globals);
+  CUDA_CHECK(cudaDeviceSynchronize());
+  CUDA_CHECK(cudaGetLastError());
+
+  auto h_q = jasper::vector_view<__half>::allocate(t.dim, NQ, /*on_host=*/true);
+  std::memset(h_q.data, 0, h_q.size_bytes());
+  std::vector<float> qf(static_cast<size_t>(NQ) * t.padded_dim, 0.0f);
+  std::mt19937 rng(21);
+  std::normal_distribution<float> nd(0.0f, 1.0f);
+  for (uint32_t i = 0; i < NQ; i++) {
+    for (uint32_t d = 0; d < t.dim; d++) {
+      const __half h = __float2half(nd(rng));
+      h_q[i][d] = h;
+      qf[static_cast<size_t>(i) * t.padded_dim + d] = __half2float(h);
+    }
+  }
+  auto d_q = h_q.to_device();
+  h_q.deallocate();
+
+  jasper::search_params params{
+    .k          = K,
+    .beam_width = 64,
+    .limit      = 256,
+  };
+  auto result = jasper::rq_search(t.g, globals, d_q, params);
+  CUDA_CHECK(cudaGetLastError());
+  CUDA_CHECK(cudaDeviceSynchronize());
+
+  std::vector<thrust::pair<uint32_t, float>> h_res(static_cast<size_t>(NQ) * K);
+  CUDA_CHECK(cudaMemcpy(h_res.data(), result.frontier,
+                        sizeof(h_res[0]) * h_res.size(), cudaMemcpyDeviceToHost));
+
+  uint32_t hits = 0;
+  std::vector<std::pair<float, uint32_t>> cand(t.n);
+  for (uint32_t i = 0; i < NQ; i++) {
+    const float* q = qf.data() + static_cast<size_t>(i) * t.padded_dim;
+    for (uint32_t j = 0; j < t.n; j++) cand[j] = {t.dist_sq(q, t.vec(j)), j};
+    std::partial_sort(cand.begin(), cand.begin() + K, cand.end());
+
+    std::set<uint32_t> truth;
+    for (uint32_t e = 0; e < K; e++) truth.insert(cand[e].second);
+    for (uint32_t e = 0; e < K; e++)
+      if (truth.count(h_res[static_cast<size_t>(i) * K + e].first)) hits++;
+  }
+  const double recall = static_cast<double>(hits) / (NQ * K);
+  EXPECT_GE(recall, 0.9) << "recall@" << K << " = " << recall;
+
+  cudaFree(result.frontier);
+  cudaFree(d_q.data);
+  t.g.deallocate();
 }
 
 } // namespace jasper::test

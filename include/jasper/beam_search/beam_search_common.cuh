@@ -84,7 +84,15 @@ inline void reset_phase_clocks() {}
 // Requires DATA_T == __half and padded_dim divisible by 8.
 // vector_view::pad already rounds padded_dim up to ≥16, so the divisibility
 // requirement is satisfied for typical configurations.
-template <typename DATA_T, uint32_t BLOCK_SIZE, distance_func DISTANCE_FUNC>
+//
+// STORE_DIMS caps how much of the residual is written: 0 (the default) stores
+// all padded_dim coordinates, any other value stores only the first STORE_DIMS
+// of them and qu_diff need only be that long. rq_estimator uses this — it reads
+// the residual's first rq_dim coordinates and nothing else, so a full-length
+// buffer would cost O(D) of shared memory for an O(d) need. Must be a multiple
+// of 8 (the uint4 store granularity).
+template <typename DATA_T, uint32_t BLOCK_SIZE, distance_func DISTANCE_FUNC,
+          uint32_t STORE_DIMS = 0>
 __device__ __forceinline__ float compute_qu_diff_and_exact(
     const DATA_T* __restrict__ query_vec,
     const DATA_T* __restrict__ u_vec,
@@ -125,8 +133,10 @@ __device__ __forceinline__ float compute_qu_diff_and_exact(
                + __half2float(__high2half(p2));
       }
     }
+    // Each uint4 covers 8 halves, so chunk i lands entirely inside a
+    // STORE_DIMS-long buffer exactly when 8i < STORE_DIMS.
     if constexpr (DISTANCE_FUNC == distance_func::L2) {
-      d_v4[i] = d;
+      if (STORE_DIMS == 0 || i * 8u < STORE_DIMS) d_v4[i] = d;
     }
   }
 

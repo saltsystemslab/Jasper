@@ -3,6 +3,8 @@
 #include <cmath>
 #include <cstring>
 #include <random>
+#include <stdexcept>
+#include <string>
 #include <type_traits>
 #include <vector>
 
@@ -106,6 +108,66 @@ __host__ void set_rotation_matrix(
       m[i + j * d]           = Q[i + j * d];
       m_transpose[i + j * d] = Q[j + i * d];  // transpose: swap i,j
     }
+  }
+}
+
+// ── Random D→d projection with orthonormal rows (the JLT P_d) ──
+// "The random orthogonal matrix which projects a D-dimensional vector to
+// d-dimensional space" of the RaBitQ ">32x compression" construction. Rows are
+// Gaussian, orthonormalized by modified Gram-Schmidt, so P_d·P_dᵀ = I_d and
+// E‖P_d x‖² = (d/D)·‖x‖².
+//
+// NOT used by the directional RaBitQ path, which gets the same distribution for
+// free: the first d rows of the Haar-random R from set_rotation_matrix are
+// themselves a uniform d-frame, so truncating a rotated vector IS a sample of
+// P_d (see rabitq/edge_rq.cuh). This exists for the case that argument cannot
+// cover — D large enough that materializing R at all is infeasible, since the
+// Householder QR above is O(D³) in time and D² in space while this is O(D·d²)
+// and D·d (123 KB vs 4.3 GB at D = 32768, d = 32).
+//
+// Output layout is (D x d) column-major — equivalently, row j of P_d occupies
+// the contiguous span m[j*D .. j*D+D), which is also what a cuBLAS OP_T GEMM
+// wants directly.
+template <typename Scalar = float>
+__host__ void set_projection_matrix(
+    int D,
+    int d,
+    Scalar* m,
+    uint64_t seed = 0) {
+
+  if (d > D)
+    throw std::runtime_error(
+        "set_projection_matrix: d=" + std::to_string(d) +
+        " exceeds D=" + std::to_string(D) + "; a projection cannot add rank");
+
+  std::mt19937_64 rng(seed);
+  std::normal_distribution<Scalar> N(0, 1);
+
+  for (int j = 0; j < d; j++)
+    for (int i = 0; i < D; i++)
+      m[static_cast<size_t>(j) * D + i] = N(rng);
+
+  // Modified Gram-Schmidt over the d rows.
+  for (int j = 0; j < d; j++) {
+    Scalar* rj = m + static_cast<size_t>(j) * D;
+    for (int k = 0; k < j; k++) {
+      const Scalar* rk = m + static_cast<size_t>(k) * D;
+      Scalar dot = 0;
+      for (int i = 0; i < D; i++) dot += rk[i] * rj[i];
+      for (int i = 0; i < D; i++) rj[i] -= dot * rk[i];
+    }
+    Scalar norm_sq = 0;
+    for (int i = 0; i < D; i++) norm_sq += rj[i] * rj[i];
+    Scalar norm = std::sqrt(norm_sq);
+    // d << D with Gaussian rows, so a dependent row is a measure-zero event;
+    // fall back to a basis vector rather than dividing by ~0.
+    if (norm < Scalar(1e-12)) {
+      for (int i = 0; i < D; i++) rj[i] = Scalar(0);
+      rj[j] = Scalar(1);
+      continue;
+    }
+    const Scalar inv = Scalar(1) / norm;
+    for (int i = 0; i < D; i++) rj[i] *= inv;
   }
 }
 

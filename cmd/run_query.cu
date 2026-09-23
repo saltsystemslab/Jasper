@@ -422,6 +422,89 @@ void run_pq_round(jasper::graph<GraphCfg>& graph,
   cudaFree(result.frontier);
 }
 
+// ── Single RaBitQ directional-search round ─────────────────────
+template <typename GraphCfg, typename DataT>
+void run_rq_round(jasper::graph<GraphCfg>& graph,
+                  jasper::rq_globals<GraphCfg::rq_dim, GraphCfg::rq_bits> globals,
+                  DataT* d_queries,
+                  uint32_t n_queries,
+                  uint32_t dim,
+                  uint32_t k,
+                  uint32_t beam_width,
+                  uint32_t limit,
+                  const GroundTruth* gt,
+                  bool print_throughput) {
+
+  jasper::vector_view<DataT> query_view(d_queries, dim, n_queries, false);
+
+  jasper::search_params params{
+    .k          = k,
+    .beam_width = beam_width,
+    .limit      = limit,
+    .get_visited = false,
+  };
+
+  cudaEvent_t e0, e1;
+  cudaEventCreate(&e0);
+  cudaEventCreate(&e1);
+
+  cudaDeviceSynchronize();
+  CUDA_CHECK(cudaGetLastError());
+
+  jasper::reset_phase_clocks();
+
+  cudaEventRecord(e0);
+  auto result = jasper::rq_search(graph, globals, query_view, params);
+  CUDA_CHECK(cudaGetLastError());
+  cudaDeviceSynchronize();
+  CUDA_CHECK(cudaGetLastError());
+  cudaEventRecord(e1);
+  cudaEventSynchronize(e1);
+
+  float duration_ms = 0;
+  cudaEventElapsedTime(&duration_ms, e0, e1);
+  cudaEventDestroy(e0);
+  cudaEventDestroy(e1);
+
+  if (print_throughput) {
+    float throughput = (n_queries * 1000.0f) / duration_ms;
+    std::cout << "  beam_width=" << beam_width
+              << " limit=" << limit
+              << " duration=" << std::fixed << std::setprecision(2) << duration_ms << "ms"
+              << " throughput=" << std::setprecision(0) << throughput << " QPS"
+              << std::endl;
+  }
+
+  // Unpack results
+  uint32_t total = n_queries * k;
+  int32_t* d_indices = nullptr;
+  float* d_distances = nullptr;
+  CUDA_CHECK(cudaMalloc(&d_indices, total * sizeof(int32_t)));
+  CUDA_CHECK(cudaMalloc(&d_distances, total * sizeof(float)));
+
+  uint32_t threads = 256;
+  uint32_t blocks = (total + threads - 1) / threads;
+  unpack_results_kernel<<<blocks, threads>>>(
+    result.frontier, d_indices, d_distances, total);
+  CUDA_CHECK(cudaGetLastError());
+  CUDA_CHECK(cudaDeviceSynchronize());
+
+  std::vector<int32_t> h_indices(total);
+  std::vector<float> h_distances(total);
+  CUDA_CHECK(cudaMemcpy(h_indices.data(), d_indices, total * sizeof(int32_t), cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(h_distances.data(), d_distances, total * sizeof(float), cudaMemcpyDeviceToHost));
+
+  if (gt) {
+    get_recall(*gt, h_indices.data(), k, n_queries);
+  }
+
+  if (print_throughput) jasper::print_phase_clocks();
+
+  cudaFree(d_indices);
+  cudaFree(d_distances);
+  cudaFree(result.frontier);
+}
+
 // Rotate a batch of vectors in place on device by the orthogonal matrix seeded
 // with `seed`. Rows are [n_vectors, padded_dim] row-major __half; only the
 // first `dim` columns are populated, pad lanes stay zero.
@@ -825,6 +908,125 @@ void load_and_bench_pq(const std::string& index_path,
   graph.deallocate();
 }
 
+// ── Load graph + encode edges with RaBitQ + run the benchmark ──
+// Unlike --lsh/--pq there is no trailer support yet, so the codes are always
+// built at load time. Rotation is mandatory rather than optional: the RaBitQ
+// code quantizes the residual's first rq_dim coordinates, which is the random
+// projection P_d only in a rotated basis (see rabitq/edge_rq.cuh). Without it
+// the search still runs and just returns quietly worse results, so reject it
+// here.
+template <typename GraphCfg, typename DataT>
+void load_and_bench_rq(const std::string& index_path,
+                       const std::string& query_path,
+                       const std::string& gt_path,
+                       const std::string& src_dtype,
+                       uint32_t dim,
+                       uint32_t k,
+                       uint64_t rotate_seed,
+                       bool do_rotate,
+                       bool on_host,
+                       const std::vector<std::pair<uint32_t, uint32_t>>& beam_limit_pairs) {
+
+  if (!do_rotate)
+    throw std::runtime_error(
+        "--rabitq requires a rotated basis: drop --no_rotate (truncating to "
+        "the first rq_dim coordinates is only a random projection there)");
+  if (GraphCfg::rq_dim > dim)
+    throw std::runtime_error(
+        "--rabitq: rq_dim=" + std::to_string(GraphCfg::rq_dim) +
+        " (= 8 * k_ranks) exceeds --dim=" + std::to_string(dim) +
+        "; lower --k_ranks");
+
+  std::cout << "Loading index..." << std::endl;
+  auto graph = jasper::load_graph_from_file<GraphCfg>(index_path, dim, on_host);
+  // load_graph_from_file doesn't build the forward stable_id -> slot table
+  // (see graph.cuh) — rebuild it here (device-resident graphs only).
+  if (!on_host) jasper::rebuild_id_map<GraphCfg>(graph);
+  std::cout << "  " << graph.n_vectors << " vectors, dim=" << graph.dim << std::endl;
+
+  // Rotate stored vectors, then build the codes in that basis. Distance-
+  // preserving, so graph edges are unaffected.
+  std::cout << "Rotating stored vectors (seed=" << rotate_seed << ")..." << std::endl;
+  rotate_graph_vectors<GraphCfg>(graph, rotate_seed);
+  cudaDeviceSynchronize();
+
+  auto rq_globals = graph.generate_rq_globals();
+  std::cout << "Populating edge RaBitQ codes (rq_dim=" << GraphCfg::rq_dim
+            << ", rq_bits=" << GraphCfg::rq_bits << ")..." << std::endl;
+  auto t0 = std::chrono::steady_clock::now();
+  graph.populate_edge_rq(rq_globals);
+  cudaDeviceSynchronize();
+  CUDA_CHECK(cudaGetLastError());
+  auto t1 = std::chrono::steady_clock::now();
+  std::cout << "  populate_edge_rq:     "
+            << std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count()
+            << " ms\n";
+
+  // Load queries, casting src_dtype -> DataT (__half)
+  std::cout << "Loading queries..." << std::endl;
+  jasper::vector_view<DataT> h_queries_view;
+  if (src_dtype == "float") {
+    h_queries_view = jasper::load_vectors_from_file_cast<DataT, float>(query_path);
+  } else if (src_dtype == "uint8") {
+    h_queries_view = jasper::load_vectors_from_file_cast<DataT, uint8_t>(query_path);
+  } else {
+    throw std::runtime_error("Unsupported source dtype: " + src_dtype);
+  }
+  if (!h_queries_view.data)
+    throw std::runtime_error("Failed to load queries from: " + query_path);
+
+  if (h_queries_view.dim != dim)
+    throw std::runtime_error(
+      "Query file dim=" + std::to_string(h_queries_view.dim) +
+      " does not match --dim=" + std::to_string(dim));
+
+  uint32_t n_queries = h_queries_view.n_vectors;
+  std::cout << "  " << n_queries << " queries, dim=" << h_queries_view.dim << std::endl;
+
+  auto d_queries_view = h_queries_view.to_device();
+  cudaFreeHost(h_queries_view.data);
+  DataT* d_queries = d_queries_view.data;
+
+  // Rotate queries with the same seed used for the stored vectors.
+  {
+    cublasHandle_t handle;
+    cublasCreate(&handle);
+    rotate_device_vectors(d_queries, n_queries, dim,
+                          d_queries_view.padded_dim, rotate_seed, handle);
+    cublasDestroy(handle);
+  }
+
+  // Load ground truth
+  GroundTruth gt;
+  bool has_gt = !gt_path.empty();
+  if (has_gt) {
+    std::cout << "Loading ground truth..." << std::endl;
+    gt = read_groundtruth(gt_path, k);
+    std::cout << "  " << gt.n_queries << " queries, k=" << gt.gt_k << std::endl;
+    if (gt.n_queries != n_queries)
+      throw std::runtime_error("Ground truth query count mismatch");
+  }
+
+  // Warmup
+  std::cout << "\nWarmup..." << std::endl;
+  auto [warmup_bw, warmup_limit] = beam_limit_pairs.front();
+  run_rq_round<GraphCfg, DataT>(
+    graph, rq_globals, d_queries, n_queries, dim, k,
+    warmup_bw, warmup_limit, nullptr, false);
+
+  // Benchmark rounds
+  std::cout << "\n=== RaBitQ Directional Beam Search Benchmark (k=" << k << ") ==="
+            << std::endl;
+  for (auto& [bw, lim] : beam_limit_pairs) {
+    run_rq_round<GraphCfg, DataT>(
+      graph, rq_globals, d_queries, n_queries, dim, k,
+      bw, lim, has_gt ? &gt : nullptr, true);
+  }
+
+  cudaFree(d_queries);
+  graph.deallocate();
+}
+
 // ── Load graph + run all beam widths ───────────────────────────
 template <typename GraphCfg, typename DataT>
 void load_and_bench(const std::string& index_path,
@@ -1002,12 +1204,22 @@ int main(int argc, char** argv) {
     .help("Number of sampled edge residuals for PQ k-means training. "
           "Only used with --pq. Default 40000.");
 
+  program.add_argument("--rabitq")
+    .default_value(false)
+    .implicit_value(true)
+    .help("RaBitQ-encode the loaded index's edges (over the first "
+          "rq_dim = 8*k_ranks rotated coordinates) and run RaBitQ directional "
+          "search. Index file needs no RaBitQ data; it is generated at load. "
+          "Requires rotation, like --lsh/--pq. Mutually exclusive with "
+          "--lsh/--pq.");
+
   program.add_argument("--k_ranks", "-r")
     .default_value(uint32_t{4})
     .scan<'u', uint32_t>()
     .choices(4u, 8u, 16u)
-    .help("LSH k_ranks / PQ subquantizers M (4, 8, or 16). "
-          "Used with --lsh or --pq.");
+    .help("LSH k_ranks / PQ subquantizers M / RaBitQ projected dimension "
+          "rq_dim = 8*k_ranks (4, 8, or 16). "
+          "Used with --lsh, --pq or --rabitq.");
 
   program.add_argument("--on_host")
     .default_value(false)
@@ -1053,6 +1265,7 @@ int main(int argc, char** argv) {
   auto beam_args    = program.get<std::vector<std::string>>("--beam_limits");
   auto use_lsh      = program.get<bool>("--lsh");
   auto use_pq       = program.get<bool>("--pq");
+  auto use_rq       = program.get<bool>("--rabitq");
   auto on_host      = program.get<bool>("--on_host");
   auto k_ranks      = program.get<uint32_t>("--k_ranks");
   auto pq_train     = program.get<uint32_t>("--pq_train");
@@ -1060,8 +1273,17 @@ int main(int argc, char** argv) {
   auto rotate_seed  = program.get<uint64_t>("--rotate_seed");
   auto prepopulated = program.get<bool>("--prepopulated");
 
-  if (use_lsh && use_pq) {
-    std::cerr << "Error: --lsh and --pq are mutually exclusive" << std::endl;
+  if (static_cast<int>(use_lsh) + static_cast<int>(use_pq)
+      + static_cast<int>(use_rq) > 1) {
+    std::cerr << "Error: --lsh, --pq and --rabitq are mutually exclusive"
+              << std::endl;
+    return 1;
+  }
+
+  if (use_rq && prepopulated) {
+    std::cerr << "Error: --rabitq does not read from the directional trailer "
+                 "yet; drop --prepopulated (codes are built at load time)"
+              << std::endl;
     return 1;
   }
 
@@ -1088,9 +1310,12 @@ int main(int argc, char** argv) {
   std::cout << std::endl;
   std::cout << "  lsh:          " << (use_lsh ? "true" : "false") << std::endl;
   std::cout << "  pq:           " << (use_pq ? "true" : "false") << std::endl;
+  std::cout << "  rabitq:       " << (use_rq ? "true" : "false") << std::endl;
   std::cout << "  on_host:      " << (on_host ? "true" : "false") << std::endl;
-  if (use_lsh || use_pq) {
+  if (use_lsh || use_pq || use_rq) {
     std::cout << "  k_ranks:      " << k_ranks << std::endl;
+    if (use_rq)
+      std::cout << "  rq_dim:       " << (k_ranks * 8) << " (1 bit/dim)" << std::endl;
     if (use_pq && !prepopulated)
       std::cout << "  pq_train:     " << pq_train << std::endl;
     std::cout << "  prepopulated: " << (prepopulated ? "true" : "false") << std::endl;
@@ -1104,7 +1329,32 @@ int main(int argc, char** argv) {
   try {
     bool dispatched = false;
 
-    if (use_pq) {
+    if (use_rq) {
+      // RaBitQ reuses the directional config table verbatim — k_ranks selects
+      // the projected dimension (rq_dim = 8*k_ranks), so no new graph configs
+      // get instantiated for this path.
+      #define TRY_DISPATCH_RQ(id, IDX, R, DAT, DIST, FUNC, KR, PACKEDT)        \
+        if (!dispatched &&                                                     \
+            lsh_config_matches<FUNC, KR, PACKEDT>(                             \
+                datatype, n_neighbors, distance, R, k_ranks, dim)) {          \
+          std::cout << "  Config: " #id << std::endl;                          \
+          load_and_bench_rq<cfg_##id, DAT>(                                    \
+              index_path, query_path, gt_path, datatype,                       \
+              dim, k, rotate_seed, !no_rotate, on_host, beam_limit_pairs);    \
+          dispatched = true;                                                   \
+        }
+
+      JASPER_FOR_EACH_LSH_CONFIG(TRY_DISPATCH_RQ)
+      #undef TRY_DISPATCH_RQ
+
+      if (!dispatched) {
+        throw std::runtime_error(
+          "Unsupported RaBitQ config: datatype=" + datatype +
+          ", n_neighbors=" + std::to_string(n_neighbors) +
+          ", distance=" + distance +
+          ", k_ranks=" + std::to_string(k_ranks));
+      }
+    } else if (use_pq) {
       // PQ requires directional (use_lsh) storage, so it dispatches over the
       // same config table; k_ranks selects the number of PQ subquantizers M.
       #define TRY_DISPATCH_PQ(id, IDX, R, DAT, DIST, FUNC, KR, PACKEDT)        \

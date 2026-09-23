@@ -15,7 +15,10 @@
 #include "jasper/index/graph_ops.cuh"
 
 #include "jasper/rabitq/distance.cuh"
+#include "jasper/rabitq/edge_rq.cuh"
+#include "jasper/rabitq/encode.cuh"
 #include "jasper/rabitq/layout.cuh"
 #include "jasper/rabitq/quantize.cuh"
+#include "jasper/rabitq/rq_kernels.cuh"
 
 #include "jasper/rotation/rotation.cuh"

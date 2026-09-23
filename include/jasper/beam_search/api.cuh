@@ -3,9 +3,11 @@
 #include "jasper/beam_search/beam_search.cuh"
 #include "jasper/beam_search/directional_beam_search.cuh"
 #include "jasper/beam_search/pq_beam_search.cuh"
+#include "jasper/beam_search/rq_beam_search.cuh"
 #include "jasper/beam_search/config.cuh"
 #include "jasper/lsh/lsh_globals.cuh"
 #include "jasper/pq/pq_codebooks.cuh"
+#include "jasper/rabitq/edge_rq.cuh"
 
 namespace jasper {
 
@@ -199,6 +201,76 @@ beam_search_result<GRAPH_CFG> pq_search(
   else if (bw + 64 < 512)  return pq_search_dispatch_width<GRAPH_CFG, BLOCK_SIZE, 512,  TILE_SIZE>(g, codebooks, d_queries, params);
   else if (bw + 64 < 1024) return pq_search_dispatch_width<GRAPH_CFG, BLOCK_SIZE, 1024, TILE_SIZE>(g, codebooks, d_queries, params);
   else if (bw + 64 < 2048) return pq_search_dispatch_width<GRAPH_CFG, BLOCK_SIZE, 2048, TILE_SIZE>(g, codebooks, d_queries, params);
+  else throw std::invalid_argument(
+      "beam_width " + std::to_string(bw) +
+      " is too large (beam_width + 64 must be < 2048)");
+}
+
+// ───────────────────────────────── rq_search ───────────────────────────────
+// Same beam-search skeleton again, with neighbor distances estimated from the
+// per-edge RaBitQ codes (see rq_beam_search.cuh). Requires the graph's stored
+// vectors to be in the rotated space the codes were built in, and the queries
+// rotated with the same seed — truncating to rq_dim coordinates is the random
+// projection P_d only there.
+
+template <typename GRAPH_CFG,
+          uint32_t BLOCK_SIZE,
+          uint32_t MAX_SEARCH_WIDTH,
+          uint32_t TILE_SIZE>
+beam_search_result<GRAPH_CFG> rq_search_impl(
+    const graph<GRAPH_CFG>&                                   g,
+    rq_globals<GRAPH_CFG::rq_dim, GRAPH_CFG::rq_bits>         globals,
+    typename GRAPH_CFG::vector_view_t&                        d_queries,
+    const search_params&                                      params) {
+  static_assert(GRAPH_CFG::use_lsh,
+                "rq_search requires graph_cfg::use_lsh (directional storage)");
+
+  using Cfg = beam_search_config<
+      GRAPH_CFG, GRAPH_CFG::dist_func,
+      BLOCK_SIZE, MAX_SEARCH_WIDTH, TILE_SIZE>;
+
+  beam_search_params<Cfg> bp {
+    .graph           = g,
+    .query_vectors   = d_queries,
+    .use_range       = false,
+    .medoid          = g.medoid,
+    .k               = params.k,
+    .beam_width      = params.beam_width,
+    .limit           = params.limit,
+    .get_visited     = params.get_visited,
+    .max_result_size = params.max_result_size,
+  };
+  return rq_beam_search<Cfg>(bp, globals);
+}
+
+template <typename GRAPH_CFG, uint32_t BLOCK_SIZE, uint32_t MAX_SEARCH_WIDTH,
+          uint32_t TILE_SIZE>
+beam_search_result<GRAPH_CFG> rq_search_dispatch_width(
+    const graph<GRAPH_CFG>&                           g,
+    rq_globals<GRAPH_CFG::rq_dim, GRAPH_CFG::rq_bits> globals,
+    typename GRAPH_CFG::vector_view_t                 d_queries,
+    const search_params&                              params) {
+  return rq_search_impl<GRAPH_CFG, BLOCK_SIZE, MAX_SEARCH_WIDTH, TILE_SIZE>(
+      g, globals, d_queries, params);
+}
+
+template <typename GRAPH_CFG,
+          uint32_t BLOCK_SIZE = 128,
+          uint32_t TILE_SIZE  = 4>
+beam_search_result<GRAPH_CFG> rq_search(
+    const graph<GRAPH_CFG>&                           g,
+    rq_globals<GRAPH_CFG::rq_dim, GRAPH_CFG::rq_bits> globals,
+    typename GRAPH_CFG::vector_view_t                 d_queries,
+    const search_params&                              params = {}) {
+  static_assert(GRAPH_CFG::use_lsh,
+                "rq_search requires graph_cfg::use_lsh (directional storage)");
+
+  const uint32_t bw = params.beam_width;
+  if      (bw + 64 < 128)  return rq_search_dispatch_width<GRAPH_CFG, BLOCK_SIZE, 128,  TILE_SIZE>(g, globals, d_queries, params);
+  else if (bw + 64 < 256)  return rq_search_dispatch_width<GRAPH_CFG, BLOCK_SIZE, 256,  TILE_SIZE>(g, globals, d_queries, params);
+  else if (bw + 64 < 512)  return rq_search_dispatch_width<GRAPH_CFG, BLOCK_SIZE, 512,  TILE_SIZE>(g, globals, d_queries, params);
+  else if (bw + 64 < 1024) return rq_search_dispatch_width<GRAPH_CFG, BLOCK_SIZE, 1024, TILE_SIZE>(g, globals, d_queries, params);
+  else if (bw + 64 < 2048) return rq_search_dispatch_width<GRAPH_CFG, BLOCK_SIZE, 2048, TILE_SIZE>(g, globals, d_queries, params);
   else throw std::invalid_argument(
       "beam_width " + std::to_string(bw) +
       " is too large (beam_width + 64 must be < 2048)");

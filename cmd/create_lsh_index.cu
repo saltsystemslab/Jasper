@@ -36,6 +36,7 @@ __device__ uint64_t g_phase_clocks[PHASE_COUNT];
   X(f16_r64_l2_k4_d128,  uint32_t, 64, __half, float, jasper::distance_func::L2,  4, uint8_t)  \
   X(f16_r64_l2_k16_d128,  uint32_t, 64, __half, float, jasper::distance_func::L2,  16, uint8_t)  \
   X(f16_r64_l2_k4_d32678,  uint32_t, 64, __half, float, jasper::distance_func::L2,  4, uint16_t)  \
+  X(f16_r64_l2_k16_d32678,  uint32_t, 64, __half, float, jasper::distance_func::L2,  16, uint16_t)  \
   X(f16_r32_ip_k4_d32678,  uint32_t, 32, __half, float, jasper::distance_func::INNER_PRODUCT,  4, uint16_t)  \
   X(f16_r64_ip_k4_d32678,  uint32_t, 64, __half, float, jasper::distance_func::INNER_PRODUCT,  4, uint16_t)
 
@@ -289,6 +290,37 @@ void run_pq_round(
   jasper::print_phase_clocks();
 }
 
+// ── Single RaBitQ directional-search round ─────────────────────
+template <typename GraphCfg, typename DataT>
+void run_rq_round(
+    jasper::graph<GraphCfg>&                                   graph,
+    jasper::rq_globals<GraphCfg::rq_dim, GraphCfg::rq_bits>    rq_globals,
+    DataT*    d_queries,
+    uint32_t  n_queries,
+    uint32_t  dim,
+    uint32_t  k,
+    uint32_t  beam_width,
+    uint32_t  limit,
+    const GroundTruth* gt,
+    bool      print_throughput) {
+
+  jasper::vector_view<DataT> query_view(d_queries, dim, n_queries, false);
+  jasper::search_params params{
+    .k           = k,
+    .beam_width  = beam_width,
+    .limit       = limit,
+    .get_visited = false,
+  };
+
+  jasper::reset_phase_clocks();
+  run_round_generic(
+    n_queries, k, beam_width, limit, gt, print_throughput,
+    [&]() {
+      return jasper::rq_search(graph, rq_globals, query_view, params);
+    });
+  jasper::print_phase_clocks();
+}
+
 template <typename DataT>
 // Rotate query vectors using the same seed used during construction
 void rotate_queries(DataT* d_queries, uint32_t n_queries, uint32_t dim,
@@ -339,6 +371,7 @@ void benchmark_all(
     jasper::graph<GraphCfg>&                                   graph,
     const jasper::lsh_globals<GraphCfg::k_ranks>&              globals,
     jasper::pq_codebooks_view<GraphCfg::pq_m, GraphCfg::pq_k>  pq_view,
+    jasper::rq_globals<GraphCfg::rq_dim, GraphCfg::rq_bits>    rq_globals,
     const std::string& query_path,
     const std::string& gt_path,
     const std::string& src_dtype,
@@ -424,6 +457,23 @@ void benchmark_all(
   for (auto& [bw, lim] : beam_limit_pairs) {
     run_pq_round<GraphCfg, DataT>(
       graph, pq_view, d_queries, n_queries, dim, k,
+      bw, lim, has_gt ? &gt : nullptr, true);
+  }
+
+  // ─── RaBitQ directional beam search ─────────────────────────
+  // Same rotated space as everything above (construction prerotates with
+  // seed 42, queries were rotated to match), which is what makes truncating to
+  // the first rq_dim coordinates a random projection.
+  std::cout << "\n=== RaBitQ Directional Beam Search Benchmark (k=" << k
+            << ", rq_dim=" << GraphCfg::rq_dim << ") ===" << std::endl;
+  std::cout << "Warmup..." << std::endl;
+  run_rq_round<GraphCfg, DataT>(
+    graph, rq_globals, d_queries, n_queries, dim, k,
+    warmup_bw, warmup_limit, nullptr, false);
+
+  for (auto& [bw, lim] : beam_limit_pairs) {
+    run_rq_round<GraphCfg, DataT>(
+      graph, rq_globals, d_queries, n_queries, dim, k,
       bw, lim, has_gt ? &gt : nullptr, true);
   }
 
@@ -529,20 +579,36 @@ void construct_and_save(const std::string& filename,
   cudaDeviceSynchronize();
   auto t5 = std::chrono::steady_clock::now();
 
+  // ── RaBitQ-encode the edges (directional RaBitQ path) ────────
+  // Construction prerotated the dataset (params.prerotate, seed 42), which is
+  // the space the codes must be built in: the projection P_d is a truncation to
+  // the first rq_dim = 8*k_ranks rotated coordinates. Nothing to train here —
+  // at 1 bit per dimension the code is the sign pattern of the residual.
+  std::cout << "  Populating edge RaBitQ codes (rq_dim="
+            << GraphCfg::rq_dim << ")..." << std::endl;
+  auto rq_globals = g.generate_rq_globals();
+  g.populate_edge_rq(rq_globals);
+  cudaDeviceSynchronize();
+  CUDA_CHECK(cudaGetLastError());
+  auto t6 = std::chrono::steady_clock::now();
+
   auto ms1 = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
   auto ms2 = std::chrono::duration_cast<std::chrono::milliseconds>(t3 - t2).count();
   auto ms3 = std::chrono::duration_cast<std::chrono::milliseconds>(t4 - t3).count();
   auto ms4 = std::chrono::duration_cast<std::chrono::milliseconds>(t5 - t4).count();
+  auto ms5 = std::chrono::duration_cast<std::chrono::milliseconds>(t6 - t5).count();
 
   std::cout << "  generate_lsh_globals: "   << ms1 << " ms\n";
   std::cout << "  populate_edge_lsh: "      << ms2 << " ms\n";
   std::cout << "  generate_pq_codebooks: "  << ms3 << " ms\n";
   std::cout << "  populate_edge_pq: "       << ms4 << " ms\n";
+  std::cout << "  populate_edge_rq: "       << ms5 << " ms\n";
 
   // ── Benchmark step ───────────────────────────────────────────
   if (!query_path.empty()) {
     benchmark_all<GraphCfg, DataT>(
-      g, lsh_globals, pq_codebooks.view(), query_path, gt_path, src_dtype,
+      g, lsh_globals, pq_codebooks.view(), rq_globals,
+      query_path, gt_path, src_dtype,
       dim, k, beam_limit_pairs);
   } else {
     std::cout << "\n  No --queries provided; skipping benchmark." << std::endl;

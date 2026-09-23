@@ -17,6 +17,8 @@
 #include "jasper/pq/edge_pq.cuh"
 #include "jasper/pq/pq_codebooks.cuh"
 #include "jasper/pq/pq_kernels.cuh"
+#include "jasper/rabitq/edge_rq.cuh"
+#include "jasper/rabitq/rq_kernels.cuh"
 
 #include "assert.h"
 #include "stdio.h"
@@ -80,6 +82,17 @@ struct graph_config {
   static constexpr uint32_t pq_k = 256;
   using edge_pq_list_t = edge_pq_list<INDEX_T, N_NEIGHBORS, pq_m>;
 
+  // RaBitQ (directional RaBitQ path). Like pq_m above, the knob is derived from
+  // K_RANKS rather than added as a template parameter, so enabling this path
+  // adds no new config combinations to compile: K_RANKS = 4/8/16 projects the
+  // edge residual onto rq_dim = 32/64/128 rotated coordinates, which at 1 bit
+  // per dimension puts the per-edge footprint (code + rescale + mag²) in the
+  // same range as the LSH and PQ codes it is benchmarked against.
+  // rq_dim must be <= the data dimension; populate_edge_rq checks that.
+  static constexpr uint32_t rq_dim  = static_cast<uint32_t>(K_RANKS) * 8u;
+  static constexpr uint32_t rq_bits = 1;
+  using edge_rq_list_t = edge_rq_list<INDEX_T, N_NEIGHBORS, rq_dim, rq_bits>;
+
   static constexpr uint8_t n_neighbors = N_NEIGHBORS;
   static constexpr distance_func dist_func = DIST_FUNC;
   static constexpr index_t vectors_per_segment = 1u << 20;
@@ -96,6 +109,7 @@ struct graph_segment {
   using edge_list_t = typename graph_cfg::edge_list_t;
   using edge_lsh_list_t = typename graph_cfg::edge_lsh_list_t;
   using edge_pq_list_t  = typename graph_cfg::edge_pq_list_t;
+  using edge_rq_list_t  = typename graph_cfg::edge_rq_list_t;
   using vector_view_t    = typename graph_cfg::vector_view_t;
 
   static constexpr uint32_t max_vectors = graph_cfg::vectors_per_segment;
@@ -109,6 +123,7 @@ struct graph_segment {
   vector_view_t vectors;
   edge_lsh_list_t* edge_lshs; // only enabled if USE_LSH
   edge_pq_list_t*  edge_pqs;  // PQ codes; only enabled if USE_LSH (directional)
+  edge_rq_list_t*  edge_rqs;  // RaBitQ codes; only enabled if USE_LSH (directional)
 
   // Deletion support: 1 BIT per slot (packed), 1 = soft-deleted. Word w covers
   // slots [32w, 32w+32); slot i is bit (i & 31) of deleted_bits[i >> 5]. 8x
@@ -158,12 +173,34 @@ struct graph_segment {
 
     seg.vectors = vector_view_t::allocate(dim, max_vectors, on_host);
 
-    // edge_lshs / edge_pqs are allocated lazily on the first
-    // populate_edge_lsh() / populate_edge_pq() call.
+    // edge_lshs / edge_pqs / edge_rqs are allocated lazily on the first
+    // populate_edge_lsh() / populate_edge_pq() / populate_edge_rq() call.
     seg.edge_lshs = nullptr;
     seg.edge_pqs  = nullptr;
+    seg.edge_rqs  = nullptr;
 
     return seg;
+  }
+
+  // Lazily allocate the RaBitQ code storage. No-op if already allocated or if
+  // use_lsh (directional storage) is disabled. Matches this segment's on_host.
+  void allocate_edge_rq() {
+    if constexpr (graph_cfg::use_lsh) {
+      if (edge_rqs != nullptr) return;
+
+      auto check = [](cudaError_t err, const char* name) {
+        if (err != cudaSuccess)
+          throw std::runtime_error(std::string(name) + " failed: " + cudaGetErrorString(err));
+      };
+
+      if (on_host) {
+        check(cudaMallocHost(&edge_rqs, max_vectors * sizeof(edge_rq_list_t)),
+              "cudaMallocHost(edge_rqs)");
+      } else {
+        check(cudaMalloc(&edge_rqs, max_vectors * sizeof(edge_rq_list_t)),
+              "cudaMalloc(edge_rqs)");
+      }
+    }
   }
 
   // Lazily allocate the PQ code storage. No-op if already allocated or if
@@ -226,6 +263,8 @@ struct graph_segment {
       edge_lshs = nullptr;
       if (on_host) cudaFreeHost(edge_pqs); else cudaFree(edge_pqs);
       edge_pqs = nullptr;
+      if (on_host) cudaFreeHost(edge_rqs); else cudaFree(edge_rqs);
+      edge_rqs = nullptr;
     }
     vectors.deallocate();
     edges = nullptr;
@@ -253,6 +292,7 @@ struct graph_segment {
     index_t*     new_slot_to_id  = nullptr;
     edge_lsh_list_t* new_edge_lshs = nullptr;
     edge_pq_list_t*  new_edge_pqs  = nullptr;
+    edge_rq_list_t*  new_edge_rqs  = nullptr;
 
     if (target_on_host) {
       cudaMallocHost(&new_edges,       max_vectors * sizeof(edge_list_t));
@@ -267,6 +307,8 @@ struct graph_segment {
           cudaMallocHost(&new_edge_lshs, max_vectors * sizeof(edge_lsh_list_t));
         if (edge_pqs != nullptr)
           cudaMallocHost(&new_edge_pqs, max_vectors * sizeof(edge_pq_list_t));
+        if (edge_rqs != nullptr)
+          cudaMallocHost(&new_edge_rqs, max_vectors * sizeof(edge_rq_list_t));
       }
     } else {
       cudaMalloc(&new_edges,       max_vectors * sizeof(edge_list_t));
@@ -284,6 +326,8 @@ struct graph_segment {
           cudaMalloc(&new_edge_lshs, max_vectors * sizeof(edge_lsh_list_t));
         if (edge_pqs != nullptr)
           cudaMalloc(&new_edge_pqs, max_vectors * sizeof(edge_pq_list_t));
+        if (edge_rqs != nullptr)
+          cudaMalloc(&new_edge_rqs, max_vectors * sizeof(edge_rq_list_t));
       }
     }
     vector_view_t new_vectors =
@@ -312,6 +356,10 @@ struct graph_segment {
           cudaMemcpyAsync(new_edge_pqs, edge_pqs,
                           static_cast<size_t>(n_vectors) * sizeof(edge_pq_list_t),
                           copy_kind, stream);
+        if (edge_rqs != nullptr)
+          cudaMemcpyAsync(new_edge_rqs, edge_rqs,
+                          static_cast<size_t>(n_vectors) * sizeof(edge_rq_list_t),
+                          copy_kind, stream);
       }
       cudaMemcpyAsync(new_vectors.data, vectors.data,
                       static_cast<size_t>(n_vectors) * padded_dim * sizeof(data_t),
@@ -325,13 +373,17 @@ struct graph_segment {
       cudaFreeHost(edge_counts);
       cudaFreeHost(deleted_bits);
       cudaFreeHost(slot_to_id);
-      if constexpr (graph_cfg::use_lsh) { cudaFreeHost(edge_lshs); cudaFreeHost(edge_pqs); }
+      if constexpr (graph_cfg::use_lsh) {
+        cudaFreeHost(edge_lshs); cudaFreeHost(edge_pqs); cudaFreeHost(edge_rqs);
+      }
     } else {
       cudaFree(edges);
       cudaFree(edge_counts);
       cudaFree(deleted_bits);
       cudaFree(slot_to_id);
-      if constexpr (graph_cfg::use_lsh) { cudaFree(edge_lshs); cudaFree(edge_pqs); }
+      if constexpr (graph_cfg::use_lsh) {
+        cudaFree(edge_lshs); cudaFree(edge_pqs); cudaFree(edge_rqs);
+      }
     }
     vectors.deallocate();
 
@@ -342,7 +394,9 @@ struct graph_segment {
     deleted_bits = new_deleted;
     slot_to_id  = new_slot_to_id;
 
-    if constexpr (graph_cfg::use_lsh) { edge_lshs = new_edge_lshs; edge_pqs = new_edge_pqs; }
+    if constexpr (graph_cfg::use_lsh) {
+      edge_lshs = new_edge_lshs; edge_pqs = new_edge_pqs; edge_rqs = new_edge_rqs;
+    }
 
     vectors     = new_vectors;
     on_host     = target_on_host;
@@ -387,6 +441,12 @@ struct graph_segment {
           target.allocate_edge_lsh();  // no-op if target already has it
           cudaMemcpyAsync(target.edge_lshs, edge_lshs,
                           static_cast<size_t>(n_vectors) * sizeof(edge_lsh_list_t),
+                          kind, stream);
+        }
+        if (edge_rqs != nullptr) {
+          target.allocate_edge_rq();   // no-op if target already has it
+          cudaMemcpyAsync(target.edge_rqs, edge_rqs,
+                          static_cast<size_t>(n_vectors) * sizeof(edge_rq_list_t),
                           kind, stream);
         }
       }
@@ -504,6 +564,7 @@ struct graph {
   using edge_list_t = typename graph_cfg::edge_list_t;
   using edge_lsh_list_t = typename graph_cfg::edge_lsh_list_t;
   using edge_pq_list_t  = typename graph_cfg::edge_pq_list_t;
+  using edge_rq_list_t  = typename graph_cfg::edge_rq_list_t;
   using packed_t = typename graph_cfg::packed_t;
   using vector_view_t    = typename graph_cfg::vector_view_t;
 
@@ -513,6 +574,8 @@ struct graph {
   static constexpr uint8_t k_ranks = graph_cfg::k_ranks;
   static constexpr uint32_t pq_m = graph_cfg::pq_m;
   static constexpr uint32_t pq_k = graph_cfg::pq_k;
+  static constexpr uint32_t rq_dim  = graph_cfg::rq_dim;
+  static constexpr uint32_t rq_bits = graph_cfg::rq_bits;
 
   uint32_t dim;
   index_t n_vectors;
@@ -1064,6 +1127,65 @@ struct graph {
         return 0;
       }
     }
+
+    // ── RaBitQ edge codes (see rabitq/edge_rq.cuh) ────────────────────────
+    // Write path only; the estimator reads whole code planes straight off the
+    // segment (rq_beam_search.cuh) rather than going through an accessor.
+
+    __device__ __forceinline__
+    void set_rq_word(index_t global_idx, uint8_t edge_idx, uint32_t w, uint32_t word) {
+      if constexpr (use_lsh) {
+        index_t local_idx = to_local(global_idx);
+        assert(local_idx < n_vectors && "global_idx out of bounds");
+        segments[segment_of(local_idx)]
+            .edge_rqs[local_of(local_idx)]
+            .set_word(edge_idx, w, word);
+      } else {
+        assert(false && "set_rq_word called with use_lsh=false");
+      }
+    }
+
+    __device__ __forceinline__
+    void set_rq_rescale(index_t global_idx, uint8_t edge_idx, __half rescale) {
+      if constexpr (use_lsh) {
+        index_t local_idx = to_local(global_idx);
+        assert(local_idx < n_vectors && "global_idx out of bounds");
+        segments[segment_of(local_idx)]
+            .edge_rqs[local_of(local_idx)]
+            .rescale[edge_idx] = rescale;
+      } else {
+        assert(false && "set_rq_rescale called with use_lsh=false");
+      }
+    }
+
+    __device__ __forceinline__
+    void set_rq_mag_sq(index_t global_idx, uint8_t edge_idx, __nv_bfloat16 mag_sq) {
+      if constexpr (use_lsh) {
+        index_t local_idx = to_local(global_idx);
+        assert(local_idx < n_vectors && "global_idx out of bounds");
+        segments[segment_of(local_idx)]
+            .edge_rqs[local_of(local_idx)]
+            .mag_sq[edge_idx] = mag_sq;
+      } else {
+        assert(false && "set_rq_mag_sq called with use_lsh=false");
+      }
+    }
+
+    // Sign-encoded level of one projected dimension. Not on the hot path —
+    // for tests and dumps.
+    __device__ __forceinline__
+    uint32_t get_rq_level(index_t global_idx, uint8_t edge_idx, uint32_t d) const {
+      if constexpr (use_lsh) {
+        index_t local_idx = to_local(global_idx);
+        assert(local_idx < n_vectors && "global_idx out of bounds");
+        return segments[segment_of(local_idx)]
+            .edge_rqs[local_of(local_idx)]
+            .get_level(edge_idx, d);
+      } else {
+        assert(false && "get_rq_level called with use_lsh=false");
+        return 0;
+      }
+    }
   };
 
   __host__ double avg_degree() const {
@@ -1304,6 +1426,56 @@ struct graph {
 
     const dim3 grid(static_cast<uint32_t>(n_vectors));
     kernel<<<grid, K, smem_bytes>>>(view(), cb.d_centroids);
+  }
+
+  // ── RaBitQ (directional RaBitQ path) ─────────────────────────────────────
+
+  // Query-invariant RaBitQ metadata. This is the analogue of
+  // generate_lsh_globals / generate_pq_codebooks, but at rq_bits == 1 there is
+  // nothing to learn from the data at all: the code is the sign pattern of the
+  // projected residual, so this is a pure host-side constant and costs nothing.
+  rq_globals<graph_cfg::rq_dim, graph_cfg::rq_bits> generate_rq_globals(
+      uint64_t seed = 1234) const {
+    static_assert(graph_cfg::use_lsh,
+                  "generate_rq_globals requires graph_cfg::use_lsh");
+    return make_rq_globals<graph_cfg::rq_dim, graph_cfg::rq_bits>(seed);
+  }
+
+  // RaBitQ-encode every graph edge's residual direction into edge_rqs, lazily
+  // allocating that storage the way populate_edge_lsh / populate_edge_pq do.
+  //
+  // The stored vectors must ALREADY be in the rotated space, and queries must
+  // be rotated with the same seed: truncating to rq_dim coordinates is the
+  // projection P_d only there (see rabitq/edge_rq.cuh for why the two are the
+  // same random object). Searching an unrotated graph is silently much worse
+  // rather than an error.
+  void populate_edge_rq(
+      const rq_globals<graph_cfg::rq_dim, graph_cfg::rq_bits>& globals) {
+    static_assert(graph_cfg::use_lsh,
+                  "populate_edge_rq requires graph_cfg::use_lsh");
+    if (n_vectors == 0) return;
+    if (graph_cfg::rq_dim > dim)
+      throw std::runtime_error(
+          "populate_edge_rq: rq_dim=" + std::to_string(graph_cfg::rq_dim) +
+          " exceeds the data dimension " + std::to_string(dim) +
+          " — lower --k_ranks (rq_dim = 8 * k_ranks)");
+
+    {
+      std::vector<segment_t> h_segs(segments.begin(), segments.end());
+      bool any_allocated = false;
+      for (auto& seg : h_segs) {
+        if (seg.edge_rqs == nullptr) { seg.allocate_edge_rq(); any_allocated = true; }
+      }
+      if (any_allocated)
+        segments = thrust::device_vector<segment_t>(h_segs.begin(), h_segs.end());
+    }
+
+    // No dynamic shared memory: rq_dim is a compile-time constant, so the
+    // per-warp encode workspace is static.
+    constexpr uint32_t BLOCK = 128;
+    const dim3 grid(static_cast<uint32_t>(n_vectors));
+    rq_populate<graph_cfg, device_view, graph_cfg::rq_dim, graph_cfg::rq_bits, BLOCK>
+        <<<grid, BLOCK>>>(view(), globals.t_const);
   }
 
   lsh_globals<graph_cfg::k_ranks> generate_lsh_globals(
