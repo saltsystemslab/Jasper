@@ -14,10 +14,10 @@
 # DiskANN-merge + directional index scaling ladder on DEEP (dim 96), from 10M
 # up to the full 1B.
 #
-# Each stage builds one index with create_diskann_index (per-shard LSH/PQ
-# population, see docs/design/directional-diskann-population.md) and then
-# queries it three ways: conventional beam search, LSH-directional, and
-# PQ-directional. The point of the ladder is that the interesting quantity is
+# Each stage builds one index with create_diskann_index (per-shard LSH/PQ/
+# RaBitQ population, see docs/design/directional-diskann-population.md) and then
+# queries it every way the index supports: conventional beam search, plus
+# LSH-, PQ- and RaBitQ-directional for whichever estimators were built. The point of the ladder is that the interesting quantity is
 # a RATIO — how much recall the shard-and-merge build gives up relative to a
 # single-graph build, and whether that ratio is stable as N grows.
 #
@@ -36,13 +36,16 @@
 #   sbatch sbatch/bench_deep_scaling.sbatch               # the whole ladder
 #   SCALES="10M 100M" sbatch sbatch/bench_deep_scaling.sbatch
 #   ESTIMATORS=pq SCALES=1B sbatch sbatch/bench_deep_scaling.sbatch
+#   ESTIMATORS=pq+rq SCALES="10M 100M" sbatch sbatch/bench_deep_scaling.sbatch
 #
-# Build and query can be split, which is worth doing at 1B where the build runs
-# for hours and the query phase wants the node to itself:
+# ⚠ Build and query run in ONE job by default and cannot be split while $WORK is
+# under /tmp, which this cluster clears at job end — STAGE_MODE=build / =query
+# is rejected there. To split at 1B (worth it: the build runs for hours), point
+# WORK= at persistent storage first:
 #
-#   SCALES=1B STAGE_MODE=build sbatch sbatch/bench_deep_scaling.sbatch
-#   SCALES=1B STAGE_MODE=query sbatch sbatch/bench_deep_scaling.sbatch
-#   SCALES=1B STAGE_MODE=query INDEX=/path/to/other.bin ./sbatch/...   # any file
+#   W=/projects/SaltSystemsLab/zikun/deep_scaling
+#   SCALES=1B WORK=$W STAGE_MODE=build sbatch sbatch/bench_deep_scaling.sbatch
+#   SCALES=1B WORK=$W STAGE_MODE=query sbatch sbatch/bench_deep_scaling.sbatch
 #
 # Every stage is independent and skipped if its index already exists, so a
 # timed-out or OOM-killed job can be resubmitted without redoing earlier work.
@@ -55,8 +58,13 @@ SCALES="${SCALES:-10M 100M 200M 1B}"
 # which puts 1B past this node's memory (see the R64 rows in section 4 of the
 # design doc). PQ also measured ~2x LSH's recall on text2image at fewer bytes
 # per node. ESTIMATORS=lsh is fine at R_fin=32.
-ESTIMATORS="${ESTIMATORS:-pq}"       # lsh | pq | lsh+pq | none
-QUERY_MODES="${QUERY_MODES:-conventional lsh pq}"
+#
+# rq (RaBitQ) is the LARGEST of the three at R_fin=64: 512 B/vector against
+# LSH's 384 and PQ's 256, so it buys less headroom than either. At the smaller
+# scales it is the interesting one to compare against pq; at 1B check DRY_RUN
+# before combining it with anything.
+ESTIMATORS="${ESTIMATORS:-pq}"       # any + combination of lsh, pq, rq | none
+QUERY_MODES="${QUERY_MODES:-conventional lsh pq rq}"   # unbuilt modes self-skip
 STAGE_MODE="${STAGE_MODE:-build+query}"    # build+query | build | query
 INDEX="${INDEX:-}"                         # query an explicit file instead of
                                            # the derived $WORK/deep<scale>_... name
@@ -96,12 +104,29 @@ BEAM_LIMITS="${BEAM_LIMITS:-16:128 32:128 64:128 128:256 256:512 512:1024 1024:2
 # 0: never pass it, even when the estimate says it won't fit.
 ON_HOST="${ON_HOST:-auto}"           # auto | 1 | 0
 DRY_RUN="${DRY_RUN:-0}"
-KEEP_INDEX="${KEEP_INDEX:-1}"        # 0 = delete each index after querying
+# Default 0 because $WORK is wiped when the job ends (see below): keeping an
+# index buys nothing across jobs, and dropping it right after its queries means
+# only the LARGEST stage has to fit at once rather than their sum. Set 1 only
+# when $WORK is persistent.
+KEEP_INDEX="${KEEP_INDEX:-0}"        # 0 = delete each index after querying
+# df reports the whole volume, which can be much larger than what this job may
+# actually use (/tmp on d4067 is ~1 TB). Set this to cap the budget in GiB; 0
+# trusts df.
+DISK_BUDGET="${DISK_BUDGET:-0}"      # GiB, 0 = ask df
 
 DATA="${DATA:-/projects/SaltSystemsLab/ann_data/deep}"
 GT="${GT:-/projects/SaltSystemsLab/ann_gt}"
 QUERIES="${QUERIES:-$DATA/deep10kquery}"
-WORK="${WORK:-/projects/SaltSystemsLab/zikun/deep_scaling}"
+# Indexes default to node-local scratch: the shared filesystem does not have
+# room for these (one 1B index is ~800 GiB of base section alone). /tmp is
+# per-node and may be cleared between jobs, so an index here is a CACHE, not an
+# artifact — "index exists, reusing" still works for a resubmission that lands
+# on the same node, but do not count on it.
+#
+# ⚠ CHANGED DEFAULT: this used to be /projects/SaltSystemsLab/zikun/deep_scaling.
+# Anything already built there will NOT be found and would be rebuilt from
+# scratch — pass WORK=/projects/SaltSystemsLab/zikun/deep_scaling to reuse it.
+WORK="${WORK:-/tmp/${USER:-$(id -un)}/deep_scaling}"
 REPO="${REPO:-$HOME/jasper}"
 # Separate from WORK on purpose: WORK may be node-local scratch that the job
 # loses on exit, and the numbers are the part you can't rebuild cheaply. The
@@ -124,13 +149,35 @@ scale_base() { case "$1" in 1B) echo "$DATA/base.1B.fbin";;
 scale_gt()   { case "$1" in 1B) echo "$GT/GT_1B/deep-1B";;
                             *) echo "$GT/GT_$1/deep-$1";; esac; }
 
-case "$ESTIMATORS" in
-  lsh)     BUILD_LSH=1; BUILD_PQ=0;;
-  pq)      BUILD_LSH=0; BUILD_PQ=1;;
-  lsh+pq)  BUILD_LSH=1; BUILD_PQ=1;;
-  none)    BUILD_LSH=0; BUILD_PQ=0;;
-  *) echo "ESTIMATORS must be one of: lsh pq lsh+pq none" >&2; exit 2;;
-esac
+# '+'-separated so any combination works: pq, lsh+pq, pq+rq, lsh+pq+rq, none.
+BUILD_LSH=0; BUILD_PQ=0; BUILD_RQ=0
+if [ "$ESTIMATORS" != "none" ]; then
+  for tok in ${ESTIMATORS//+/ }; do
+    case "$tok" in
+      lsh)       BUILD_LSH=1;;
+      pq)        BUILD_PQ=1;;
+      rq|rabitq) BUILD_RQ=1;;
+      *) echo "ESTIMATORS tokens must be lsh, pq, rq (or the whole value 'none');" \
+              "got '$tok' in '$ESTIMATORS'" >&2; exit 2;;
+    esac
+  done
+fi
+
+# RaBitQ geometry, derived like the C++ side: rq_dim = 8*k_ranks at 1 bit per
+# dimension, packed into 32-bit words, plus an fp16 rescale and a bf16 mag² per
+# edge (see edge_rq_list in rabitq/edge_rq.cuh).
+RQ_DIM=$(( 8 * K_RANKS ))
+RQ_WORDS=$(( (RQ_DIM + 31) / 32 ))
+RQ_PER_EDGE=$(( 4 * RQ_WORDS + 4 ))
+
+# The codes truncate to the first rq_dim rotated coordinates, so the projection
+# has to fit inside the data. DEEP is dim 96, which means K_RANKS=16 (rq_dim
+# 128) is not usable here — catch it now rather than hours into a build.
+if [ "$BUILD_RQ" = "1" ] && [ "$RQ_DIM" -gt "$DIM" ]; then
+  echo "ESTIMATORS includes rq but rq_dim=8*K_RANKS=$RQ_DIM exceeds dim=$DIM." >&2
+  echo "Lower K_RANKS (4 gives rq_dim=32) or drop rq from ESTIMATORS." >&2
+  exit 2
+fi
 
 # ── Budget model (mirrors docs/design/directional-diskann-population.md §4) ──
 # Bytes of host memory the builder holds resident, per vector. Keep this in sync
@@ -151,6 +198,9 @@ host_per_vec() {
     per=$(( per + R_FIN * K_RANKS ))                # edge_pq_list
     per=$(( per + 4 ))                              # exact ||v||^2
   fi
+  if [ "$BUILD_RQ" = "1" ]; then
+    per=$(( per + R_FIN * RQ_PER_EDGE ))            # edge_rq_list
+  fi
   echo "$per"
 }
 
@@ -161,6 +211,7 @@ device_per_slot() {
   local per=$(( PADDED * 2 + R_INT * 6 + 1 + 4 + 1 ))
   [ "$BUILD_LSH" = "1" ] && per=$(( per + R_INT * K_RANKS * PACKED_BYTES + R_INT * 2 ))
   [ "$BUILD_PQ"  = "1" ] && per=$(( per + R_INT * K_RANKS ))
+  [ "$BUILD_RQ"  = "1" ] && per=$(( per + R_INT * RQ_PER_EDGE ))
   echo "$per"
 }
 
@@ -170,6 +221,7 @@ merge_job_per_node() {
   local per=$(( R_INT * 6 + 1 + 4 ))
   [ "$BUILD_LSH" = "1" ] && per=$(( per + R_INT * K_RANKS * PACKED_BYTES + R_INT * 2 ))
   [ "$BUILD_PQ"  = "1" ] && per=$(( per + R_INT * K_RANKS ))
+  [ "$BUILD_RQ"  = "1" ] && per=$(( per + R_INT * RQ_PER_EDGE ))
   echo "$per"
 }
 
@@ -193,6 +245,7 @@ query_resident_per_node() {
   local per=$(( PADDED * 2 + R_FIN * 6 + 1 + 4 ))
   [ "$BUILD_LSH" = "1" ] && per=$(( per + R_FIN * K_RANKS * PACKED_BYTES + R_FIN * 2 ))
   [ "$BUILD_PQ"  = "1" ] && per=$(( per + R_FIN * K_RANKS + 4 ))
+  [ "$BUILD_RQ"  = "1" ] && per=$(( per + R_FIN * RQ_PER_EDGE ))
   echo "$per"
 }
 
@@ -208,6 +261,7 @@ disk_per_vec() {
     per=$(( per + R_FIN * K_RANKS * PACKED_BYTES + R_FIN * 2 ))
   fi
   if [ "$BUILD_PQ" = "1" ]; then per=$(( per + R_FIN * K_RANKS + 4 )); fi
+  if [ "$BUILD_RQ" = "1" ]; then per=$(( per + R_FIN * RQ_PER_EDGE )); fi
   echo "$per"
 }
 
@@ -233,6 +287,12 @@ n_parts_for() {
   if [ "$N_PARTS" != "0" ]; then echo "$N_PARTS"; return; fi
   target=$(( $(max_shard) * SHARD_FILL / 100 ))
   [ "$target" -lt 1 ] && { echo 0; return; }   # nothing fits on the device
+  # A shard can never hold more than n DISTINCT vectors — the n_dup duplicates
+  # collapse when they land in the same shard — so the n*N_DUP work estimate
+  # only binds once it is actually spread across parts. Without this check a
+  # dataset that fits whole on the device still gets split, purely because
+  # n*N_DUP exceeds the target, which costs recall for nothing.
+  if [ "$n" -le "$target" ]; then echo 1; return; fi
   p=$(( (n * N_DUP + target - 1) / target ))
   [ "$p" -lt 1 ] && p=1
   [ "$p" -gt "$cap" ] && p=$cap
@@ -310,7 +370,8 @@ disk_avail_bytes() { df -B1 --output=avail "$1" 2>/dev/null | tail -1 | tr -d ' 
 echo "=== deep scaling ladder ==="
 echo "  host:        $(hostname)"
 echo "  scales:      $SCALES"
-echo "  estimators:  $ESTIMATORS (lsh=$BUILD_LSH pq=$BUILD_PQ, k_ranks=$K_RANKS)"
+echo "  estimators:  $ESTIMATORS (lsh=$BUILD_LSH pq=$BUILD_PQ rq=$BUILD_RQ,"
+echo "               k_ranks=$K_RANKS$([ "$BUILD_RQ" = "1" ] && echo ", rq_dim=$RQ_DIM @ ${RQ_PER_EDGE}B/edge"))"
 echo "  degrees:     R_int=$R_INT R_fin=$R_FIN  n_dup=$N_DUP  alpha=$ALPHA"
 echo "  distance:    $DIST   dim=$DIM (packed_t=${PACKED_BYTES}B)"
 echo "  query modes: $QUERY_MODES   (k = $K, in that order)"
@@ -321,6 +382,9 @@ mkdir -p "$WORK" "$LOGDIR"
 MEM_TOTAL=$(mem_total_bytes)
 MEM_AVAIL=$(mem_available_bytes)
 DISK_AVAIL=$(disk_avail_bytes "$WORK")
+if [ "$DISK_BUDGET" != "0" ]; then
+  DISK_AVAIL=$(( DISK_BUDGET * 1073741824 ))
+fi
 DEVICE_FREE_BYTES=$(resolve_device_free)
 WORKSPACE_BYTES=$(parse_size "$WORKSPACE_BUDGET")
 MAX_SHARD=$(max_shard)
@@ -337,6 +401,20 @@ echo "               workspace + 4 GiB slack"
 echo "  max_shard:   $(mnodes "$MAX_SHARD") nodes at $(device_per_slot) B/slot"
 echo "               -> aiming for $(mnodes $(( MAX_SHARD * SHARD_FILL / 100 )))/shard (${SHARD_FILL}% fill)"
 echo
+
+# $WORK under /tmp is wiped at job end on this cluster, so an index built in one
+# job is gone before a second job could query it.
+case "$WORK" in
+  /tmp/*|/var/tmp/*) WORK_EPHEMERAL=1;;
+  *)                 WORK_EPHEMERAL=0;;
+esac
+if [ "$WORK_EPHEMERAL" = "1" ] && [ "$STAGE_MODE" != "build+query" ]; then
+  echo "STAGE_MODE=$STAGE_MODE with WORK=$WORK cannot work: /tmp is cleared when" >&2
+  echo "the job ends, so a build-only job leaves nothing for a query-only job to" >&2
+  echo "find. Either keep STAGE_MODE=build+query (the default), or point WORK= at" >&2
+  echo "persistent storage with room for the index." >&2
+  exit 2
+fi
 
 [ "$MAX_SHARD" -gt 0 ] || {
   echo "Nothing fits on the device: $(device_per_slot) B/slot leaves no room after" >&2
@@ -439,7 +517,8 @@ if [ "$DRY_RUN" != "0" ]; then
   echo "                      largest stage needs to fit on disk at once"
   echo "  WORK=<big fs>       somewhere with room; df -h to find one"
   echo "  ESTIMATORS=pq       drops the LSH trailer (PQ beat LSH by 2x on"
-  echo "                      text2image at less bytes/node)"
+  echo "                      text2image at less bytes/node); rq is the"
+  echo "                      biggest of the three, so drop it first at 1B"
   echo "  SHARD_FILL=40       smaller shards: less gather+merge RAM, some recall"
   echo "  WORKSPACE_BUDGET=5GB  bigger max_shard, so fewer shards"
   echo
@@ -511,6 +590,7 @@ run_stage() {
   local est_arg=()
   [ "$BUILD_LSH" = "1" ] && est_arg+=(--lsh)
   [ "$BUILD_PQ"  = "1" ] && est_arg+=(--pq)
+  [ "$BUILD_RQ"  = "1" ] && est_arg+=(--rabitq)
 
   if [ "$do_build" = "0" ]; then
     [ -s "$idx" ] || { echo "  STAGE_MODE=query but no index at $idx"; return 1; }
@@ -523,7 +603,7 @@ run_stage() {
         -f "$base" -t "$SRC_DTYPE" -d "$DIST" --dim "$DIM" \
         --r_intermediate "$R_INT" --r_final "$R_FIN" \
         --n_parts "$p" --n_dup "$N_DUP" -a "$ALPHA" \
-        -w "$WORKSPACE_BUDGET" "${est_arg[@]}" --k_ranks "$K_RANKS" \
+        -w "$WORKSPACE_BUDGET" ${est_arg[@]+"${est_arg[@]}"} --k_ranks "$K_RANKS" \
         -i "$idx" 2>&1 | tee -a "$log" \
       || { echo "  BUILD FAILED for $s (see $log)"; return 1; }
     echo "  [$( stamp )] built, $(gib "$(stat -c %s "$idx")") GiB on disk"
@@ -583,14 +663,17 @@ run_stage() {
              mode_arg=(--lsh --prepopulated --k_ranks "$K_RANKS");;
         pq)  [ "$BUILD_PQ" = "1" ]  || { echo "  skip pq query (not built)"; continue; }
              mode_arg=(--pq --prepopulated --k_ranks "$K_RANKS");;
+        rq|rabitq)
+             [ "$BUILD_RQ" = "1" ]  || { echo "  skip rq query (not built)"; continue; }
+             mode_arg=(--rabitq --prepopulated --k_ranks "$K_RANKS");;
         *) echo "  unknown query mode: $mode"; continue;;
       esac
       echo "  [$( stamp )] query: $mode (k=$kk)"
       # A failure here is usually the ground truth: read_groundtruth rejects a k
       # larger than the file's own gt_k. Non-fatal, the next k still runs.
       ./build/bin/run_query -i "$idx" --dim "$DIM" -d "$DIST" -t "$SRC_DTYPE" \
-          -n "$R_FIN" -k "$kk" "${mode_arg[@]}" "${host_arg[@]}" \
-          -q "$QUERIES" "${gt_arg[@]}" --beam_limits $BEAM_LIMITS 2>&1 \
+          -n "$R_FIN" -k "$kk" ${mode_arg[@]+"${mode_arg[@]}"} ${host_arg[@]+"${host_arg[@]}"} \
+          -q "$QUERIES" ${gt_arg[@]+"${gt_arg[@]}"} --beam_limits $BEAM_LIMITS 2>&1 \
         | tee -a "$log" \
         | grep -E "beam_width|Recall|prerotated|rotating queries|trailer" \
         || echo "  QUERY FAILED ($mode, k=$kk) — see $log"

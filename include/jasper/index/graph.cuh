@@ -613,15 +613,17 @@ struct graph {
     g.n_segments = (n_vector_slots + vectors_per_segment - 1) / vectors_per_segment;
     g.on_host = on_host;
 
+    // What segment_t::allocate actually reserves here. The directional payload
+    // buffers (edge_lshs / edge_pqs / edge_rqs) are NOT included: they are
+    // allocated lazily by the first populate_edge_* call, so counting them here
+    // reports a total that never exists and can exceed the device — which is
+    // exactly the confusion this print used to cause. They are listed
+    // separately as "if populated" so the ceiling is still visible.
     const size_t padded_dim = vector_view_t::pad(dim);
-    size_t bytes_per_segment =
+    const size_t bytes_per_segment =
         static_cast<size_t>(vectors_per_segment) * sizeof(edge_list_t)
       + static_cast<size_t>(vectors_per_segment) * sizeof(uint8_t)
       + static_cast<size_t>(vectors_per_segment) * padded_dim * sizeof(data_t);
-    if constexpr (use_lsh) {
-      bytes_per_segment +=
-          static_cast<size_t>(vectors_per_segment) * sizeof(edge_lsh_list_t);
-    }
     const size_t total_bytes = bytes_per_segment * g.n_segments;
 
     std::cout << "[graph::allocate]: " << g.n_segments << " segments x "
@@ -630,10 +632,11 @@ struct graph {
               << (total_bytes / (1ull << 30)) << " GB) on "
               << (on_host ? "host" : "device");
     if constexpr (use_lsh) {
-      std::cout << " (LSH enabled, +"
-                << (static_cast<size_t>(vectors_per_segment)
-                    * sizeof(edge_lsh_list_t) / (1ull << 20))
-                << " MB/segment for edge_lsh_list)";
+      constexpr size_t VPS = vectors_per_segment;
+      std::cout << "; lazily, per segment if populated: lsh +"
+                << (VPS * sizeof(edge_lsh_list_t) / (1ull << 20)) << " MB, pq +"
+                << (VPS * sizeof(edge_pq_list_t)  / (1ull << 20)) << " MB, rq +"
+                << (VPS * sizeof(edge_rq_list_t)  / (1ull << 20)) << " MB";
     }
     std::cout << "\n";
 
@@ -1996,6 +1999,12 @@ __host__ void save_graph_to_file(const graph<graph_cfg>& g,
 // it locates the block from EOF so a reader that cannot size the estimator
 // blocks (a non-directional config) can still find out which space the stored
 // vectors are in.
+//
+// Block order on disk is lsh (bit 0), pq (bit 1), norms (bit 2), rabitq
+// (bit 4), rotation (bit 3, last). New blocks append just before rotation, so
+// a reader that predates them stops after the blocks it knows and never reads
+// into the ones it doesn't — which is why bit 4 sits after bit 3 numerically
+// but before it on disk.
 inline constexpr uint32_t DIRECTIONAL_TRAILER_MAGIC   = 0x484C5344u;  // arbitrary sentinel
 inline constexpr uint32_t DIRECTIONAL_TRAILER_VERSION = 1u;
 
@@ -2123,8 +2132,10 @@ struct directional_graph_bundle {
   graph<graph_cfg> g{};
   bool has_lsh = false;
   bool has_pq  = false;
+  bool has_rq  = false;
   lsh_globals<graph_cfg::k_ranks> globals{};
   pq_codebooks<graph_cfg::pq_m, graph_cfg::pq_k> codebooks{};
+  rq_globals<graph_cfg::rq_dim, graph_cfg::rq_bits> rq{};
   directional_rotation_info rotation{};   // .known == false for older files
 };
 
@@ -2134,7 +2145,8 @@ __host__ void save_directional_graph_to_file(
     const lsh_globals<graph_cfg::k_ranks>* globals,                  // nullptr if LSH not built
     const pq_codebooks<graph_cfg::pq_m, graph_cfg::pq_k>* codebooks, // nullptr if PQ not built
     std::string output_fname,
-    directional_rotation_info rotation = directional_rotation_info{})
+    directional_rotation_info rotation = directional_rotation_info{},
+    const rq_globals<graph_cfg::rq_dim, graph_cfg::rq_bits>* rq_globals_in = nullptr)
 {
   static_assert(graph_cfg::use_lsh,
                 "save_directional_graph_to_file requires graph_cfg::use_lsh");
@@ -2142,6 +2154,7 @@ __host__ void save_directional_graph_to_file(
   using segment_t       = graph_segment<graph_cfg>;
   using edge_lsh_list_t = typename graph_cfg::edge_lsh_list_t;
   using edge_pq_list_t  = typename graph_cfg::edge_pq_list_t;
+  using edge_rq_list_t  = typename graph_cfg::edge_rq_list_t;
   constexpr uint32_t vectors_per_segment = graph_cfg::vectors_per_segment;
 
   // Base section: identical bytes to save_graph_to_file, so old loaders (and
@@ -2171,7 +2184,8 @@ __host__ void save_directional_graph_to_file(
   const bool has_lsh   = globals != nullptr && h_segments[0].edge_lshs != nullptr;
   const bool has_pq    = codebooks != nullptr && h_segments[0].edge_pqs != nullptr;
   const bool has_norms = g.d_vector_norms != nullptr;
-  if (!has_lsh && !has_pq && !has_norms && !rotation.known) return;
+  const bool has_rq    = rq_globals_in != nullptr && h_segments[0].edge_rqs != nullptr;
+  if (!has_lsh && !has_pq && !has_norms && !has_rq && !rotation.known) return;
 
   std::ofstream outFile(output_fname, std::ios::binary | std::ios::app);
   if (!outFile.is_open())
@@ -2181,7 +2195,7 @@ __host__ void save_directional_graph_to_file(
   outFile.write(reinterpret_cast<const char*>(&DIRECTIONAL_TRAILER_MAGIC),   sizeof(uint32_t));
   outFile.write(reinterpret_cast<const char*>(&DIRECTIONAL_TRAILER_VERSION), sizeof(uint32_t));
   const uint8_t flags = (has_lsh ? 1u : 0u) | (has_pq ? 2u : 0u) | (has_norms ? 4u : 0u)
-                      | (rotation.known ? 8u : 0u);
+                      | (rotation.known ? 8u : 0u) | (has_rq ? 16u : 0u);
   outFile.write(reinterpret_cast<const char*>(&flags), sizeof(uint8_t));
 
   if (has_lsh) {
@@ -2251,6 +2265,32 @@ __host__ void save_directional_graph_to_file(
                   static_cast<std::streamsize>(h_norms.size() * sizeof(float)));
   }
 
+  if (has_rq) {
+    const uint32_t rq_dim_u32  = graph_cfg::rq_dim;
+    const uint32_t rq_bits_u32 = graph_cfg::rq_bits;
+    outFile.write(reinterpret_cast<const char*>(&rq_dim_u32),  sizeof(uint32_t));
+    outFile.write(reinterpret_cast<const char*>(&rq_bits_u32), sizeof(uint32_t));
+    outFile.write(reinterpret_cast<const char*>(rq_globals_in),
+                  sizeof(rq_globals<graph_cfg::rq_dim, graph_cfg::rq_bits>));
+
+    edge_rq_list_t* h_scratch = nullptr;
+    if (!g.on_host)
+      cudaMallocHost(&h_scratch, sizeof(edge_rq_list_t) * vectors_per_segment);
+    for (uint32_t s = 0; s < g.n_segments; s++) {
+      const segment_t& seg       = h_segments[s];
+      const uint32_t   seg_count = static_cast<uint32_t>(seg.n_vectors);
+      const edge_rq_list_t* src  = seg.edge_rqs;
+      if (!g.on_host) {
+        cudaMemcpy(h_scratch, src, sizeof(edge_rq_list_t) * seg_count,
+                  cudaMemcpyDeviceToHost);
+        src = h_scratch;
+      }
+      outFile.write(reinterpret_cast<const char*>(src),
+                    sizeof(edge_rq_list_t) * seg_count);
+    }
+    if (!g.on_host) cudaFreeHost(h_scratch);
+  }
+
   // Last, so a reader that doesn't know flag bit 3 never reads into it.
   if (rotation.known) {
     const uint8_t rot = rotation.prerotate ? 1u : 0u;
@@ -2262,7 +2302,7 @@ __host__ void save_directional_graph_to_file(
 
   std::cout << "Appended directional trailer to " << output_fname
             << " (lsh=" << has_lsh << ", pq=" << has_pq
-            << ", norms=" << has_norms;
+            << ", rq=" << has_rq << ", norms=" << has_norms;
   if (rotation.known)
     std::cout << ", prerotate=" << rotation.prerotate
               << " seed=" << rotation.seed;
@@ -2281,6 +2321,7 @@ __host__ directional_graph_bundle<graph_cfg> load_directional_graph_from_file(
   using segment_t       = graph_segment<graph_cfg>;
   using edge_lsh_list_t = typename graph_cfg::edge_lsh_list_t;
   using edge_pq_list_t  = typename graph_cfg::edge_pq_list_t;
+  using edge_rq_list_t  = typename graph_cfg::edge_rq_list_t;
   constexpr uint32_t vectors_per_segment = graph_cfg::vectors_per_segment;
 
   directional_graph_bundle<graph_cfg> bundle;
@@ -2320,6 +2361,7 @@ __host__ directional_graph_bundle<graph_cfg> load_directional_graph_from_file(
   const bool file_has_pq       = flags & 2u;
   const bool file_has_norms    = flags & 4u;
   const bool file_has_rotation = flags & 8u;
+  const bool file_has_rq       = flags & 16u;
 
   std::vector<segment_t> h_segments(bundle.g.segments.begin(), bundle.g.segments.end());
 
@@ -2397,13 +2439,6 @@ __host__ directional_graph_bundle<graph_cfg> load_directional_graph_from_file(
     bundle.has_pq = true;
   }
 
-  // The allocate_edge_lsh()/allocate_edge_pq() calls above only mutate the
-  // host-side `h_segments` copy's pointers; re-upload once so the device-
-  // resident segment structs (what device_view actually reads) see them.
-  if (file_has_lsh || file_has_pq) {
-    bundle.g.segments = thrust::device_vector<segment_t>(h_segments.begin(), h_segments.end());
-  }
-
   if (file_has_norms) {
     std::vector<float> h_norms(static_cast<size_t>(bundle.g.n_vectors));
     inFile.read(reinterpret_cast<char*>(h_norms.data()),
@@ -2411,6 +2446,55 @@ __host__ directional_graph_bundle<graph_cfg> load_directional_graph_from_file(
     cudaMalloc(&bundle.g.d_vector_norms, h_norms.size() * sizeof(float));
     cudaMemcpy(bundle.g.d_vector_norms, h_norms.data(),
                h_norms.size() * sizeof(float), cudaMemcpyHostToDevice);
+  }
+
+  if (file_has_rq) {
+    uint32_t rq_dim_u32 = 0, rq_bits_u32 = 0;
+    inFile.read(reinterpret_cast<char*>(&rq_dim_u32),  sizeof(uint32_t));
+    inFile.read(reinterpret_cast<char*>(&rq_bits_u32), sizeof(uint32_t));
+    if (rq_dim_u32 != graph_cfg::rq_dim || rq_bits_u32 != graph_cfg::rq_bits) {
+      throw std::runtime_error(
+          "load_directional_graph_from_file: RaBitQ trailer rq_dim/rq_bits "
+          "mismatch — file has " + std::to_string(rq_dim_u32) + "/" +
+          std::to_string(rq_bits_u32) + ", this config wants " +
+          std::to_string(graph_cfg::rq_dim) + "/" +
+          std::to_string(graph_cfg::rq_bits) + " (rq_dim = 8 * k_ranks)");
+    }
+    inFile.read(reinterpret_cast<char*>(&bundle.rq),
+                sizeof(rq_globals<graph_cfg::rq_dim, graph_cfg::rq_bits>));
+
+    for (auto& seg : h_segments) seg.allocate_edge_rq();  // no-op if allocated
+
+    edge_rq_list_t* h_scratch = nullptr;
+    if (!on_host)
+      cudaMallocHost(&h_scratch, sizeof(edge_rq_list_t) * vectors_per_segment);
+    for (uint32_t s = 0; s < bundle.g.n_segments; s++) {
+      segment_t&     seg       = h_segments[s];
+      const uint32_t seg_count = static_cast<uint32_t>(seg.n_vectors);
+      const std::streamsize want =
+          static_cast<std::streamsize>(seg_count) * sizeof(edge_rq_list_t);
+      if (on_host) {
+        inFile.read(reinterpret_cast<char*>(seg.edge_rqs), want);
+      } else {
+        inFile.read(reinterpret_cast<char*>(h_scratch), want);
+        cudaMemcpy(seg.edge_rqs, h_scratch, want, cudaMemcpyHostToDevice);
+      }
+      if (!inFile)
+        throw std::runtime_error(
+            "load_directional_graph_from_file: RaBitQ block flagged but "
+            "truncated in " + input_fname);
+    }
+    if (!on_host) cudaFreeHost(h_scratch);
+    bundle.has_rq = true;
+  }
+
+  // The allocate_edge_* calls above only mutate the host-side `h_segments`
+  // copy's pointers; re-upload once so the device-resident segment structs
+  // (what device_view actually reads) see them. Must come after every block
+  // that can allocate, which is why it sits below the RaBitQ read rather than
+  // next to the LSH/PQ ones.
+  if (file_has_lsh || file_has_pq || file_has_rq) {
+    bundle.g.segments = thrust::device_vector<segment_t>(h_segments.begin(), h_segments.end());
   }
 
   if (file_has_rotation) {
@@ -2432,7 +2516,7 @@ __host__ directional_graph_bundle<graph_cfg> load_directional_graph_from_file(
 
   std::cout << "Loaded directional trailer from " << input_fname
             << " (lsh=" << bundle.has_lsh << ", pq=" << bundle.has_pq
-            << ", norms=" << file_has_norms;
+            << ", rq=" << bundle.has_rq << ", norms=" << file_has_norms;
   if (bundle.rotation.known)
     std::cout << ", prerotate=" << bundle.rotation.prerotate
               << " seed=" << bundle.rotation.seed;

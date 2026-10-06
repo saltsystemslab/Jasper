@@ -909,12 +909,14 @@ void load_and_bench_pq(const std::string& index_path,
 }
 
 // ── Load graph + encode edges with RaBitQ + run the benchmark ──
-// Unlike --lsh/--pq there is no trailer support yet, so the codes are always
-// built at load time. Rotation is mandatory rather than optional: the RaBitQ
-// code quantizes the residual's first rq_dim coordinates, which is the random
-// projection P_d only in a rotated basis (see rabitq/edge_rq.cuh). Without it
-// the search still runs and just returns quietly worse results, so reject it
-// here.
+// Rotation is mandatory rather than optional: the RaBitQ code quantizes the
+// residual's first rq_dim coordinates, which is the random projection P_d only
+// in a rotated basis (see rabitq/edge_rq.cuh). Without it the search still runs
+// and just returns quietly worse results, so reject it here.
+//
+// --prepopulated reads the codes from the index's directional trailer
+// (create_diskann_index --rabitq) instead of rebuilding them; the stored
+// vectors are then already rotated, so only the queries need it.
 template <typename GraphCfg, typename DataT>
 void load_and_bench_rq(const std::string& index_path,
                        const std::string& query_path,
@@ -925,6 +927,7 @@ void load_and_bench_rq(const std::string& index_path,
                        uint64_t rotate_seed,
                        bool do_rotate,
                        bool on_host,
+                       bool prepopulated,
                        const std::vector<std::pair<uint32_t, uint32_t>>& beam_limit_pairs) {
 
   if (!do_rotate)
@@ -938,29 +941,49 @@ void load_and_bench_rq(const std::string& index_path,
         "; lower --k_ranks");
 
   std::cout << "Loading index..." << std::endl;
-  auto graph = jasper::load_graph_from_file<GraphCfg>(index_path, dim, on_host);
-  // load_graph_from_file doesn't build the forward stable_id -> slot table
-  // (see graph.cuh) — rebuild it here (device-resident graphs only).
-  if (!on_host) jasper::rebuild_id_map<GraphCfg>(graph);
-  std::cout << "  " << graph.n_vectors << " vectors, dim=" << graph.dim << std::endl;
+  jasper::graph<GraphCfg> graph{};
+  jasper::rq_globals<GraphCfg::rq_dim, GraphCfg::rq_bits> rq_globals{};
 
-  // Rotate stored vectors, then build the codes in that basis. Distance-
-  // preserving, so graph edges are unaffected.
-  std::cout << "Rotating stored vectors (seed=" << rotate_seed << ")..." << std::endl;
-  rotate_graph_vectors<GraphCfg>(graph, rotate_seed);
-  cudaDeviceSynchronize();
+  if (prepopulated) {
+    auto bundle = jasper::load_directional_graph_from_file<GraphCfg>(
+        index_path, dim, on_host);
+    if (!bundle.has_rq)
+      throw std::runtime_error(
+          "--prepopulated: " + index_path + " has no RaBitQ artifacts in its "
+          "directional trailer (build it with create_diskann_index --rabitq, "
+          "or drop --prepopulated to populate at load time)");
+    graph      = std::move(bundle.g);
+    rq_globals = bundle.rq;
+    if (bundle.has_pq) bundle.codebooks.free();   // not used on this path
+    if (!on_host) jasper::rebuild_id_map<GraphCfg>(graph);
+    std::cout << "  " << graph.n_vectors << " vectors, dim=" << graph.dim
+              << " (RaBitQ codes read from trailer)" << std::endl;
+    apply_trailer_rotation(bundle.rotation, do_rotate, rotate_seed);
+  } else {
+    graph = jasper::load_graph_from_file<GraphCfg>(index_path, dim, on_host);
+    // load_graph_from_file doesn't build the forward stable_id -> slot table
+    // (see graph.cuh) — rebuild it here (device-resident graphs only).
+    if (!on_host) jasper::rebuild_id_map<GraphCfg>(graph);
+    std::cout << "  " << graph.n_vectors << " vectors, dim=" << graph.dim << std::endl;
 
-  auto rq_globals = graph.generate_rq_globals();
-  std::cout << "Populating edge RaBitQ codes (rq_dim=" << GraphCfg::rq_dim
-            << ", rq_bits=" << GraphCfg::rq_bits << ")..." << std::endl;
-  auto t0 = std::chrono::steady_clock::now();
-  graph.populate_edge_rq(rq_globals);
-  cudaDeviceSynchronize();
-  CUDA_CHECK(cudaGetLastError());
-  auto t1 = std::chrono::steady_clock::now();
-  std::cout << "  populate_edge_rq:     "
-            << std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count()
-            << " ms\n";
+    // Rotate stored vectors, then build the codes in that basis. Distance-
+    // preserving, so graph edges are unaffected.
+    std::cout << "Rotating stored vectors (seed=" << rotate_seed << ")..." << std::endl;
+    rotate_graph_vectors<GraphCfg>(graph, rotate_seed);
+    cudaDeviceSynchronize();
+
+    rq_globals = graph.generate_rq_globals();
+    std::cout << "Populating edge RaBitQ codes (rq_dim=" << GraphCfg::rq_dim
+              << ", rq_bits=" << GraphCfg::rq_bits << ")..." << std::endl;
+    auto t0 = std::chrono::steady_clock::now();
+    graph.populate_edge_rq(rq_globals);
+    cudaDeviceSynchronize();
+    CUDA_CHECK(cudaGetLastError());
+    auto t1 = std::chrono::steady_clock::now();
+    std::cout << "  populate_edge_rq:     "
+              << std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count()
+              << " ms\n";
+  }
 
   // Load queries, casting src_dtype -> DataT (__half)
   std::cout << "Loading queries..." << std::endl;
@@ -1229,11 +1252,11 @@ int main(int argc, char** argv) {
   program.add_argument("--prepopulated")
     .default_value(false)
     .implicit_value(true)
-    .help("Read the LSH/PQ codes and calibration from the index's directional "
-          "trailer (create_diskann_index --lsh/--pq) instead of computing them "
-          "at load time. The stored vectors are then already rotated, so only "
-          "the queries are rotated — pass the build's --prerotate_seed as "
-          "--rotate_seed.");
+    .help("Read the LSH/PQ/RaBitQ codes and calibration from the index's "
+          "directional trailer (create_diskann_index --lsh/--pq/--rabitq) "
+          "instead of computing them at load time. The stored vectors are then "
+          "already rotated, so only the queries are rotated — pass the build's "
+          "--prerotate_seed as --rotate_seed.");
 
   program.add_argument("--no_rotate")
     .default_value(false)
@@ -1280,12 +1303,6 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  if (use_rq && prepopulated) {
-    std::cerr << "Error: --rabitq does not read from the directional trailer "
-                 "yet; drop --prepopulated (codes are built at load time)"
-              << std::endl;
-    return 1;
-  }
 
   std::vector<std::pair<uint32_t, uint32_t>> beam_limit_pairs;
   try {
@@ -1340,7 +1357,8 @@ int main(int argc, char** argv) {
           std::cout << "  Config: " #id << std::endl;                          \
           load_and_bench_rq<cfg_##id, DAT>(                                    \
               index_path, query_path, gt_path, datatype,                       \
-              dim, k, rotate_seed, !no_rotate, on_host, beam_limit_pairs);    \
+              dim, k, rotate_seed, !no_rotate, on_host, prepopulated,          \
+              beam_limit_pairs);                                               \
           dispatched = true;                                                   \
         }
 

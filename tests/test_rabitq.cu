@@ -496,6 +496,29 @@ TEST_F(EdgeRqLayoutTest, TwoBitLevelsPackFourPerByte) {
   EXPECT_EQ(row.get_level(1, 3), 3u);
 }
 
+// The plane stride IS the neighbor count, which changes between the DiskANN
+// builder's R_int and R_fin rows. At rq_dim=32 there is only one plane and the
+// stride never shows; at 128 there are four, and a byte-wise row copy between
+// two degrees would misplace every plane past the first. copy_rq_edge goes
+// through get_word/set_word for exactly this reason.
+TEST_F(EdgeRqLayoutTest, WordPlanesAreStridedByNeighborCount) {
+  using narrow_t = edge_rq_list<uint32_t, 32, 128, 1>;
+  using wide_t   = edge_rq_list<uint32_t, 64, 128, 1>;
+  static_assert(narrow_t::n_words == 4 && wide_t::n_words == 4,
+                "expected 4 planes at rq_dim=128, rq_bits=1");
+
+  narrow_t a{};
+  wide_t   b{};
+  for (uint32_t w = 0; w < narrow_t::n_words; w++) a.set_word(7, w, 0x1000u + w);
+  for (uint32_t w = 0; w < narrow_t::n_words; w++) b.set_word(3, w, a.get_word(7, w));
+  for (uint32_t w = 0; w < wide_t::n_words; w++)
+    EXPECT_EQ(b.get_word(3, w), 0x1000u + w) << "plane " << w;
+
+  // Plane 1 of edge 0 really does sit at a different offset in the two layouts.
+  EXPECT_EQ(&a.code[1 * 32] - &a.code[0], 32);
+  EXPECT_EQ(&b.code[1 * 64] - &b.code[0], 64);
+}
+
 TEST_F(EdgeRqLayoutTest, CbMatchesBitWidth) {
   EXPECT_FLOAT_EQ((rq_globals<32, 1>::cb()), -0.5f);
   EXPECT_FLOAT_EQ((rq_globals<32, 2>::cb()), -1.5f);

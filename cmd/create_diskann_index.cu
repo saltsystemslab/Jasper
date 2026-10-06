@@ -38,11 +38,23 @@ JASPER_FOR_EACH_CONFIG(DECLARE_CONFIGS)
 // run_query do it: uint8_t carries a 7-bit coordinate index (dim <= 128),
 // uint16_t a 15-bit one (dim > 128).
 //
-// Only k_ranks = 4 is compiled in. Every entry here instantiates the whole
-// construct + populate + merge stack twice (INT and FIN), in one translation
-// unit; adding a k_ranks dimension doubles that. If you need another value, add
-// the rows and expect the build to get slower — or split this file per config
-// the way ffi/ does.
+// Every entry here instantiates the whole construct + populate + merge stack
+// twice (INT and FIN), in one translation unit, so rows are expensive. At R=64
+// the set is deliberately sparse: k_ranks=4 for both metrics and both packings,
+// plus ONE k16 row.
+//
+// That lone d_r64_64_l2_k16_dbig is not an oversight and its missing ip twin is
+// not either. It exists for high-dimensional L2 data (the 768-dim SRA/locale
+// sets), where k_ranks=4 means RaBitQ projects onto rq_dim = 8*4 = 32 of 768
+// coordinates — a 24x reduction whose cosine error is ~1/sqrt(32). k16 gives
+// rq_dim=128 instead. run_query already compiles the matching
+// lsh_f16_r64_l2_k16_d32678, so this row is what makes that pair usable end to
+// end; the ip side has no such dataset yet and would cost the same again.
+//
+// Before adding more: check BOTH tables. create_diskann_index and run_query are
+// independent, and at dim > 128 run_query has no R=32 rows at all — so a
+// combination can build and then be unqueryable. sbatch/bench_locale.sbatch
+// greps both tables and rejects the mismatch up front.
 //
 // Note k_ranks doubles as the PQ subquantizer count M (graph_config::pq_m), and
 // --pq requires padded_dim % M == 0.
@@ -63,7 +75,8 @@ JASPER_FOR_EACH_CONFIG(DECLARE_CONFIGS)
   X(d_r64_64_l2_k4_d128,   uint32_t, 64, 64, __half, float, jasper::distance_func::L2,            4, uint8_t)  \
   X(d_r64_64_l2_k4_dbig,   uint32_t, 64, 64, __half, float, jasper::distance_func::L2,            4, uint16_t) \
   X(d_r64_64_ip_k4_d128,   uint32_t, 64, 64, __half, float, jasper::distance_func::INNER_PRODUCT, 4, uint8_t)  \
-  X(d_r64_64_ip_k4_dbig,   uint32_t, 64, 64, __half, float, jasper::distance_func::INNER_PRODUCT, 4, uint16_t)
+  X(d_r64_64_ip_k4_dbig,   uint32_t, 64, 64, __half, float, jasper::distance_func::INNER_PRODUCT, 4, uint16_t) \
+  X(d_r64_64_l2_k16_dbig,  uint32_t, 64, 64, __half, float, jasper::distance_func::L2,            16, uint16_t)
 
 #define DECLARE_DIR_CONFIGS(id, IDX, RINT, RFIN, DAT, DIST, FUNC, KR, PACKEDT)           \
   using int_cfg_##id = jasper::graph_construct_config<                                    \
@@ -158,8 +171,10 @@ void construct(
   if (opts.rotating()) {
     std::cout << "\n  This index is in a ROTATED space (seed "
               << opts.prerotate_seed << "), recorded in the file — readers "
-                 "rotate queries to match on their own:\n"
-              << "      run_query ... --lsh --prepopulated\n";
+                 "rotate queries to match on their own:\n";
+    if (opts.build_lsh) std::cout << "      run_query ... --lsh    --prepopulated\n";
+    if (opts.build_pq)  std::cout << "      run_query ... --pq     --prepopulated\n";
+    if (opts.build_rq)  std::cout << "      run_query ... --rabitq --prepopulated\n";
   }
 
   ig.dir.free_models();   // releases the PQ codebooks' device memory
@@ -205,8 +220,9 @@ void dispatch(
 {
   if (opts.any()) {
     if (dim == 0)
-      throw std::runtime_error("--lsh/--pq require --dim (it selects the packed "
-                               "word width: uint8 for dim <= 128, uint16 above)");
+      throw std::runtime_error("--lsh/--pq/--rabitq require --dim (it selects "
+                               "the packed word width: uint8 for dim <= 128, "
+                               "uint16 above)");
 
     #define TRY_DIR_DISPATCH(id, IDX, RINT, RFIN, DAT, DIST, FUNC, KR, PACKEDT)          \
       if (dir_config_matches<FUNC, KR, PACKEDT>(datatype, distance, r_int, r_final,      \
@@ -313,10 +329,19 @@ int main(int argc, char** argv) {
     .help("Populate per-edge PQ codes + exact vector norms and write them in "
           "the index trailer (enables pq_search). Can be combined with --lsh.");
 
+  program.add_argument("--rabitq")
+    .default_value(false).implicit_value(true)
+    .help("Populate per-edge RaBitQ codes over the first rq_dim = 8*k_ranks "
+          "rotated coordinates and write them in the index trailer (enables "
+          "rq_search). Requires the prerotation. Can be combined with "
+          "--lsh/--pq, but note it is the largest of the three payloads.");
+
   program.add_argument("--k_ranks")
     .default_value(uint32_t{4}).scan<'u', uint32_t>()
-    .help("LSH rank count, which is also the PQ subquantizer count M. Only 4 is "
-          "compiled in; --pq additionally needs padded_dim divisible by it.");
+    .help("LSH rank count, also the PQ subquantizer count M and the RaBitQ "
+          "projected dim / 8. Compiled in: 4, 8, 16 at --r_final 32; 4 at "
+          "--r_final 64, plus 16 for l2 with dim > 128. --pq additionally "
+          "needs padded_dim divisible by it.");
 
   program.add_argument("--lsh_samples")
     .default_value(uint32_t{32768}).scan<'u', uint32_t>()
@@ -362,6 +387,7 @@ int main(int argc, char** argv) {
   jasper::diskann_directional_opts opts;
   opts.build_lsh      = program.get<bool>("--lsh");
   opts.build_pq       = program.get<bool>("--pq");
+  opts.build_rq       = program.get<bool>("--rabitq");
   opts.lsh_samples    = program.get<uint32_t>("--lsh_samples");
   opts.pq_train       = program.get<uint32_t>("--pq_train");
   opts.prerotate      = !program.get<bool>("--no_prerotate");
@@ -384,6 +410,7 @@ int main(int argc, char** argv) {
   if (opts.any()) {
     std::cout << "  lsh:              " << (opts.build_lsh ? "true" : "false") << std::endl;
     std::cout << "  pq:               " << (opts.build_pq ? "true" : "false") << std::endl;
+    std::cout << "  rabitq:           " << (opts.build_rq ? "true" : "false") << std::endl;
     std::cout << "  k_ranks:          " << k_ranks << std::endl;
     std::cout << "  dim:              " << dim << std::endl;
     std::cout << "  prerotate:        " << (opts.prerotate ? "true" : "false");

@@ -60,6 +60,7 @@ namespace jasper {
 struct diskann_directional_opts {
   bool     build_lsh   = false;
   bool     build_pq    = false;
+  bool     build_rq    = false;   // RaBitQ; no model to train, see below
   uint32_t lsh_samples = 32768;   // edges sampled to calibrate lsh_globals
   uint64_t lsh_seed    = 42;
   uint32_t pq_train    = 40000;   // residuals sampled to train the codebooks
@@ -74,7 +75,7 @@ struct diskann_directional_opts {
   bool     prerotate      = true;
   uint64_t prerotate_seed = 42;
 
-  __host__ bool any() const { return build_lsh || build_pq; }
+  __host__ bool any() const { return build_lsh || build_pq || build_rq; }
   __host__ bool rotating() const { return any() && prerotate; }
 };
 
@@ -91,6 +92,7 @@ struct diskann_directional_state {
   static constexpr bool enabled = false;
   bool has_lsh = false;
   bool has_pq  = false;
+  bool has_rq  = false;
   __host__ void free_models() {}   // no-op, so callers need no if constexpr
 };
 
@@ -99,21 +101,28 @@ struct diskann_directional_state<FIN_GRAPH_CFG, true> {
   static constexpr bool enabled = true;
   using edge_lsh_t = typename FIN_GRAPH_CFG::edge_lsh_list_t;
   using edge_pq_t  = typename FIN_GRAPH_CFG::edge_pq_list_t;
+  using edge_rq_t  = typename FIN_GRAPH_CFG::edge_rq_list_t;
 
   // Indexed by global id, parallel to diskann_intermediate_graph::edges.
   // Empty unless the corresponding estimator was requested.
   std::vector<edge_lsh_t> edge_lshs;
   std::vector<edge_pq_t>  edge_pqs;
+  std::vector<edge_rq_t>  edge_rqs;
 
   // Exact ||v||² per vector, needed by the PQ L2 estimator.
   std::vector<float> norms;
 
   lsh_globals<FIN_GRAPH_CFG::k_ranks>                    globals{};
   pq_codebooks<FIN_GRAPH_CFG::pq_m, FIN_GRAPH_CFG::pq_k> codebooks{};
+  // RaBitQ has no learned model: rq_globals is a host-side constant (and inert
+  // at rq_bits == 1), so unlike globals/codebooks it needs no sampling pass and
+  // nothing has to be shared across shards.
+  rq_globals<FIN_GRAPH_CFG::rq_dim, FIN_GRAPH_CFG::rq_bits> rq{};
 
   // Set once the arrays are allocated, i.e. "this estimator is being built".
   bool has_lsh = false;
   bool has_pq  = false;
+  bool has_rq  = false;
 
   // Which space the stored vectors ended up in, recorded so the saver can put
   // it in the trailer and readers don't have to be told out of band.
@@ -136,6 +145,7 @@ struct diskann_shard_payload<INT_GRAPH_CFG, true> {
   static constexpr bool enabled = true;
   std::vector<typename INT_GRAPH_CFG::edge_lsh_list_t> lsh;
   std::vector<typename INT_GRAPH_CFG::edge_pq_list_t>  pq;
+  std::vector<typename INT_GRAPH_CFG::edge_rq_list_t>  rq;
 };
 
 // Builds the DiskANN-style merged graph. INT_CFG drives the per-shard build at
@@ -168,6 +178,8 @@ struct diskann_intermediate_graph {
   using fin_edge_lsh_t = typename fin_graph_cfg::edge_lsh_list_t;
   using int_edge_pq_t  = typename int_graph_cfg::edge_pq_list_t;
   using fin_edge_pq_t  = typename fin_graph_cfg::edge_pq_list_t;
+  using int_edge_rq_t  = typename int_graph_cfg::edge_rq_list_t;
+  using fin_edge_rq_t  = typename fin_graph_cfg::edge_rq_list_t;
   using shard_payload_t = diskann_shard_payload<int_graph_cfg>;
 
   static constexpr uint32_t R_INT   = int_graph_cfg::n_neighbors;
@@ -197,6 +209,10 @@ struct diskann_intermediate_graph {
                 "INT_CFG and FIN_CFG must share pq_m");
   static_assert(int_graph_cfg::pq_k == fin_graph_cfg::pq_k,
                 "INT_CFG and FIN_CFG must share pq_k");
+  static_assert(int_graph_cfg::rq_dim == fin_graph_cfg::rq_dim,
+                "INT_CFG and FIN_CFG must share rq_dim");
+  static_assert(int_graph_cfg::rq_bits == fin_graph_cfg::rq_bits,
+                "INT_CFG and FIN_CFG must share rq_bits");
 
   // Final graph, host-resident, vectors excluded. Indexed by global id.
   std::vector<fin_edge_list_t> edges;
@@ -570,6 +586,8 @@ struct diskann_intermediate_graph {
     const int_edge_lsh_t* in_lsh  = nullptr;
     fin_edge_pq_t*        out_pq  = nullptr;
     const int_edge_pq_t*  in_pq   = nullptr;
+    fin_edge_rq_t*        out_rq  = nullptr;
+    const int_edge_rq_t*  in_rq   = nullptr;
   };
 
   // Copy one edge slot's LSH payload between rows of different degree (INT_CFG
@@ -592,6 +610,19 @@ struct diskann_intermediate_graph {
     constexpr uint32_t M = fin_graph_cfg::pq_m;
     for (uint32_t j = 0; j < M; j++)
       dst.set_code(dst_e, j, src.get_code(src_e, j));
+  }
+
+  // Same for RaBitQ. The code planes are word-plane-major — code[w*N + e] — so
+  // N changes with the degree and the rows CANNOT be copied as raw bytes;
+  // get_word/set_word apply each row's own stride. Same trap as copy_pq_edge.
+  template <typename DST_T, typename SRC_T>
+  static inline void copy_rq_edge(DST_T& dst, uint8_t dst_e,
+                                  const SRC_T& src, uint8_t src_e) {
+    constexpr uint32_t W = fin_edge_rq_t::n_words;
+    for (uint32_t w = 0; w < W; w++)
+      dst.set_word(dst_e, w, src.get_word(src_e, w));
+    dst.rescale[dst_e] = src.rescale[src_e];
+    dst.mag_sq[dst_e]  = src.mag_sq[src_e];
   }
 
   // Distance-only merge of one shard neighbor row into the final row for a node.
@@ -699,6 +730,13 @@ struct diskann_intermediate_graph {
           else                 copy_pq_edge(*pay.out_pq, s, *pay.in_pq, sel_slot[s]);
         }
       }
+      if (pay.out_rq != nullptr && pay.in_rq != nullptr) {
+        const fin_edge_rq_t prev = *pay.out_rq;
+        for (uint8_t s = 0; s < sel; s++) {
+          if (sel_src[s] == 0) copy_rq_edge(*pay.out_rq, s, prev, sel_slot[s]);
+          else                 copy_rq_edge(*pay.out_rq, s, *pay.in_rq, sel_slot[s]);
+        }
+      }
     }
   }
 
@@ -725,14 +763,26 @@ struct diskann_intermediate_graph {
     if constexpr (!USE_LSH) {
       if (opts.any())
         throw std::runtime_error(
-            "[construct_diskann] build_lsh/build_pq require configs with "
-            "use_lsh=true (graph_config's USE_LSH/K_RANKS template args)");
+            "[construct_diskann] build_lsh/build_pq/build_rq require configs "
+            "with use_lsh=true (graph_config's USE_LSH/K_RANKS template args)");
     } else {
       if (opts.build_pq && padded_dim % fin_graph_cfg::pq_m != 0)
         throw std::runtime_error(
             "[construct_diskann] build_pq requires padded_dim ("
             + std::to_string(padded_dim) + ") divisible by pq_m="
             + std::to_string(fin_graph_cfg::pq_m));
+      // The codes truncate to the first rq_dim rotated coordinates, so the
+      // projection has to fit inside the data.
+      if (opts.build_rq && fin_graph_cfg::rq_dim > dim)
+        throw std::runtime_error(
+            "[construct_diskann] build_rq requires rq_dim="
+            + std::to_string(fin_graph_cfg::rq_dim) + " <= dim="
+            + std::to_string(dim) + " (rq_dim = 8 * k_ranks)");
+      if (opts.build_rq && !opts.prerotate)
+        throw std::runtime_error(
+            "[construct_diskann] build_rq requires prerotate: truncating to "
+            "the first rq_dim coordinates is only a random projection in a "
+            "rotated basis");
     }
 
     diskann_intermediate_graph ig;
@@ -798,14 +848,22 @@ struct diskann_intermediate_graph {
         ig.dir.has_pq = true;
         extra += static_cast<size_t>(N) * sizeof(fin_edge_pq_t);
       }
+      if (opts.build_rq) {
+        ig.dir.edge_rqs.assign(static_cast<size_t>(N), fin_edge_rq_t{});
+        ig.dir.rq     = make_rq_globals<fin_graph_cfg::rq_dim, fin_graph_cfg::rq_bits>();
+        ig.dir.has_rq = true;
+        extra += static_cast<size_t>(N) * sizeof(fin_edge_rq_t);
+      }
       if (extra > 0)
         std::printf("[construct_diskann] directional payload on host: %.1f GB "
-                    "(lsh=%d %zuB/node, pq=%d %zuB/node)\n",
+                    "(lsh=%d %zuB/node, pq=%d %zuB/node, rq=%d %zuB/node)\n",
                     extra / (1024.0 * 1024.0 * 1024.0),
                     static_cast<int>(opts.build_lsh),
                     opts.build_lsh ? sizeof(fin_edge_lsh_t) : size_t{0},
                     static_cast<int>(opts.build_pq),
-                    opts.build_pq ? sizeof(fin_edge_pq_t) : size_t{0});
+                    opts.build_pq ? sizeof(fin_edge_pq_t) : size_t{0},
+                    static_cast<int>(opts.build_rq),
+                    opts.build_rq ? sizeof(fin_edge_rq_t) : size_t{0});
     }
     const double t_alloc = secs(t_alloc0, clk::now());
 
@@ -845,6 +903,7 @@ struct diskann_intermediate_graph {
     if constexpr (USE_LSH) {
       if (opts.build_lsh) per_vec += sizeof(int_edge_lsh_t);
       if (opts.build_pq)  per_vec += sizeof(int_edge_pq_t);
+      if (opts.build_rq)  per_vec += sizeof(int_edge_rq_t);
     }
     size_t free_b = 0, total_b = 0;
     cudaMemGetInfo(&free_b, &total_b);
@@ -1019,6 +1078,10 @@ struct diskann_intermediate_graph {
               pay.out_pq = &ig.dir.edge_pqs[gid];
               pay.in_pq  = &job.pay.pq[i];
             }
+            if (ig.dir.has_rq) {
+              pay.out_rq = &ig.dir.edge_rqs[gid];
+              pay.in_rq  = &job.pay.rq[i];
+            }
           }
           merge_row(ig.edges[gid], ig.counts[gid], job.se[i], job.sc[i], pay);
         }
@@ -1065,6 +1128,9 @@ struct diskann_intermediate_graph {
           const auto tp0 = clk::now();
           if (opts.build_lsh) g.populate_edge_lsh();
           if (opts.build_pq)  g.populate_edge_pq(ig.dir.codebooks);
+          // RaBitQ codes depend only on the (u, v) pair, so a shard-local
+          // populate is bit-identical to a whole-graph one and needs no model.
+          if (opts.build_rq)  g.populate_edge_rq(ig.dir.rq);
           check(cudaGetLastError(), "populate_edge_* launch");
           check(cudaDeviceSynchronize(), "populate_edge_* sync");
           t_populate += secs(tp0, clk::now());
@@ -1109,6 +1175,7 @@ struct diskann_intermediate_graph {
         if constexpr (USE_LSH) {
           if (ig.dir.has_lsh) job.pay.lsh.resize(seg_count);
           if (ig.dir.has_pq)  job.pay.pq.resize(seg_count);
+          if (ig.dir.has_rq)  job.pay.rq.resize(seg_count);
         }
 
         cudaMemcpy(job.se.data(), seg.edges,
@@ -1125,6 +1192,10 @@ struct diskann_intermediate_graph {
           if (ig.dir.has_pq)
             cudaMemcpy(job.pay.pq.data(), seg.edge_pqs,
                        static_cast<size_t>(seg_count) * sizeof(int_edge_pq_t),
+                       cudaMemcpyDeviceToHost);
+          if (ig.dir.has_rq)
+            cudaMemcpy(job.pay.rq.data(), seg.edge_rqs,
+                       static_cast<size_t>(seg_count) * sizeof(int_edge_rq_t),
                        cudaMemcpyDeviceToHost);
         }
         off += seg_count;
@@ -1225,6 +1296,7 @@ struct diskann_intermediate_graph {
         out << '\n';
         if (dir.has_lsh) { out << "  lsh:\n"; dir.edge_lshs[i].print(out, cnt); }
         if (dir.has_pq)  { out << "  pq:\n";  dir.edge_pqs[i].print(out, cnt); }
+        if (dir.has_rq)  { out << "  rq:\n";  dir.edge_rqs[i].print(out, cnt); }
       }
     }
   }
@@ -1299,9 +1371,10 @@ struct diskann_intermediate_graph {
 
       const bool has_lsh      = dir.has_lsh && !dir.edge_lshs.empty();
       const bool has_pq       = dir.has_pq  && !dir.edge_pqs.empty();
+      const bool has_rq       = dir.has_rq  && !dir.edge_rqs.empty();
       const bool has_norms    = !dir.norms.empty();
       const bool has_rotation = dir.rotation.known;
-      if (!has_lsh && !has_pq && !has_norms && !has_rotation)
+      if (!has_lsh && !has_pq && !has_rq && !has_norms && !has_rotation)
         return;   // base-only, nothing to add
 
       std::ofstream out(output_fname, std::ios::binary | std::ios::app);
@@ -1311,7 +1384,8 @@ struct diskann_intermediate_graph {
       out.write(reinterpret_cast<const char*>(&DIRECTIONAL_TRAILER_MAGIC),   sizeof(uint32_t));
       out.write(reinterpret_cast<const char*>(&DIRECTIONAL_TRAILER_VERSION), sizeof(uint32_t));
       const uint8_t flags = (has_lsh ? 1u : 0u) | (has_pq ? 2u : 0u)
-                          | (has_norms ? 4u : 0u) | (has_rotation ? 8u : 0u);
+                          | (has_norms ? 4u : 0u) | (has_rotation ? 8u : 0u)
+                          | (has_rq ? 16u : 0u);
       out.write(reinterpret_cast<const char*>(&flags), sizeof(uint8_t));
 
       // Write `rows` array entries in vectors_per_segment-sized chunks.
@@ -1364,6 +1438,16 @@ struct diskann_intermediate_graph {
       if (has_norms)
         write_rows(dir.norms.data(), sizeof(float), "vector norms");
 
+      if (has_rq) {
+        const uint32_t rq_dim_u32  = fin_graph_cfg::rq_dim;
+        const uint32_t rq_bits_u32 = fin_graph_cfg::rq_bits;
+        out.write(reinterpret_cast<const char*>(&rq_dim_u32),  sizeof(uint32_t));
+        out.write(reinterpret_cast<const char*>(&rq_bits_u32), sizeof(uint32_t));
+        out.write(reinterpret_cast<const char*>(&dir.rq),
+                  sizeof(rq_globals<fin_graph_cfg::rq_dim, fin_graph_cfg::rq_bits>));
+        write_rows(dir.edge_rqs.data(), sizeof(fin_edge_rq_t), "edge_rqs");
+      }
+
       // Last block, so a reader that doesn't know flag bit 3 never reads into it.
       if (has_rotation) {
         const uint8_t rot = dir.rotation.prerotate ? 1u : 0u;
@@ -1375,7 +1459,7 @@ struct diskann_intermediate_graph {
 
       std::cout << "Appended directional trailer to " << output_fname
                 << " (lsh=" << has_lsh << ", pq=" << has_pq
-                << ", norms=" << has_norms;
+                << ", rq=" << has_rq << ", norms=" << has_norms;
       if (has_rotation)
         std::cout << ", prerotate=" << dir.rotation.prerotate
                   << " seed=" << dir.rotation.seed;

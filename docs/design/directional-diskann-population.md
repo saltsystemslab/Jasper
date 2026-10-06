@@ -320,6 +320,7 @@ With `index_t = uint32_t`, `data_t = __half`, bf16 edge distances, and
 | `edge_list_t(R)` | `6R` (4 B id + 2 B bf16 dist) |
 | `edge_lsh_list_t(R, K, P)` | `R*K*sizeof(P) + 2R` |
 | `edge_pq_list_t(R, M)` | `R*M` |
+| `edge_rq_list_t(R, d, b)` | `R*(4*ceil(d*b/32) + 4)` (code words + fp16 rescale + bf16 mag²) |
 | `edge_counts` | 1 / slot |
 | `d_vector_norms` | 4 / vector |
 | `slot_to_id` (device only) | 4 / slot |
@@ -327,8 +328,25 @@ With `index_t = uint32_t`, `data_t = __half`, bf16 edge distances, and
 | `shard_ids` (host, build only) | `n_dup * 4` / vector |
 
 `pq_m == k_ranks` by construction (`graph.cuh:78`), so one knob sets both the
-LSH rank count and the PQ subquantizer count. That coupling drives the tables
-below and is revisited in section 6.
+LSH rank count and the PQ subquantizer count. RaBitQ joins the same coupling:
+`rq_dim == 8 * k_ranks` at 1 bit per dimension, chosen so enabling it adds no
+new graph configs to compile. That coupling drives the tables below and is
+revisited in section 6.
+
+**RaBitQ is the largest of the three payloads** at every shape we compile. At
+K = M = 4 it is `rq_dim = 32`, i.e. one 32-bit code word plus 4 B of scalars
+per edge:
+
+| estimator | B/edge at K=4 | B/node at R=64 | B/node at R=32 |
+| --- | --- | --- | --- |
+| LSH (uint8 packing) | 6 | 384 | 192 |
+| PQ | 4 | 256 | 128 |
+| RaBitQ | 8 | 512 | 256 |
+
+All three flags are independent, so the sum only applies when they are combined
+— `--lsh --pq --rabitq` at R_fin = 64 is 1152 B/node, or ~115 GB of host-
+resident payload at 100M vectors. `build()` prints the figure before
+allocating.
 
 `packed_t` must hold the coordinate index in its low bits (7 for uint8, 15 for
 uint16, `lsh_kernels.cuh:25-31`), so dim <= 128 can use uint8 and dim = 768

@@ -136,6 +136,7 @@ template <typename GRAPH_T>
 struct dir_meta {
   bool has_lsh   = false;
   bool has_pq    = false;
+  bool has_rq    = false;
   bool prerotate = false;
   // Kept alongside d_rotation so save can record it in the trailer; a loader
   // then gets the rotation from the file instead of from its caller.
@@ -143,6 +144,9 @@ struct dir_meta {
   typename GRAPH_T::data_t* d_rotation = nullptr;  // dim x dim, col-major, device; owned
   jasper::lsh_globals<GRAPH_T::k_ranks> globals{};
   jasper::pq_codebooks<GRAPH_T::pq_m, GRAPH_T::pq_k> codebooks{};  // owns d_centroids
+  // RaBitQ owns nothing: rq_globals is three scalars, and the codes live on the
+  // graph's segments like the LSH/PQ ones.
+  jasper::rq_globals<GRAPH_T::rq_dim, GRAPH_T::rq_bits> rq{};
 };
 
 template <typename GRAPH_T>
@@ -531,6 +535,115 @@ void BuildPq_##id(int64_t handle, int64_t n_train, int64_t kmeans_iter,      \
   meta.codebooks = cb;                                                      \
 }                                                                             \
                                                                                \
+/* RaBitQ has no model to train, so this is populate-only. It does require the \
+   rotated basis: the codes truncate to the first rq_dim coordinates, which is \
+   the projection P_d only there, and building them on raw axes is silently    \
+   worse rather than an error — hence the hard check. */                       \
+void BuildRq_##id(int64_t handle) {                                          \
+  using graph_t = jasper::graph<cfg_##id>;                                   \
+  graph_t* gp;                                                               \
+  {                                                                           \
+    std::lock_guard<std::mutex> lock(g_mutex);                              \
+    auto it = g_graphs.find(handle);                                        \
+    TVM_FFI_ICHECK(it != g_graphs.end()) << "Invalid handle: " << handle;     \
+    gp = &std::get<graph_t>(it->second);                                    \
+    auto mit = dir_meta_map<graph_t>().find(handle);                        \
+    TVM_FFI_ICHECK(mit != dir_meta_map<graph_t>().end())                    \
+        << "Handle " << handle << " has no directional metadata";           \
+    TVM_FFI_ICHECK(mit->second.prerotate)                                   \
+        << "build_rq() requires a prerotated graph (construct with "        \
+        << "prerotate=True): truncating to the first rq_dim coordinates is " \
+        << "only a random projection in a rotated basis";                   \
+  }                                                                          \
+  auto rq = gp->generate_rq_globals();                                      \
+  gp->populate_edge_rq(rq);                                                 \
+                                                                               \
+  std::lock_guard<std::mutex> lock(g_mutex);                                 \
+  auto& meta = dir_meta_map<graph_t>()[handle];                             \
+  meta.has_rq = true;                                                       \
+  meta.rq     = rq;                                                         \
+}                                                                             \
+                                                                               \
+void RqSearch_##id(int64_t handle,                                          \
+                   ffi::TensorView queries,                                 \
+                   ffi::TensorView out_indices,                             \
+                   ffi::TensorView out_distances,                          \
+                   int64_t k, int64_t beam_width, int64_t limit,           \
+                   bool print_throughput) {                                \
+  using graph_t = jasper::graph<cfg_##id>;                                   \
+  graph_t* gp;                                                               \
+  dir_meta<graph_t> meta;                                                   \
+  {                                                                           \
+    std::lock_guard<std::mutex> lock(g_mutex);                              \
+    auto it = g_graphs.find(handle);                                        \
+    TVM_FFI_ICHECK(it != g_graphs.end()) << "Invalid handle: " << handle;     \
+    gp = &std::get<graph_t>(it->second);                                    \
+    auto mit = dir_meta_map<graph_t>().find(handle);                        \
+    TVM_FFI_ICHECK(mit != dir_meta_map<graph_t>().end())                    \
+        << "Handle " << handle << " has no directional metadata";           \
+    meta = mit->second;                                                     \
+  }                                                                          \
+  TVM_FFI_ICHECK(meta.has_rq)                                               \
+      << "Graph " << handle << " has no RaBitQ artifacts built — "         \
+      << "call build_rq() first";                                          \
+  auto& g = *gp;                                                            \
+                                                                               \
+  uint32_t n_queries = static_cast<uint32_t>(queries.size(0));              \
+  uint32_t dim_ = g.dim;                                                    \
+                                                                               \
+  DAT* d_query_data = static_cast<DAT*>(queries.data_ptr());                \
+  DAT* d_rotated = nullptr;                                                 \
+  if (meta.prerotate) {                                                     \
+    d_rotated = rotate_query_batch(d_query_data, n_queries, dim_,           \
+                                   meta.d_rotation);                        \
+    d_query_data = d_rotated;                                              \
+  }                                                                          \
+                                                                               \
+  jasper::vector_view<DAT> d_queries(d_query_data, dim_, n_queries, false); \
+                                                                               \
+  jasper::search_params params{                                            \
+      .k           = static_cast<uint32_t>(k),                             \
+      .beam_width  = static_cast<uint32_t>(beam_width),                    \
+      .limit       = static_cast<uint32_t>(limit),                         \
+      .get_visited = false,                                                \
+  };                                                                         \
+                                                                               \
+  cudaEvent_t e0, e1;                                                       \
+  cudaEventCreate(&e0);                                                     \
+  cudaEventCreate(&e1);                                                     \
+  cudaEventRecord(e0);                                                      \
+  auto result = jasper::rq_search(g, meta.rq, d_queries, params);           \
+  cudaEventRecord(e1);                                                      \
+  cudaEventSynchronize(e1);                                                 \
+                                                                               \
+  float duration_ms = 0;                                                    \
+  cudaEventElapsedTime(&duration_ms, e0, e1);                               \
+  cudaEventDestroy(e0);                                                     \
+  cudaEventDestroy(e1);                                                     \
+                                                                               \
+  if (print_throughput)                                                     \
+    std::cout << "[rq_search] duration=" << duration_ms                     \
+      << "ms, throughput=" << (n_queries * 1000.0f)/duration_ms            \
+      << std::endl;                                                         \
+                                                                               \
+  DLDevice device = queries.device();                                      \
+  cudaStream_t stream = static_cast<cudaStream_t>(                          \
+      TVMFFIEnvGetStream(device.device_type, device.device_id));           \
+                                                                               \
+  uint32_t total = n_queries * static_cast<uint32_t>(k);                   \
+  uint32_t threads = 256;                                                   \
+  uint32_t blocks = (total + threads - 1) / threads;                       \
+                                                                               \
+  unpack_results_kernel<<<blocks, threads, 0, stream>>>(                   \
+      result.frontier,                                                      \
+      static_cast<int32_t*>(out_indices.data_ptr()),                       \
+      static_cast<float*>(out_distances.data_ptr()),                       \
+      total);                                                               \
+                                                                               \
+  cudaFree(result.frontier);                                               \
+  if (d_rotated) cudaFree(d_rotated);                                      \
+}                                                                             \
+                                                                               \
 void DirectionalSearch_##id(int64_t handle,                                  \
                             ffi::TensorView queries,                        \
                             ffi::TensorView out_indices,                    \
@@ -713,7 +826,8 @@ void SaveDirectionalGraph_##id(int64_t handle, ffi::String path) {          \
       *gp,                                                                  \
       meta.has_lsh ? &meta.globals   : nullptr,                            \
       meta.has_pq  ? &meta.codebooks : nullptr,                            \
-      std::string(path), rot);                                              \
+      std::string(path), rot,                                               \
+      meta.has_rq  ? &meta.rq        : nullptr);                            \
 }                                                                             \
                                                                                \
 int64_t LoadDirectionalGraph_##id(ffi::String path, int64_t dim, bool on_host, \
@@ -725,8 +839,10 @@ int64_t LoadDirectionalGraph_##id(ffi::String path, int64_t dim, bool on_host, \
   dir_meta<graph_t> meta;                                                   \
   meta.has_lsh   = bundle.has_lsh;                                          \
   meta.has_pq    = bundle.has_pq;                                           \
+  meta.has_rq    = bundle.has_rq;                                           \
   meta.globals   = bundle.globals;                                          \
   meta.codebooks = bundle.codebooks;                                        \
+  meta.rq        = bundle.rq;                                               \
   /* The file's own record wins over the caller's arguments: passing the    \
      wrong prerotate/seed searches unrotated queries against a rotated     \
      index, which returns plausible nonsense with no error. Files written   \
@@ -779,7 +895,8 @@ void GetVectorDirectional_##id(int64_t handle, int64_t index,                \
 }                                                                             \
                                                                                \
 /* bit0 = has_lsh, bit1 = has_pq, bit2 = queries are being rotated (which  \
-   for a loaded graph is what the trailer said, not what the caller passed).\
+   for a loaded graph is what the trailer said, not what the caller passed),\
+   bit3 = has_rq.                                                           \
    0 if the handle has no directional metadata at all (shouldn't happen for \
    a directional-config handle, but keeps this query total rather than      \
    throwing). */                                                            \
@@ -790,7 +907,7 @@ int64_t GetDirectionalFlags_##id(int64_t handle) {                          \
   auto it = dm.find(handle);                                                \
   if (it == dm.end()) return 0;                                            \
   return (it->second.has_lsh ? 1 : 0) | (it->second.has_pq ? 2 : 0)         \
-       | (it->second.prerotate ? 4 : 0);                                    \
+       | (it->second.prerotate ? 4 : 0) | (it->second.has_rq ? 8 : 0);      \
 }
 
 // ── Free / info (config-agnostic; defined once in ffi/jasper_ffi_plain.cu) ──
@@ -818,8 +935,10 @@ int64_t GetDim(int64_t handle);
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_construct_directional_##id, jasper_ffi::ConstructDirectionalGraph_##id); \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_build_lsh_##id,             jasper_ffi::BuildLsh_##id);                  \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_build_pq_##id,              jasper_ffi::BuildPq_##id);                   \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_build_rq_##id,              jasper_ffi::BuildRq_##id);                   \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_directional_search_##id,    jasper_ffi::DirectionalSearch_##id);         \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_pq_search_##id,             jasper_ffi::PqSearch_##id);                  \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_rq_search_##id,             jasper_ffi::RqSearch_##id);                  \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_save_directional_##id,      jasper_ffi::SaveDirectionalGraph_##id);      \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_load_directional_##id,      jasper_ffi::LoadDirectionalGraph_##id);      \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_get_vector_directional_##id, jasper_ffi::GetVectorDirectional_##id);     \

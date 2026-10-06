@@ -145,6 +145,8 @@ def _get_directional_fns(config_id: str):
             getattr(_mod, f"jasper_load_directional_{config_id}"),
             getattr(_mod, f"jasper_get_vector_directional_{config_id}"),
             getattr(_mod, f"jasper_get_directional_flags_{config_id}"),
+            getattr(_mod, f"jasper_build_rq_{config_id}"),
+            getattr(_mod, f"jasper_rq_search_{config_id}"),
         )
     return _directional_fn_cache[config_id]
 
@@ -200,6 +202,7 @@ class Graph:
         k_ranks: int | None = None,
         has_lsh: bool = False,
         has_pq: bool = False,
+        has_rq: bool = False,
         prerotate: bool = False,
         prerotate_seed: int = 42,
     ):
@@ -214,6 +217,7 @@ class Graph:
         self._k_ranks = k_ranks
         self._has_lsh = has_lsh
         self._has_pq = has_pq
+        self._has_rq = has_rq
         self._prerotate = prerotate
         self._prerotate_seed = prerotate_seed
 
@@ -221,7 +225,8 @@ class Graph:
             (self._construct_fn, self._build_lsh_fn, self._build_pq_fn,
              self._directional_search_fn, self._pq_search_fn,
              self._save_fn, self._load_fn, self._get_vector_fn,
-             self._get_flags_fn) = _get_directional_fns(config_id)
+             self._get_flags_fn, self._build_rq_fn,
+             self._rq_search_fn) = _get_directional_fns(config_id)
             # Deletion/append are only exported per-config for plain graphs —
             # directional configs don't have mark_deleted/consolidate/compact/
             # append FFI bindings (see ffi/jasper_ffi_common.cuh DEFINE_OPS vs
@@ -291,7 +296,8 @@ class Graph:
         config_id = _resolve_directional_config(
             data_type, n_neighbors, distance, k_ranks, dim
         )
-        (_, _, _, _, _, _, load_fn, _, get_flags_fn) = _get_directional_fns(config_id)
+        (_, _, _, _, _, _, load_fn, _, get_flags_fn, _, _) = \
+            _get_directional_fns(config_id)
         handle = load_fn(path, dim, on_host, prerotate, prerotate_seed)
         flags = get_flags_fn(handle)
 
@@ -299,6 +305,7 @@ class Graph:
             handle, config_id, data_type, distance, n_neighbors, dim,
             is_directional=True, k_ranks=k_ranks,
             has_lsh=bool(flags & 1), has_pq=bool(flags & 2),
+            has_rq=bool(flags & 8),
             # bit2 is what the loader actually settled on: the index's own
             # recorded rotation when it has one, else the argument above.
             prerotate=bool(flags & 4), prerotate_seed=prerotate_seed,
@@ -329,6 +336,7 @@ class Graph:
         on_host: bool = False,
         build_lsh: bool = False,
         build_pq: bool = False,
+        build_rq: bool = False,
         k_ranks: int = 4,
         prerotate: bool | None = None,
         prerotate_seed: int = 42,
@@ -352,13 +360,18 @@ class Graph:
                              directional_search().
             build_pq:         Also populate Product-Quantization edges + exact
                              vector norms, enabling pq_search().
-            k_ranks:          LSH rank count / PQ subquantizer count (4 or 16).
-                             Only used when build_lsh or build_pq is True.
+            build_rq:         Also populate RaBitQ edges over the first
+                             rq_dim = 8*k_ranks rotated coordinates, enabling
+                             rq_search(). Requires prerotate (the default).
+            k_ranks:          LSH rank count / PQ subquantizer count / RaBitQ
+                             projected dim / 8 (4 or 16). Only used when
+                             build_lsh, build_pq or build_rq is True.
             prerotate:        Rotate vectors (and, transparently, queries at
                              search time) by a random orthogonal matrix.
-                             Defaults to True iff build_lsh or build_pq is
-                             set, since LSH/PQ estimator quality relies on
-                             it — pass False explicitly to disable.
+                             Defaults to True iff build_lsh, build_pq or
+                             build_rq is set, since estimator quality relies
+                             on it — pass False explicitly to disable. RaBitQ
+                             requires it outright.
                              This choice and prerotate_seed are recorded in
                              the file by save(), and load() honors them.
             prerotate_seed:   Seed for the rotation matrix.
@@ -394,7 +407,7 @@ class Graph:
                 f"Use torch.float16."
             )
 
-        if not (build_lsh or build_pq):
+        if not (build_lsh or build_pq or build_rq):
             config_id = _resolve_config(data_type, n_neighbors, distance)
             construct_fn = _get_fns(config_id)[1]
             handle = construct_fn(vectors, dim, alpha, workspace_budget_bytes, on_host)
@@ -405,8 +418,8 @@ class Graph:
         )
         resolved_prerotate = prerotate if prerotate is not None else True
 
-        (construct_fn, build_lsh_fn, build_pq_fn, _, _, _, _, _, _) = \
-            _get_directional_fns(config_id)
+        (construct_fn, build_lsh_fn, build_pq_fn, _, _, _, _, _, _,
+         build_rq_fn, _) = _get_directional_fns(config_id)
 
         handle = construct_fn(
             vectors, dim, alpha, workspace_budget_bytes, on_host,
@@ -417,11 +430,13 @@ class Graph:
             build_lsh_fn(handle, lsh_samples, lsh_seed)
         if build_pq:
             build_pq_fn(handle, pq_train, pq_kmeans_iter, pq_seed)
+        if build_rq:
+            build_rq_fn(handle)
 
         return cls(
             handle, config_id, data_type, distance, n_neighbors, dim,
             is_directional=True, k_ranks=k_ranks,
-            has_lsh=build_lsh, has_pq=build_pq,
+            has_lsh=build_lsh, has_pq=build_pq, has_rq=build_rq,
             prerotate=resolved_prerotate, prerotate_seed=prerotate_seed,
         )
 
@@ -468,8 +483,8 @@ class Graph:
         if self._is_directional:
             raise RuntimeError(
                 "search() is not available on a directional graph "
-                "(built with build_lsh=True/build_pq=True) — use "
-                "directional_search() or pq_search() instead"
+                "(built with build_lsh=True/build_pq=True/build_rq=True) — use "
+                "directional_search(), pq_search() or rq_search() instead"
             )
 
         if not queries.is_cuda:
@@ -616,6 +631,55 @@ class Graph:
             k, beam_width, resolved_limit, print_throughput,
         )
 
+        return out_indices, out_distances
+
+    def rq_search(
+        self,
+        queries: torch.Tensor,
+        k: int = 10,
+        beam_width: int = 64,
+        limit: int | None = None,
+        print_throughput: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Run beam search scored by the RaBitQ estimator.
+
+        Requires this graph to have been built with build_rq=True (or
+        loaded with RaBitQ artifacts present — see Graph.load's k_ranks arg).
+        Query rotation happens transparently; this path always needs it,
+        since the codes quantize the first rq_dim rotated coordinates.
+
+        Args:
+            queries:    CUDA tensor of shape [n_queries, dim].
+            k:          Number of nearest neighbors to return.
+            beam_width: Search beam width.
+            limit:      Defaults to 2x beam_width.
+        Returns:
+            indices:   int32  tensor [n_queries, k]
+            distances: float32 tensor [n_queries, k]
+        """
+        self._check_alive()
+        if not self._is_directional or not self._has_rq:
+            raise RuntimeError(
+                "rq_search() requires a graph built with build_rq=True "
+                "(or loaded with RaBitQ artifacts present)"
+            )
+
+        queries = self._directional_query_check(queries)
+        n_queries = queries.size(0)
+
+        out_indices = torch.empty(
+            n_queries, k, dtype=torch.int32, device=queries.device
+        )
+        out_distances = torch.empty(
+            n_queries, k, dtype=torch.float32, device=queries.device
+        )
+
+        resolved_limit = limit if limit is not None else beam_width * 2
+        self._rq_search_fn(
+            self._handle, queries, out_indices, out_distances,
+            k, beam_width, resolved_limit, print_throughput,
+        )
         return out_indices, out_distances
 
     def get_vector(self, stable_id: int) -> torch.Tensor:

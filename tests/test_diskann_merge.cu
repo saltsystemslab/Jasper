@@ -37,6 +37,8 @@ using int_l = ig_t::int_edge_lsh_t;
 using fin_l = ig_t::fin_edge_lsh_t;
 using int_q = ig_t::int_edge_pq_t;
 using fin_q = ig_t::fin_edge_pq_t;
+using int_r = ig_t::int_edge_rq_t;
+using fin_r = ig_t::fin_edge_rq_t;
 
 constexpr uint32_t K = 4;   // k_ranks
 constexpr uint32_t M = 4;   // pq_m
@@ -73,6 +75,29 @@ void expect_pq(const ROW_T& row, uint8_t e, uint8_t tag, const char* what) {
   for (uint32_t j = 0; j < M; j++)
     EXPECT_EQ(row.get_code(e, j), static_cast<uint8_t>(tag + j))
         << what << ": code[edge " << int(e) << ", sub " << j << "]";
+}
+
+// RaBitQ rows are word-plane-major (code[w*N + e]), so N changes with the
+// degree — get_word/set_word are what make the R_INT -> R_FIN copy correct, and
+// a raw byte copy would scramble every plane past the first. These stamps are
+// what would catch that.
+template <typename ROW_T>
+void stamp_rq(ROW_T& row, uint8_t e, uint8_t tag) {
+  for (uint32_t w = 0; w < ROW_T::n_words; w++)
+    row.set_word(e, w, 0xA5A50000u | (static_cast<uint32_t>(tag) + w));
+  row.rescale[e] = __float2half(static_cast<float>(tag) * 0.25f);
+  row.mag_sq[e]  = __float2bfloat16(static_cast<float>(tag));
+}
+
+template <typename ROW_T>
+void expect_rq(const ROW_T& row, uint8_t e, uint8_t tag, const char* what) {
+  for (uint32_t w = 0; w < ROW_T::n_words; w++)
+    EXPECT_EQ(row.get_word(e, w), 0xA5A50000u | (static_cast<uint32_t>(tag) + w))
+        << what << ": code word[edge " << int(e) << ", w " << w << "]";
+  EXPECT_FLOAT_EQ(row.get_rescale(e), static_cast<float>(tag) * 0.25f)
+      << what << ": rescale[edge " << int(e) << "]";
+  EXPECT_FLOAT_EQ(row.get_mag_sq(e), static_cast<float>(tag))
+      << what << ": mag_sq[edge " << int(e) << "]";
 }
 
 void set_edge(fin_e& row, uint8_t slot, uint32_t id, float dist) {
@@ -117,16 +142,19 @@ TEST(DiskannMergeRow, PayloadSurvivesInPlaceOverwrite) {
   int_l in_lsh{};
   fin_q out_pq{};
   int_q in_pq{};
+  fin_r out_rq{};
+  int_r in_rq{};
   uint8_t out_count = 2, in_count = 2;
 
-  set_edge(out, 0, 100, 5.0f);  stamp_lsh(out_lsh, 0, 50); stamp_pq(out_pq, 0, 50);
-  set_edge(out, 1, 101, 6.0f);  stamp_lsh(out_lsh, 1, 60); stamp_pq(out_pq, 1, 60);
-  set_edge(in,  0, 200, 1.0f);  stamp_lsh(in_lsh,  0, 20); stamp_pq(in_pq,  0, 20);
-  set_edge(in,  1, 201, 2.0f);  stamp_lsh(in_lsh,  1, 30); stamp_pq(in_pq,  1, 30);
+  set_edge(out, 0, 100, 5.0f);  stamp_lsh(out_lsh, 0, 50); stamp_pq(out_pq, 0, 50); stamp_rq(out_rq, 0, 50);
+  set_edge(out, 1, 101, 6.0f);  stamp_lsh(out_lsh, 1, 60); stamp_pq(out_pq, 1, 60); stamp_rq(out_rq, 1, 60);
+  set_edge(in,  0, 200, 1.0f);  stamp_lsh(in_lsh,  0, 20); stamp_pq(in_pq,  0, 20); stamp_rq(in_rq,  0, 20);
+  set_edge(in,  1, 201, 2.0f);  stamp_lsh(in_lsh,  1, 30); stamp_pq(in_pq,  1, 30); stamp_rq(in_rq,  1, 30);
 
   ig_t::row_payload_t pay;
   pay.out_lsh = &out_lsh; pay.in_lsh = &in_lsh;
   pay.out_pq  = &out_pq;  pay.in_pq  = &in_pq;
+  pay.out_rq  = &out_rq;  pay.in_rq  = &in_rq;
 
   ig_t::merge_row(out, out_count, in, in_count, pay);
 
@@ -147,6 +175,11 @@ TEST(DiskannMergeRow, PayloadSurvivesInPlaceOverwrite) {
   expect_pq(out_pq, 1, 30, "slot1 from in[1]");
   expect_pq(out_pq, 2, 50, "slot2 from clobbered out[0]");
   expect_pq(out_pq, 3, 60, "slot3 from clobbered out[1]");
+
+  expect_rq(out_rq, 0, 20, "slot0 from in[0]");
+  expect_rq(out_rq, 1, 30, "slot1 from in[1]");
+  expect_rq(out_rq, 2, 50, "slot2 from clobbered out[0]");
+  expect_rq(out_rq, 3, 60, "slot3 from clobbered out[1]");
 }
 
 // A deduplicated edge keeps the payload of the occurrence that won on distance.
@@ -181,6 +214,8 @@ TEST(DiskannMergeRow, TruncatesToRFinAndNeverShrinks) {
   int_e in{};
   fin_l out_lsh{};
   int_l in_lsh{};
+  fin_r out_rq{};
+  int_r in_rq{};
   uint8_t out_count = static_cast<uint8_t>(R_FIN);
   uint8_t in_count  = static_cast<uint8_t>(R_INT);
 
@@ -189,15 +224,18 @@ TEST(DiskannMergeRow, TruncatesToRFinAndNeverShrinks) {
   for (uint32_t j = 0; j < R_FIN; j++) {
     set_edge(out, static_cast<uint8_t>(j), 1000 + j, 100.0f + j);
     stamp_lsh(out_lsh, static_cast<uint8_t>(j), static_cast<uint8_t>(j));
+    stamp_rq(out_rq, static_cast<uint8_t>(j), static_cast<uint8_t>(j));
   }
   for (uint32_t j = 0; j < R_INT; j++) {
     set_edge(in, static_cast<uint8_t>(j), 2000 + j, 1.0f + j);
     stamp_lsh(in_lsh, static_cast<uint8_t>(j), static_cast<uint8_t>(128 + j));
+    stamp_rq(in_rq, static_cast<uint8_t>(j), static_cast<uint8_t>(128 + j));
   }
 
   const uint8_t before = out_count;
   ig_t::row_payload_t pay;
   pay.out_lsh = &out_lsh; pay.in_lsh = &in_lsh;
+  pay.out_rq  = &out_rq;  pay.in_rq  = &in_rq;
 
   ig_t::merge_row(out, out_count, in, in_count, pay);
 
@@ -208,11 +246,15 @@ TEST(DiskannMergeRow, TruncatesToRFinAndNeverShrinks) {
     EXPECT_EQ(out.edges[j], 2000 + j);
     expect_lsh(out_lsh, static_cast<uint8_t>(j),
                static_cast<uint8_t>(128 + j), "front slots come from in");
+    expect_rq(out_rq, static_cast<uint8_t>(j),
+              static_cast<uint8_t>(128 + j), "front slots come from in");
   }
   for (uint32_t j = 0; j < R_FIN - R_INT; j++) {
     EXPECT_EQ(out.edges[R_INT + j], 1000 + j);
     expect_lsh(out_lsh, static_cast<uint8_t>(R_INT + j),
                static_cast<uint8_t>(j), "tail slots are surviving out edges");
+    expect_rq(out_rq, static_cast<uint8_t>(R_INT + j),
+              static_cast<uint8_t>(j), "tail slots are surviving out edges");
   }
 }
 
@@ -225,17 +267,21 @@ TEST(DiskannMergeRow, EmptyOutTakesShardRow) {
   int_l in_lsh{};
   fin_q out_pq{};
   int_q in_pq{};
+  fin_r out_rq{};
+  int_r in_rq{};
   uint8_t out_count = 0, in_count = 3;
 
   for (uint8_t j = 0; j < 3; j++) {
     set_edge(in, j, 500u + j, 1.0f + j);
     stamp_lsh(in_lsh, j, static_cast<uint8_t>(10 * (j + 1)));
     stamp_pq(in_pq, j, static_cast<uint8_t>(10 * (j + 1)));
+    stamp_rq(in_rq, j, static_cast<uint8_t>(10 * (j + 1)));
   }
 
   ig_t::row_payload_t pay;
   pay.out_lsh = &out_lsh; pay.in_lsh = &in_lsh;
   pay.out_pq  = &out_pq;  pay.in_pq  = &in_pq;
+  pay.out_rq  = &out_rq;  pay.in_rq  = &in_rq;
 
   ig_t::merge_row(out, out_count, in, in_count, pay);
 
@@ -244,6 +290,7 @@ TEST(DiskannMergeRow, EmptyOutTakesShardRow) {
     EXPECT_EQ(out.edges[j], 500u + j);
     expect_lsh(out_lsh, j, static_cast<uint8_t>(10 * (j + 1)), "copied from in");
     expect_pq(out_pq, j, static_cast<uint8_t>(10 * (j + 1)), "copied from in");
+    expect_rq(out_rq, j, static_cast<uint8_t>(10 * (j + 1)), "copied from in");
   }
   // Slots past the count are untouched, which is what lets the merge skip
   // clearing them (the arrays start value-initialized).
