@@ -15,10 +15,6 @@ cmake --install build
 pip install -e python/
 ```
 
-## Slurm benchmark examples
-
-Slurm scripts for benchmarks found inside the paper is stored in `sbatch/`.
-
 ## Python Usage
 
 All Python APIs can be found under the `example/` folder, where we provides python scripts to construct and query vector index in jasper. See `example/graph.py` for building and searching in one pass, `example/query.py` for loading a saved index and running queries, and `example/groundtruth.py` for generating exact k-NN ground truth to measure recall.
@@ -98,3 +94,46 @@ g.save(
 # returns: None
 ```
 
+## Slurm benchmark examples
+
+Slurm scripts for the benchmarks in the paper are stored in `sbatch/`. Every
+script builds the binaries it needs with CMake before running, so submit it
+from a checkout of this repo (the long-running sweeps assume `REPO=$HOME/jasper`).
+
+Common to the long-running sweeps (the four `bench_deep_*`/`bench_locale*`
+scripts and `distortion_sweep`):
+
+- They pin `--nodelist=d4067` and run for up to 24 h. Every tunable is an
+  environment variable, documented in the script's header comment.
+- `DRY_RUN=1 ./sbatch/<script>.sbatch` prints the plan (shard count, per-cell
+  host/device memory, whether each cell runs on the device or `--on_host`) and
+  exits without building anything. Run it before submitting a large job.
+- Indexes are built in node-local `/tmp`, which is wiped when the job ends, so
+  build and query happen in the same job. Logs and results go to persistent
+  storage under the repo.
+
+### Edge-estimator experiments (CPH/LSH, PQ, RaBitQ)
+
+| Script | What it measures |
+|---|---|
+| `bench_deep_ksweep.sbatch` | Sweeps code size `r` (`--k_ranks` = 4, 8, 16) for all three estimators on one plain DEEP index, so every cell searches the same graph. Reports QPS and recall@k with `run_query`. `SCALE=10M/100M/200M/1B` picks the dataset size and `R_INT`/`R_FIN` the degree (e.g. `SCALE=1B R_INT=32 R_FIN=32`). With `RUN_POPS=1` it also records nodes explored per query with `distortion_test --pops`. |
+| `bench_locale_ksweep.sbatch` | The same sweep on the LOCALE genomic embeddings: `DATASET=sra50` or `sra500`, degree fixed at 64, with an optional query-mutation axis (`MUTATIONS="0.00 0.05 0.10"`). Supports `RUN_POPS=1`. SRA500 must first be converted from its Hugging Face bundle (see `scripts/locale_bundle_to_fbin.py` below). |
+| `distortion_sweep.sbatch` | Estimator accuracy microbenchmarks with `distortion_test` on device-resident datasets (BigANN 10M, Deep 10M, GIST, OpenAI, SRA50). For each dataset, estimator and `r` it writes recall vs nodes popped, plus estimated-vs-exact edge distances for (query, popped node) pairs taken from real searches and for random (node, query) pairs. Then it draws the distortion scatters and ranking plots. |
+
+### Index construction at scale (DiskANN-style shard and merge)
+
+| Script | What it measures |
+|---|---|
+| `bench_deep_scaling.sbatch` | A scaling ladder on DEEP from 10M to the full 1B. Each rung builds a sharded index with `create_diskann_index` (codes populated per shard) and queries it with conventional beam search and with every estimator that was built. The quantity of interest is how much recall the shard-and-merge build gives up as N grows. At 1B, host RAM is the binding constraint, so check `DRY_RUN=1` first. |
+| `bench_locale.sbatch` | The same build-and-query benchmark on LOCALE SRA50 and SRA500, across the three query mutation rates (0%, 5%, 10%). Every (mutation, estimator, k) combination queries one index per dataset. |
+
+### Helper scripts used by the sweeps (`scripts/`)
+
+| Script | Purpose |
+|---|---|
+| `locale_bundle_to_fbin.py` | Converts the LOCALE Hugging Face release (503 base shards plus per-mutation queries and ground truth) into the `base.fbin` / `query_mut*.fbin` / `gt_mut*.ibin` layout the locale scripts read. Run it once before `DATASET=sra500`. |
+| `tile_queries.py` | Repeats a small query set (and its ground truth) up to a target batch size so the GPU is saturated. Recall is unchanged. |
+| `plot_pops.py` | Recall vs nodes popped per query, from `--pops` CSVs. |
+| `plot_distortion.py` | Estimated-vs-true distance density grids, from edge-score CSVs. |
+| `neighborhood_ranking.py` | Within-neighborhood ranking accuracy (recall@m, Spearman) vs bytes per edge, from edge-score CSVs. |
+| `export_distortion_pgf.py` | Exports a distortion grid as pgfplots CSVs plus a ready-to-`\input` `.tex` figure. |
