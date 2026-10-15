@@ -169,6 +169,14 @@ if(JASPER_BUILD_CMD)
     CUDA_SEPARABLE_COMPILATION ON
   )
 
+  add_executable(distortion_test cmd/distortion_test.cu)
+  target_link_libraries(distortion_test PRIVATE jasper)
+  set_target_properties(distortion_test PROPERTIES
+    CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
+    CUDA_SEPARABLE_COMPILATION ON
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+  )
+
   add_executable(test_deletion cmd/test_deletion.cu)
   target_link_libraries(test_deletion PRIVATE jasper)
   set_target_properties(test_deletion PROPERTIES

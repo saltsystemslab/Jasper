@@ -865,4 +865,129 @@ TEST(RqBeamSearchTest, RecallAgainstBruteForce) {
   t.g.deallocate();
 }
 
+// ── rq_dim wider than the data ─────────────────────────────────
+// 8*k_ranks can outrun the dimension (k_ranks=16 on DEEP's 96 dims, and here
+// rq_dim=32 on 16). There is then nothing to project onto, so the scheme has
+// to degenerate to plain 1-bit RaBitQ over every real coordinate with the
+// surplus held at zero — NOT read past the end of the row. The same config
+// serves both tests, so this costs no extra instantiation.
+constexpr uint32_t RQ_DIM_SMALL = 16;   // < rq_dim (32): the clamped case
+static_assert(RQ_DIM_SMALL < rq_cfg::rq_dim, "fixture must exercise the clamp");
+
+// The encoder's half: the coded prefix is the whole vector, the tail is pinned
+// to the sign of an exact zero, and rescale/mag come out of the real
+// coordinates alone — which is the same code a native rq_dim == dim build
+// would write, since a zero coordinate adds 0 to both ||r|| and ||r||₁.
+TEST(EdgeRqEncodeTest, ClampsAndZeroPadsWhenRqDimExceedsData) {
+  auto t = build_rq_test_graph(64, RQ_DIM_SMALL, 7);
+  ASSERT_LT(t.padded_dim, rq_cfg::rq_dim) << "fixture did not clamp";
+
+  auto globals = t.g.generate_rq_globals();
+  t.g.populate_edge_rq(globals);
+  CUDA_CHECK(cudaDeviceSynchronize());
+  CUDA_CHECK(cudaGetLastError());
+  auto rows = read_edge_rqs(t.g, t.n);
+
+  constexpr uint32_t D = rq_cfg::rq_dim;
+  for (uint32_t u = 0; u < t.n; u++) {
+    for (uint32_t e = 0; e < RQ_R; e++) {
+      const uint8_t  e8 = static_cast<uint8_t>(e);
+      const uint32_t v  = t.nbrs[static_cast<size_t>(u) * RQ_R + e];
+
+      double mag_sq = 0.0, proj_l1 = 0.0;
+      for (uint32_t d = 0; d < t.padded_dim; d++) {
+        const float rf = t.vec(v)[d] - t.vec(u)[d];
+        mag_sq  += static_cast<double>(rf) * rf;
+        proj_l1 += std::fabs(static_cast<double>(rf));
+        ASSERT_EQ(rows[u].get_level(e8, d), rf >= 0.0f ? 1u : 0u)
+            << "u=" << u << " edge=" << e << " dim=" << d;
+      }
+      // The tail never touched the vector: sign(0) = +, so every surplus bit
+      // is a 1. A garbage value here means rq_populate read off the row.
+      for (uint32_t d = t.padded_dim; d < D; d++)
+        ASSERT_EQ(rows[u].get_level(e8, d), 1u)
+            << "u=" << u << " edge=" << e << " pad dim=" << d;
+
+      // mag² is the full (= projected, here) residual, and rescale uses only
+      // the real coordinates: 2·||r|| / ||r||₁.
+      const float want_mag = static_cast<float>(mag_sq);
+      EXPECT_NEAR(rows[u].get_mag_sq(e8), want_mag, 0.01f * want_mag + 1e-3f)
+          << "u=" << u << " edge=" << e;
+      const float want_rescale =
+          static_cast<float>(2.0 * std::sqrt(mag_sq) / proj_l1);
+      EXPECT_NEAR(rows[u].get_rescale(e8), want_rescale, 0.01f * want_rescale)
+          << "u=" << u << " edge=" << e;
+    }
+  }
+  t.g.deallocate();
+}
+
+// The estimator's half, end to end. rq_estimator has to zero the [padded_dim,
+// rq_dim) tail of its shared residual ONCE in the constructor and keep it
+// zero, because the per-edge dot runs to the compile-time rq_dim. If that tail
+// held junk, every estimate would take a random contribution from it and
+// recall would collapse — so this is the test that fails if the clamp is only
+// half-implemented.
+TEST(RqBeamSearchTest, RecallWhenRqDimExceedsData) {
+  constexpr uint32_t NQ = 32;
+  constexpr uint32_t K  = 10;
+
+  auto t = build_rq_test_graph(256, RQ_DIM_SMALL, 13);
+  ASSERT_LT(t.padded_dim, rq_cfg::rq_dim) << "fixture did not clamp";
+
+  auto globals = t.g.generate_rq_globals();
+  t.g.populate_edge_rq(globals);
+  CUDA_CHECK(cudaDeviceSynchronize());
+  CUDA_CHECK(cudaGetLastError());
+
+  auto h_q = jasper::vector_view<__half>::allocate(t.dim, NQ, /*on_host=*/true);
+  std::memset(h_q.data, 0, h_q.size_bytes());
+  std::vector<float> qf(static_cast<size_t>(NQ) * t.padded_dim, 0.0f);
+  std::mt19937 rng(21);
+  std::normal_distribution<float> nd(0.0f, 1.0f);
+  for (uint32_t i = 0; i < NQ; i++) {
+    for (uint32_t d = 0; d < t.dim; d++) {
+      const __half h = __float2half(nd(rng));
+      h_q[i][d] = h;
+      qf[static_cast<size_t>(i) * t.padded_dim + d] = __half2float(h);
+    }
+  }
+  auto d_q = h_q.to_device();
+  h_q.deallocate();
+
+  jasper::search_params params{
+    .k          = K,
+    .beam_width = 64,
+    .limit      = 256,
+  };
+  auto result = jasper::rq_search(t.g, globals, d_q, params);
+  CUDA_CHECK(cudaGetLastError());
+  CUDA_CHECK(cudaDeviceSynchronize());
+
+  std::vector<thrust::pair<uint32_t, float>> h_res(static_cast<size_t>(NQ) * K);
+  CUDA_CHECK(cudaMemcpy(h_res.data(), result.frontier,
+                        sizeof(h_res[0]) * h_res.size(), cudaMemcpyDeviceToHost));
+
+  uint32_t hits = 0;
+  std::vector<std::pair<float, uint32_t>> cand(t.n);
+  for (uint32_t i = 0; i < NQ; i++) {
+    const float* q = qf.data() + static_cast<size_t>(i) * t.padded_dim;
+    for (uint32_t j = 0; j < t.n; j++) cand[j] = {t.dist_sq(q, t.vec(j)), j};
+    std::partial_sort(cand.begin(), cand.begin() + K, cand.end());
+
+    std::set<uint32_t> truth;
+    for (uint32_t e = 0; e < K; e++) truth.insert(cand[e].second);
+    for (uint32_t e = 0; e < K; e++)
+      if (truth.count(h_res[static_cast<size_t>(i) * K + e].first)) hits++;
+  }
+  // Looser than the projecting case: 16 coded dimensions is a weaker ranker
+  // than 32. The bar is "ranks sensibly", not a numerical target.
+  const double recall = static_cast<double>(hits) / (NQ * K);
+  EXPECT_GE(recall, 0.85) << "recall@" << K << " = " << recall;
+
+  cudaFree(result.frontier);
+  cudaFree(d_q.data);
+  t.g.deallocate();
+}
+
 } // namespace jasper::test

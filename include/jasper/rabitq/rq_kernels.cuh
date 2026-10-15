@@ -50,6 +50,15 @@ __device__ __forceinline__ void clear_rq_slot(
 // the same code would quantize raw axis-aligned coordinates instead — not an
 // error, just quietly much worse.
 //
+// When RQ_DIM exceeds the data (8*k_ranks > padded_dim), there is nothing to
+// project onto and the scheme degenerates to plain 1-bit RaBitQ over the whole
+// vector. That is handled by coding only the first `eff` coordinates and
+// holding the rest at exactly zero, which costs the estimate nothing: a zero
+// coordinate contributes (val + 0.5)*|0| = 0 to ip_norm here and
+// (level + cb)*0 = 0 to the dot at search time, so the result is identical to
+// a code built at RQ_DIM == padded_dim. Only the unused bits are wasted, and
+// they are wasted identically on both sides.
+//
 // The magnitude stays a full-dimension quantity on purpose: the projected space
 // is used ONLY for the direction, and is paired with exact norms (eq. 65).
 template <typename graph_cfg, typename graph_t, uint32_t RQ_DIM, uint32_t RQ_BITS,
@@ -81,6 +90,10 @@ __global__ void rq_populate(graph_t g, float t_const) {
   __shared__ uint8_t s_code[N_WARPS][RQ_DIM];
 
   const uint32_t padded_dim = g.get_padded_dim();
+  // Coordinates that actually exist. Equal to RQ_DIM in the projecting case;
+  // smaller when 8*k_ranks outruns the data and this degenerates to full-
+  // dimension 1-bit RaBitQ.
+  const uint32_t eff        = (RQ_DIM < padded_dim) ? RQ_DIM : padded_dim;
   const index_t  u_lid      = static_cast<index_t>(blockIdx.x);
   const index_t  u_gid      = u_lid + g.global_offset;
 
@@ -97,17 +110,21 @@ __global__ void rq_populate(graph_t g, float t_const) {
     const data_t* __restrict__ nv = g.get_vector(nb);
 
     // One pass over the residual: the EXACT full-dimension ||v-u||² (which the
-    // estimator pairs with the projected cosine) and the projected prefix that
-    // gets coded come out together.
+    // estimator pairs with the projected cosine) and the coded prefix come out
+    // together.
     float mag_acc = 0.0f, proj_acc = 0.0f;
     for (uint32_t i = lane; i < padded_dim; i += 32u) {
       const float r = __half2float(nv[i]) - __half2float(uv[i]);
       mag_acc += r * r;
-      if (i < RQ_DIM) {
+      if (i < eff) {
         s_res[warp_id][i] = r;
         proj_acc += r * r;
       }
     }
+    // Tail past the data: exactly zero, never read from the vector (which
+    // would run off the end of the row). Zeros fall out of every sum below.
+    for (uint32_t i = eff + lane; i < RQ_DIM; i += 32u) s_res[warp_id][i] = 0.0f;
+
     const float mag_sq  = cg::reduce(tile, mag_acc,  cg::plus<float>());
     const float proj_sq = cg::reduce(tile, proj_acc, cg::plus<float>());
     tile.sync();

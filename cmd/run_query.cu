@@ -934,11 +934,18 @@ void load_and_bench_rq(const std::string& index_path,
     throw std::runtime_error(
         "--rabitq requires a rotated basis: drop --no_rotate (truncating to "
         "the first rq_dim coordinates is only a random projection there)");
+  // rq_dim wider than the data is legal but buys nothing: there is no room to
+  // project, so this degenerates to plain 1-bit RaBitQ over every coordinate
+  // with the surplus bits pinned to zero (populate_edge_rq and rq_estimator
+  // both clamp). Same recall as the largest k_ranks that fits, at strictly
+  // more bytes per edge — so warn rather than refuse, and say what it costs.
   if (GraphCfg::rq_dim > dim)
-    throw std::runtime_error(
-        "--rabitq: rq_dim=" + std::to_string(GraphCfg::rq_dim) +
-        " (= 8 * k_ranks) exceeds --dim=" + std::to_string(dim) +
-        "; lower --k_ranks");
+    std::cout << "WARNING: --rabitq rq_dim=" << GraphCfg::rq_dim
+              << " (= 8 * k_ranks) exceeds --dim=" << dim
+              << ": no projection, coding all " << dim << " coordinates and "
+              << "idling " << (GraphCfg::rq_dim - dim) << " of "
+              << GraphCfg::rq_dim << " bits per edge. Recall matches "
+              << "--k_ranks " << (dim / 8) << " at more bytes." << std::endl;
 
   std::cout << "Loading index..." << std::endl;
   jasper::graph<GraphCfg> graph{};

@@ -76,6 +76,7 @@ JASPER_FOR_EACH_CONFIG(DECLARE_CONFIGS)
   X(d_r64_64_l2_k4_dbig,   uint32_t, 64, 64, __half, float, jasper::distance_func::L2,            4, uint16_t) \
   X(d_r64_64_ip_k4_d128,   uint32_t, 64, 64, __half, float, jasper::distance_func::INNER_PRODUCT, 4, uint8_t)  \
   X(d_r64_64_ip_k4_dbig,   uint32_t, 64, 64, __half, float, jasper::distance_func::INNER_PRODUCT, 4, uint16_t) \
+  X(d_r64_64_l2_k16_d128,  uint32_t, 64, 64, __half, float, jasper::distance_func::L2,            16, uint8_t)  \
   X(d_r64_64_l2_k16_dbig,  uint32_t, 64, 64, __half, float, jasper::distance_func::L2,            16, uint16_t)
 
 #define DECLARE_DIR_CONFIGS(id, IDX, RINT, RFIN, DAT, DIST, FUNC, KR, PACKEDT)           \

@@ -41,6 +41,10 @@
 #   sbatch sbatch/bench_deep_ksweep.sbatch
 #   K_LIST="4 16" METHODS="pq rq" sbatch sbatch/bench_deep_ksweep.sbatch
 #   INDEX=/path/to/plain.bin sbatch sbatch/bench_deep_ksweep.sbatch
+#   SCALE=1B R_INT=32 R_FIN=32 RUN_POPS=1 sbatch sbatch/bench_deep_ksweep.sbatch
+#
+# RUN_POPS=1 also records nodes popped per query (recall vs nodes explored)
+# for every estimator cell: see run_pops below.
 #
 # ⚠ THROUGHPUT COMPARABILITY. A loaded index that exceeds the card is searched
 # over PCIe (--on_host), which is far slower per hop. At 100M and R_fin=64 the
@@ -75,6 +79,7 @@ BEAM_LIMITS="${BEAM_LIMITS:-16:128 32:128 64:128 128:256 256:512 512:1024 1024:2
 QUERY_BATCH="${QUERY_BATCH:-0}"        # tile queries for a saturated QPS number
 ON_HOST="${ON_HOST:-auto}"             # auto | 1 | 0
 RUN_BASELINE="${RUN_BASELINE:-1}"      # also run conventional search once
+RUN_POPS="${RUN_POPS:-0}"              # also run distortion_test --pops per cell
 DRY_RUN="${DRY_RUN:-0}"
 DISK_BUDGET="${DISK_BUDGET:-0}"        # GiB, 0 = ask df
 
@@ -86,6 +91,7 @@ QUERIES="${QUERIES:-$DATA/deep10kquery}"
 WORK="${WORK:-/tmp/${USER:-$(id -un)}/deep_ksweep}"
 REPO="${REPO:-$HOME/jasper}"
 LOGDIR="${LOGDIR:-$REPO/deep_ksweep_logs}"
+POPS_DIR="${POPS_DIR:-$LOGDIR/pops}"   # <dataset>_<method>_k<k>.csv (plot_pops.py)
 INDEX="${INDEX:-}"                     # reuse an existing PLAIN index
 
 DIM=96
@@ -167,6 +173,11 @@ echo "  methods:     $METHODS"
 echo "  k_ranks:     $K_LIST"
 echo "  degrees:     R_int=$R_INT R_fin=$R_FIN  n_dup=$N_DUP  alpha=$ALPHA  dist=$DIST"
 echo "  search k:    $K"
+if [ "$RUN_POPS" = "1" ] && [ "$DIST" != "l2" ]; then
+  echo "  pops:        disabled — distortion_test compiles L2 configs only"
+  RUN_POPS=0
+fi
+[ "$RUN_POPS" = "1" ] && echo "  pops:        distortion_test --pops per cell -> $POPS_DIR"
 echo "  workdir:     $WORK"
 echo "  logs:        $LOGDIR"
 
@@ -242,11 +253,14 @@ for m in $METHODS; do
         "SKIP: run_query has no R=$R_FIN k_ranks=$k $DIST $PACKED_T config"
       continue
     fi
-    # RaBitQ projects onto rq_dim = 8k coordinates; it cannot exceed dim.
-    if [ "$m" = "rq" ] && [ $(( 8 * k )) -gt "$DIM" ]; then
-      printf "  %-4s %-4s %9s %10s %10s %s\n" "$m" "$k" - - - \
-        "SKIP: rq_dim=$(( 8 * k )) > dim=$DIM"
-      continue
+    # rq_dim = 8k wider than the data is allowed, but there is nothing to
+    # project onto: it degenerates to plain 1-bit RaBitQ over all padded_dim
+    # coordinates, with the surplus bits stored at zero. Same recall as the
+    # largest k that fits, at strictly more bytes — so flag it rather than
+    # letting the B/edge column imply the extra bits bought something.
+    rq_note=""
+    if [ "$m" = "rq" ] && [ $(( 8 * k )) -gt "$PADDED" ]; then
+      rq_note="(no projection: codes $PADDED dims, $(( 8 * k - PADDED )) bits/edge idle)"
     fi
     # PQ splits padded_dim into k subspaces; it must divide evenly.
     if [ "$m" = "pq" ] && [ $(( PADDED % k )) -ne 0 ]; then
@@ -265,7 +279,7 @@ for m in $METHODS; do
          else ANY_DEVICE=1; fi;;
     esac
     printf "  %-4s %-4s %9s %10s %10s %s\n" \
-      "$m" "$k" "$(( pe / R_FIN ))" "$pn" "$(gib "$res") GiB" "$where"
+      "$m" "$k" "$(( pe / R_FIN ))" "$pn" "$(gib "$res") GiB" "$where $rq_note"
     CELLS="$CELLS $m:$k"
   done
 done
@@ -303,7 +317,9 @@ THRUST_DIR="${THRUST_DIR:-/projects/SaltSystemsLab/zikun/env/lib/rapids/cmake/th
 echo "=== building binaries ==="
 cmake -B build -DJASPER_BUILD_CMD=ON -DJASPER_BUILD_TESTS=OFF -DJASPER_BUILD_FFI=OFF \
   -DThrust_DIR="$THRUST_DIR" -DCMAKE_PREFIX_PATH="$CONDA_PREFIX" >/dev/null
-cmake --build build --target create_diskann_index run_query -j8 >/dev/null
+cmake --build build --target create_diskann_index run_query \
+  $([ "$RUN_POPS" = "1" ] && echo distortion_test) -j8 >/dev/null
+[ "$RUN_POPS" = "1" ] && mkdir -p "$POPS_DIR"
 echo "  ok"
 echo
 
@@ -352,6 +368,25 @@ if [ "$QUERY_BATCH" != "0" ]; then
   fi
 fi
 
+# ── Nodes popped per query (RUN_POPS=1) ────────────────────────────────────
+# run_query reports throughput, not how many nodes each search popped. With
+# RUN_POPS=1 every estimator cell is followed by distortion_test --pops on the
+# SAME plain index, with the same --on_host decision, queries, ground truth and
+# beam:limit pairs, so the QPS curve and the nodes-explored curve come from one
+# graph and one build. Costs a second index load + code build per cell.
+run_pops() {                       # $1 method, $2 k, $3 log, then --on_host if any
+  local m=$1 k=$2 log=$3; shift 3
+  local dm=$m; [ "$m" = "rq" ] && dm=rabitq
+  local out="$POPS_DIR/deep${SCALE}_${dm}_k${k}.csv"
+  [ -r "$G" ] || { echo "  pops: skipped (no ground truth)"; return 0; }
+  echo "[$( stamp )] pops $dm k$k -> $out"
+  ./build/bin/distortion_test -i "$IDX" --dim "$DIM" -t "$SRC_DTYPE" -n "$R_FIN" \
+      -m "$dm" -r "$k" -q "$Q" -g "$G" -k "$K" "$@" --pops "$out" -b $BEAM_LIMITS 2>&1 \
+    | tee -a "$log" \
+    | grep -E "mean_pops" \
+    || echo "  POPS FAILED ($dm k$k) — see $log"
+}
+
 run_cell() {                       # $1 = method, $2 = k_ranks ("" = baseline)
   local m=$1 k=${2:-}
   local mode_arg=() label host_arg=() res
@@ -379,6 +414,9 @@ run_cell() {                       # $1 = method, $2 = k_ranks ("" = baseline)
     | tee -a "$log" \
     | grep -E "beam_width|Recall|populate|generate|Rotating|Training" \
     || echo "  CELL FAILED ($label) — see $log"
+  if [ "$RUN_POPS" = "1" ] && [ "$m" != "conventional" ]; then
+    run_pops "$m" "$k" "$log" ${host_arg[@]+"${host_arg[@]}"}
+  fi
   echo
 }
 
@@ -392,3 +430,4 @@ done
 
 echo "=== done: $(stamp) ==="
 echo "Per-cell logs in $LOGDIR/deep${SCALE}_r${R_INT}_${R_FIN}_<method>_k<k>.log"
+[ "$RUN_POPS" = "1" ] && echo "Nodes-popped CSVs in $POPS_DIR/deep${SCALE}_<method>_k<k>.csv" || true

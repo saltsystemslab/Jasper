@@ -17,10 +17,11 @@
 #
 # The sibling of bench_deep_ksweep.sbatch, for the SRA genomic sketch sets.
 # Same shape, and worth running for a reason the DEEP sweep cannot cover: at
-# dim 768 all nine cells are legal and all nine fit on the card, so this is the
-# complete grid at one throughput regime. On DEEP (dim 96) RaBitQ's k16 is
-# impossible — rq_dim = 8*16 = 128 exceeds the data dimension — and at R=64
-# most cells spill to PCIe.
+# dim 768 every cell actually projects (rq_dim = 8k <= 128 < 768) and all nine
+# fit on the card, so this is the complete grid at one throughput regime. On
+# DEEP (dim 96) RaBitQ's k16 runs but degenerates — rq_dim = 128 outruns the
+# data, so it codes all 96 dims and idles 32 bits/edge — and at R=64 most
+# cells spill to PCIe.
 #
 # ── Why this builds ONE index ──────────────────────────────────────────────
 # run_query WITHOUT --prepopulated builds the codes at load: it rotates the
@@ -48,6 +49,10 @@
 #   METHODS="pq rq" K_LIST="4 16" sbatch sbatch/bench_locale_ksweep.sbatch
 #   MUTATIONS="0.00 0.05 0.10" sbatch sbatch/bench_locale_ksweep.sbatch
 #   DATASET=sra500 sbatch sbatch/bench_locale_ksweep.sbatch
+#   DATASET=sra500 RUN_POPS=1 sbatch sbatch/bench_locale_ksweep.sbatch
+#
+# RUN_POPS=1 also records nodes popped per query (recall vs nodes explored)
+# for every estimator cell: see run_pops below.
 #
 # Queries are tiled to QUERY_BATCH by default: the locale sets are ~500, the
 # beam search runs one block per query, and 500 blocks leaves the GPU idle
@@ -75,15 +80,24 @@ BEAM_LIMITS="${BEAM_LIMITS:-16:128 32:128 64:128 128:256 256:512 512:1024 1024:2
 QUERY_BATCH="${QUERY_BATCH:-10000}"    # 0 disables tiling
 ON_HOST="${ON_HOST:-auto}"             # auto | 1 | 0
 RUN_BASELINE="${RUN_BASELINE:-1}"      # also run conventional search once
+RUN_POPS="${RUN_POPS:-0}"              # also run distortion_test --pops per cell
 DRY_RUN="${DRY_RUN:-0}"
 DISK_BUDGET="${DISK_BUDGET:-0}"        # GiB, 0 = ask df
 
-DATA="${DATA:-/tmp2/ann_data/locale}"
+# sra500 is converted from the Hugging Face bundle in /scratch by
+# scripts/locale_bundle_to_fbin.py (the old /tmp2 copy is gone); sra50 still
+# lives in /tmp2. Either way the layout is $DATA/$DATASET/{base,query_mut*,gt_mut*}.
+if [ "$DATASET" = "sra500" ]; then
+  DATA="${DATA:-/scratch/${USER:-$(id -un)}/locale}"
+else
+  DATA="${DATA:-/tmp2/ann_data/locale}"
+fi
 # /tmp is node-local and cleared at job end, so the index cannot outlive this
 # job — fine, because the whole sweep runs inside it.
 WORK="${WORK:-/tmp/${USER:-$(id -un)}/locale_ksweep}"
 REPO="${REPO:-$HOME/jasper}"
 LOGDIR="${LOGDIR:-$REPO/locale_ksweep_logs}"
+POPS_DIR="${POPS_DIR:-$LOGDIR/pops}"   # <dataset>_<method>_k<k>.csv (plot_pops.py)
 INDEX="${INDEX:-}"                     # reuse an existing PLAIN index
 
 SRC_DTYPE=float
@@ -169,6 +183,11 @@ echo "  k_ranks:     $K_LIST"
 echo "  mutations:   $MUTATIONS"
 echo "  degrees:     R_int=$R_INT R_fin=$R_FIN  n_dup=$N_DUP  alpha=$ALPHA  dist=$DIST"
 echo "  search k:    $K"
+if [ "$RUN_POPS" = "1" ] && [ "$DIST" != "l2" ]; then
+  echo "  pops:        disabled — distortion_test compiles L2 configs only"
+  RUN_POPS=0
+fi
+[ "$RUN_POPS" = "1" ] && echo "  pops:        distortion_test --pops per cell -> $POPS_DIR"
 [ "$QUERY_BATCH" = "0" ] || echo "  query batch: tiled to >= $QUERY_BATCH (recall unchanged)"
 echo "  workdir:     $WORK"
 echo "  logs:        $LOGDIR"
@@ -265,11 +284,14 @@ for meth in $METHODS; do
         "SKIP: run_query has no R=$R_FIN k_ranks=$k $DIST $PACKED_T config"
       continue
     fi
-    # RaBitQ projects onto rq_dim = 8k coordinates; it cannot exceed dim.
-    if [ "$meth" = "rq" ] && [ $(( 8 * k )) -gt "$DIM" ]; then
-      printf "  %-4s %-4s %9s %10s %10s %s\n" "$meth" "$k" - - - \
-        "SKIP: rq_dim=$(( 8 * k )) > dim=$DIM"
-      continue
+    # rq_dim = 8k wider than the data is allowed, but there is nothing to
+    # project onto: it degenerates to plain 1-bit RaBitQ over all padded_dim
+    # coordinates, with the surplus bits stored at zero. Same recall as the
+    # largest k that fits, at strictly more bytes — so flag it rather than
+    # letting the B/edge column imply the extra bits bought something.
+    rq_note=""
+    if [ "$meth" = "rq" ] && [ $(( 8 * k )) -gt "$PADDED" ]; then
+      rq_note="(no projection: codes $PADDED dims, $(( 8 * k - PADDED )) bits/edge idle)"
     fi
     # PQ splits padded_dim into k subspaces; it must divide evenly.
     if [ "$meth" = "pq" ] && [ $(( PADDED % k )) -ne 0 ]; then
@@ -288,7 +310,7 @@ for meth in $METHODS; do
          else ANY_DEVICE=1; fi;;
     esac
     printf "  %-4s %-4s %9s %10s %10s %s\n" \
-      "$meth" "$k" "$(( pe / R_FIN ))" "$pn" "$(gib "$res") GiB" "$where"
+      "$meth" "$k" "$(( pe / R_FIN ))" "$pn" "$(gib "$res") GiB" "$where $rq_note"
     CELLS="$CELLS $meth:$k"
   done
 done
@@ -327,7 +349,9 @@ THRUST_DIR="${THRUST_DIR:-/projects/SaltSystemsLab/zikun/env/lib/rapids/cmake/th
 echo "=== building binaries ==="
 cmake -B build -DJASPER_BUILD_CMD=ON -DJASPER_BUILD_TESTS=OFF -DJASPER_BUILD_FFI=OFF \
   -DThrust_DIR="$THRUST_DIR" -DCMAKE_PREFIX_PATH="$CONDA_PREFIX" >/dev/null
-cmake --build build --target create_diskann_index run_query -j8 >/dev/null
+cmake --build build --target create_diskann_index run_query \
+  $([ "$RUN_POPS" = "1" ] && echo distortion_test) -j8 >/dev/null
+[ "$RUN_POPS" = "1" ] && mkdir -p "$POPS_DIR"
 echo "  ok"
 echo
 
@@ -371,6 +395,26 @@ prep_queries() {           # $1 = mutation; sets QFILE / GFILE
   return 0
 }
 
+# ── Nodes popped per query (RUN_POPS=1) ────────────────────────────────────
+# run_query reports throughput, not how many nodes each search popped. With
+# RUN_POPS=1 every estimator cell is followed by distortion_test --pops on the
+# SAME plain index, with the same --on_host decision, queries, ground truth and
+# beam:limit pairs, so the QPS curve and the nodes-explored curve come from one
+# graph and one build. Costs a second index load + code build per cell.
+run_pops() {               # $1 method, $2 k, $3 mutation, $4 log, then --on_host if any
+  local m=$1 k=$2 mut=$3 log=$4; shift 4
+  local dm=$m; [ "$m" = "rq" ] && dm=rabitq
+  local name="$DATASET"; [ "$mut" = "0.00" ] || name="${DATASET}_mut${mut}"
+  local out="$POPS_DIR/${name}_${dm}_k${k}.csv"
+  [ -n "$GFILE" ] || { echo "  pops: skipped (no ground truth for mut$mut)"; return 0; }
+  echo "[$( stamp )] pops $dm k$k mut$mut -> $out"
+  ./build/bin/distortion_test -i "$IDX" --dim "$DIM" -t "$SRC_DTYPE" -n "$R_FIN" \
+      -m "$dm" -r "$k" -q "$QFILE" -g "$GFILE" -k "$K" "$@" --pops "$out" -b $BEAM_LIMITS 2>&1 \
+    | tee -a "$log" \
+    | grep -E "mean_pops" \
+    || echo "  POPS FAILED ($dm k$k mut$mut) — see $log"
+}
+
 run_cell() {               # $1 = method, $2 = k_ranks ("" = baseline), $3 = mutation
   local meth=$1 k=${2:-} mut=$3
   local mode_arg=() host_arg=() gt_arg=() label res
@@ -400,6 +444,9 @@ run_cell() {               # $1 = method, $2 = k_ranks ("" = baseline), $3 = mut
     | tee -a "$log" \
     | grep -E "beam_width|Recall|populate|generate|Rotating|Training" \
     || echo "  CELL FAILED ($label mut$mut) — see $log"
+  if [ "$RUN_POPS" = "1" ] && [ "$meth" != "conventional" ]; then
+    run_pops "$meth" "$k" "$mut" "$log" ${host_arg[@]+"${host_arg[@]}"}
+  fi
   echo
 }
 
@@ -418,3 +465,4 @@ done
 
 echo "=== done: $(stamp) ==="
 echo "Per-cell logs in $LOGDIR/${DATASET}_r${R_INT}_${R_FIN}_<method>_k<k>_mut<m>.log"
+[ "$RUN_POPS" = "1" ] && echo "Nodes-popped CSVs in $POPS_DIR/${DATASET}_<method>_k<k>.csv" || true

@@ -88,7 +88,9 @@ struct graph_config {
   // edge residual onto rq_dim = 32/64/128 rotated coordinates, which at 1 bit
   // per dimension puts the per-edge footprint (code + rescale + mag²) in the
   // same range as the LSH and PQ codes it is benchmarked against.
-  // rq_dim must be <= the data dimension; populate_edge_rq checks that.
+  // rq_dim > the data dimension is legal but pointless: there is nothing to
+  // project onto, so it degenerates to plain 1-bit RaBitQ over every
+  // coordinate with the surplus bits pinned to zero. populate_edge_rq says so.
   static constexpr uint32_t rq_dim  = static_cast<uint32_t>(K_RANKS) * 8u;
   static constexpr uint32_t rq_bits = 1;
   using edge_rq_list_t = edge_rq_list<INDEX_T, N_NEIGHBORS, rq_dim, rq_bits>;
@@ -1457,11 +1459,20 @@ struct graph {
     static_assert(graph_cfg::use_lsh,
                   "populate_edge_rq requires graph_cfg::use_lsh");
     if (n_vectors == 0) return;
-    if (graph_cfg::rq_dim > dim)
-      throw std::runtime_error(
-          "populate_edge_rq: rq_dim=" + std::to_string(graph_cfg::rq_dim) +
-          " exceeds the data dimension " + std::to_string(dim) +
-          " — lower --k_ranks (rq_dim = 8 * k_ranks)");
+    // rq_dim wider than the data is not an error: there is simply nothing to
+    // project onto, so the codes degenerate to plain 1-bit RaBitQ over the
+    // whole vector and the surplus bits sit at zero. Worth saying out loud,
+    // because those bits are stored and paid for without carrying anything.
+    if (graph_cfg::rq_dim > get_padded_dim()) {
+      std::cout << "[populate_edge_rq] rq_dim=" << graph_cfg::rq_dim
+                << " exceeds padded_dim=" << get_padded_dim()
+                << "; coding all " << get_padded_dim()
+                << " coordinates (no projection) and zero-padding the rest — "
+                << (graph_cfg::rq_dim - get_padded_dim())
+                << " of " << graph_cfg::rq_dim
+                << " code bits per edge carry nothing. Lower k_ranks to "
+                << (get_padded_dim() / 8) << " or less to stop paying for them.\n";
+    }
 
     {
       std::vector<segment_t> h_segs(segments.begin(), segments.end());

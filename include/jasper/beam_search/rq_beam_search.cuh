@@ -199,12 +199,13 @@ struct rq_estimator {
   // (16B-aligned for compute_qu_diff_and_exact's vectorized stores, and capped
   // there by STORE_DIMS so it never scales with the data dimension). The IP
   // path dots against the query itself, which is already in shared memory, so
-  // it needs nothing.
-  __host__ static uint32_t extra_smem_size(uint32_t /*padded_dim*/) {
-    if constexpr (IS_L2)
-      return (static_cast<uint32_t>(sizeof(DATA_T)) * RQ_DIM + 15u) & ~15u;
-    else
-      return 0u;
+  // it normally needs nothing — unless rq_dim outruns the data, where it needs
+  // its own zero-padded copy rather than reading off the end of the query.
+  static constexpr uint32_t RD_BYTES =
+      (static_cast<uint32_t>(sizeof(DATA_T)) * RQ_DIM + 15u) & ~15u;
+  __host__ static uint32_t extra_smem_size(uint32_t padded_dim) {
+    if constexpr (IS_L2) return RD_BYTES;
+    return (RQ_DIM > padded_dim) ? RD_BYTES : 0u;
   }
 
   DATA_T*       smem_qu_diff;  // (q-u)[:rq_dim], written by visit(); L2 only
@@ -229,10 +230,29 @@ struct rq_estimator {
                           uint32_t padded_dim,
                           const globals_t& /*globals*/)
     : smem_qu_diff(reinterpret_cast<DATA_T*>(extra_smem)),
-      est_vec(IS_L2 ? smem_qu_diff : smem_query_vec),
+      est_vec(IS_L2 || RQ_DIM > padded_dim ? smem_qu_diff : smem_query_vec),
       node_scale(0.0f),
       exact_u(0.0f)
   {
+    // rq_dim wider than the data: no projection is possible, so this is plain
+    // 1-bit RaBitQ over the whole vector, with the surplus coordinates pinned
+    // to zero. Writing those zeros ONCE here is what lets the per-node and
+    // per-edge loops below keep compile-time bounds and read them for free —
+    // a zero coordinate adds nothing to the norm or to the dot, so the result
+    // matches a code built at rq_dim == padded_dim exactly. The encoder pins
+    // the same tail (rq_populate), so both sides agree bit for bit.
+    if (RQ_DIM > padded_dim) {
+      for (uint32_t i = padded_dim + threadIdx.x; i < RQ_DIM; i += BLOCK_SIZE)
+        smem_qu_diff[i] = static_cast<DATA_T>(0.0f);
+      // IP dots against the query, which is only padded_dim long, so it needs
+      // its own zero-padded copy rather than reading past the end of it.
+      if constexpr (!IS_L2) {
+        for (uint32_t i = threadIdx.x; i < padded_dim; i += BLOCK_SIZE)
+          smem_qu_diff[i] = smem_query_vec[i];
+      }
+      __syncthreads();
+    }
+
     // INNER_PRODUCT dots against q itself, so the scale is query-invariant:
     // compute it once here instead of per popped node.
     if constexpr (!IS_L2) {
@@ -281,19 +301,6 @@ struct rq_estimator {
 };
 
 // ===== Host: launcher =====
-// The projection is a coordinate truncation, so rq_dim must actually fit inside
-// the data dimension — otherwise the scorer would read past the estimator
-// vector. populate_edge_rq rejects that too, but a search can be handed a graph
-// it did not populate.
-template <typename graph_cfg_t>
-__host__ inline void rq_check_dim(uint32_t dim) {
-  if (graph_cfg_t::rq_dim > dim)
-    throw std::runtime_error(
-        "rq_beam_search: rq_dim=" + std::to_string(graph_cfg_t::rq_dim) +
-        " exceeds the data dimension " + std::to_string(dim) +
-        " — lower k_ranks (rq_dim = 8 * k_ranks)");
-}
-
 template <typename Cfg>
 __host__ beam_search_result<typename Cfg::graph_cfg_t>
 rq_beam_search(
@@ -304,7 +311,6 @@ rq_beam_search(
   using graph_cfg_t = typename Cfg::graph_cfg_t;
   static_assert(graph_cfg_t::use_lsh,
                 "rq_beam_search requires graph_cfg::use_lsh (directional storage)");
-  rq_check_dim<graph_cfg_t>(p.graph.dim);
   using Estimator = rq_estimator<graph_cfg_t, Cfg::dist_func, Cfg::block_size>;
   return graph_beam_search<Cfg, Estimator>(p, globals, stream);
 }
@@ -320,7 +326,6 @@ __host__ void rq_beam_search(
   using graph_cfg_t = typename Cfg::graph_cfg_t;
   static_assert(graph_cfg_t::use_lsh,
                 "rq_beam_search requires graph_cfg::use_lsh (directional storage)");
-  rq_check_dim<graph_cfg_t>(p.graph.dim);
   using Estimator = rq_estimator<graph_cfg_t, Cfg::dist_func, Cfg::block_size>;
   graph_beam_search<Cfg, Estimator>(p, globals, result, stream);
 }
