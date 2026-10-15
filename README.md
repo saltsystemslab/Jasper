@@ -98,36 +98,3 @@ g.save(
 # returns: None
 ```
 
-## Benchmarks
-
-Updated automatically by neu-ci after each nightly cluster run.
-
-### QPS vs. recall
-
-<!--neu-ci:qps_recall start-->
-![qps_recall](results/qps_recall.png)
-
-_updated 2026-08-04 03:25 UTC_
-<!--neu-ci:qps_recall end-->
-
-### Latest results
-
-<!--neu-ci:results start-->
-| dataset | insert_vps | query_qps | recall | delete_ms | live_recall | viol | consolidate_ms | append_vps |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| bigann10M | 454024.0 | 2024974.0 | 0.9568 | 1.8 | 0.9569 | 0 | 3094.1 | 252425.0 |
-| deep10M | 638085.0 | 2305065.0 | 0.9487 | 1.7 | 0.9492 | 0 | 2586.2 | 295110.0 |
-| gist | 171321.0 | 275170.0 | 0.8473 | 0.8 | 0.8469 | 0 | 976.5 | 162293.0 |
-| openai | 50634.0 | 139359.0 | 0.8936 | 1.1 | 0.8936 | 0 | 14958.1 | 35279.0 |
-
-_updated 2026-08-04 03:25 UTC_
-<!--neu-ci:results end-->
-
-### Throughput vs. recall tradeoff (bigann10M)
-
-<!--neu-ci:tradeoff start-->
-![tradeoff](results/tradeoff_bigann10m.png)
-
-_updated 2026-08-04 03:25 UTC_
-<!--neu-ci:tradeoff end-->
-
