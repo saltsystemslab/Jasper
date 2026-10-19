@@ -75,7 +75,9 @@ DEVICE_FREE_MIB="${DEVICE_FREE_MIB:-0}"
 SHARD_FILL="${SHARD_FILL:-70}"
 N_PARTS="${N_PARTS:-0}"
 K="${K:-10}"                           # search k; one value keeps the grid small
-BEAM_LIMITS="${BEAM_LIMITS:-16:128 32:128 64:128 128:256 256:512 512:1024 1024:2048}"
+# Same tail as bench_locale / bench_deep_scaling. The searches dispatch on
+# beam_width + 64 < 2048 (largest compiled search width), so 1982 is the top.
+BEAM_LIMITS="${BEAM_LIMITS:-16:128 32:128 64:128 128:256 256:512 512:1024 1024:2048 1536:2048 1982:2048}"
 QUERY_BATCH="${QUERY_BATCH:-0}"        # tile queries for a saturated QPS number
 ON_HOST="${ON_HOST:-auto}"             # auto | 1 | 0
 RUN_BASELINE="${RUN_BASELINE:-1}"      # also run conventional search once

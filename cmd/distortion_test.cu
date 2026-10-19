@@ -22,6 +22,11 @@
 //   --random <csv>      Score the out-edges of random nodes against random
 //                       queries (the original Fig. 8 sampling).
 //
+// -m conventional runs plain beam search (exact distance to every neighbor)
+// for --pops only, as the baseline for vectors fetched per query: directional
+// search fetches one vector per pop, conventional search one per appended
+// neighbor. --pops reports both counts as mean_vectors_fetched.
+//
 // The edge-scoring CSVs share one schema (step = n_steps = -1 for --random):
 //   method,k_ranks,distance,sample,u,query,step,n_steps,v,exact,est
 // exact/est are squared L2. They feed scripts/plot_distortion.py and
@@ -84,13 +89,14 @@ DT_FOR_EACH_CONFIG(DECLARE_CONFIGS_)
 // the searches run.
 constexpr uint32_t kBlock = 128;
 
-enum class Method { LSH, PQ, RQ };
+enum class Method { LSH, PQ, RQ, CONV };
 
 static const char* method_name(Method m) {
   switch (m) {
     case Method::LSH: return "lsh";
     case Method::PQ:  return "pq";
     case Method::RQ:  return "rabitq";
+    case Method::CONV: return "conventional";
   }
   return "?";
 }
@@ -197,8 +203,32 @@ struct Trajectories {
   uint32_t n_queries = 0, stride = 0;
   std::vector<thrust::pair<uint32_t, float>> visited;  // [n_queries * stride], pop order
   std::vector<uint32_t> counts;                        // pops per query
+  std::vector<uint64_t> fetched;                       // full vectors read per query
   std::vector<uint32_t> topk;                          // [n_queries * k]
 };
+
+// Vectors conventional search reads for one query, from its visited log.
+// populate_distances computes an exact distance for every valid neighbor it
+// appends (duplicates included, deduplication comes after), plus the medoid it
+// seeds with, so the count is 1 + the out-degrees of the expanded pops. A query
+// that hit max_result_size breaks right after recording its last pop, before
+// expanding it, so that pop's neighbors are not counted. Exact for a single
+// (unsharded-view) graph, where every neighbor is in range.
+template <typename GraphCfg>
+__global__ void conventional_vectors_fetched(
+    typename jasper::graph<GraphCfg>::device_view g,
+    const thrust::pair<uint32_t, float>* __restrict__ visited,
+    const uint32_t* __restrict__ counts, uint32_t stride, uint32_t n_queries,
+    uint64_t* __restrict__ out) {
+  const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n_queries) return;
+  const uint32_t n        = counts[i];
+  const uint32_t expanded = (n == stride) ? n - 1 : n;
+  uint64_t s = 1;
+  for (uint32_t j = 0; j < expanded; ++j)
+    s += g.get_edge_count(visited[static_cast<size_t>(i) * stride + j].first);
+  out[i] = s;
+}
 
 template <typename GraphCfg, Method M>
 static Trajectories<GraphCfg> search_logged(jasper::graph<GraphCfg>& g, Codes<GraphCfg>& c,
@@ -213,6 +243,7 @@ static Trajectories<GraphCfg> search_logged(jasper::graph<GraphCfg>& g, Codes<Gr
   if constexpr (M == Method::LSH) r = jasper::directional_search(g, c.lsh, q, p);
   if constexpr (M == Method::PQ)  r = jasper::pq_search(g, c.pq.view(), q, p);
   if constexpr (M == Method::RQ)  r = jasper::rq_search(g, c.rq, q, p);
+  if constexpr (M == Method::CONV) r = jasper::search(g, q, p);
   CUDA_CHECK(cudaDeviceSynchronize());
 
   Trajectories<GraphCfg> t;
@@ -229,6 +260,19 @@ static Trajectories<GraphCfg> search_logged(jasper::graph<GraphCfg>& g, Codes<Gr
                         cudaMemcpyDeviceToHost));
   t.topk.resize(front.size());
   for (size_t i = 0; i < front.size(); ++i) t.topk[i] = front[i].first;
+
+  // Directional search reads exactly one full vector per pop (visit() of u).
+  t.fetched.assign(t.counts.begin(), t.counts.end());
+  if constexpr (M == Method::CONV) {
+    uint64_t* d_fetched = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_fetched, sizeof(uint64_t) * t.n_queries));
+    conventional_vectors_fetched<GraphCfg><<<(t.n_queries + 255) / 256, 256>>>(
+        g.view(), r.visited, r.visited_counts, t.stride, t.n_queries, d_fetched);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaMemcpy(t.fetched.data(), d_fetched, sizeof(uint64_t) * t.n_queries,
+                          cudaMemcpyDeviceToHost));
+    cudaFree(d_fetched);
+  }
   cudaFree(r.frontier);
   cudaFree(r.visited);
   cudaFree(r.visited_counts);
@@ -282,7 +326,8 @@ static void run_pops(jasper::graph<GraphCfg>& g, Codes<GraphCfg>& c,
                      jasper::vector_view<__half> q, const GroundTruth& gt, const Opts& o) {
   std::ofstream out(o.pops_out);
   if (!out) throw std::runtime_error("Cannot open output: " + o.pops_out);
-  out << "method,k_ranks,beam_width,limit,recall,mean_pops,p50_pops,p95_pops,capped_frac\n";
+  out << "method,k_ranks,beam_width,limit,recall,mean_pops,p50_pops,p95_pops,capped_frac,"
+         "mean_vectors_fetched\n";
   std::cout << "\n=== recall vs pops (" << method_name(M) << " k_ranks="
             << static_cast<uint32_t>(GraphCfg::k_ranks) << ") ===" << std::endl;
 
@@ -306,15 +351,20 @@ static void run_pops(jasper::graph<GraphCfg>& g, Codes<GraphCfg>& c,
     // convergence; worth knowing when reading the curve's tail.
     const double capped =
         double(std::count(cnt.begin(), cnt.end(), t.stride)) / cnt.size();
+    double fetched = 0;
+    for (uint64_t x : t.fetched) fetched += double(x);
+    fetched /= t.fetched.size();
 
     out << method_name(M) << ',' << static_cast<uint32_t>(GraphCfg::k_ranks) << ','
         << bw << ',' << lim << ',' << std::setprecision(6) << recall << ',' << mean << ','
-        << cnt[cnt.size() / 2] << ',' << cnt[cnt.size() * 95 / 100] << ',' << capped << '\n';
+        << cnt[cnt.size() / 2] << ',' << cnt[cnt.size() * 95 / 100] << ',' << capped << ','
+        << fetched << '\n';
     std::cout << "  beam_width=" << bw << " limit=" << lim << std::fixed
               << std::setprecision(4) << " recall@" << o.k << "=" << recall
               << std::setprecision(1) << " mean_pops=" << mean
               << " p95_pops=" << cnt[cnt.size() * 95 / 100]
-              << std::setprecision(3) << " capped=" << capped << std::endl;
+              << std::setprecision(3) << " capped=" << capped
+              << std::setprecision(1) << " vectors_fetched=" << fetched << std::endl;
     std::cout.unsetf(std::ios::fixed);
   }
   std::cout << "  wrote " << o.pops_out << std::endl;
@@ -400,6 +450,10 @@ static void run(const Opts& o) {
     rotate_vectors = false;
     rotate_queries = true;
     seed           = rot.seed;
+  } else if constexpr (M == Method::CONV) {
+    // Exact distances are rotation-invariant and there are no codes to build,
+    // so skip the (host-side, at scale slow) rotation entirely.
+    rotate_vectors = rotate_queries = false;
   }
   if (rotate_vectors) {
     std::cout << "Rotating stored vectors (seed=" << seed << ")..." << std::endl;
@@ -418,7 +472,7 @@ static void run(const Opts& o) {
     codes.pq = graph.generate_pq_codebooks(o.pq_train);
     graph.populate_edge_pq(codes.pq);
     graph.compute_vector_norms();
-  } else {
+  } else if constexpr (M == Method::RQ) {
     std::cout << "Building RaBitQ codes (rq_dim=" << GraphCfg::rq_dim << ")..." << std::endl;
     codes.rq = graph.generate_rq_globals();
     graph.populate_edge_rq(codes.rq);
@@ -479,7 +533,9 @@ int main(int argc, char** argv) {
   program.add_argument("--n_neighbors", "-n").default_value(uint64_t{64}).scan<'u', uint64_t>();
   program.add_argument("--dim").required().scan<'u', uint32_t>();
   program.add_argument("--k", "-k").default_value(uint32_t{10}).scan<'u', uint32_t>();
-  program.add_argument("--method", "-m").required().choices("lsh", "pq", "rabitq");
+  program.add_argument("--method", "-m").required()
+      .choices("lsh", "pq", "rabitq", "conventional")
+      .help("Edge estimator; conventional = exact-distance beam search (--pops only).");
   program.add_argument("--k_ranks", "-r").default_value(uint32_t{4}).scan<'u', uint32_t>()
       .choices(4u, 8u, 16u);
   program.add_argument("--pq_train").default_value(uint32_t{40000}).scan<'u', uint32_t>();
@@ -529,7 +585,8 @@ int main(int argc, char** argv) {
   const auto method   = program.get<std::string>("--method");
   const auto n_nb     = program.get<uint64_t>("--n_neighbors");
   const auto k_ranks  = program.get<uint32_t>("--k_ranks");
-  o.method = method == "lsh" ? Method::LSH : method == "pq" ? Method::PQ : Method::RQ;
+  o.method = method == "lsh" ? Method::LSH : method == "pq" ? Method::PQ
+           : method == "rabitq" ? Method::RQ : Method::CONV;
 
   try {
     for (auto& s : program.get<std::vector<std::string>>("--beam_limits"))
@@ -541,6 +598,11 @@ int main(int argc, char** argv) {
   }
   if (o.pops_out.empty() && o.traj_out.empty() && o.random_out.empty()) {
     std::cerr << "Error: nothing to do; pass --pops, --trajectory and/or --random" << std::endl;
+    return 1;
+  }
+  if (o.method == Method::CONV && (!o.traj_out.empty() || !o.random_out.empty())) {
+    std::cerr << "Error: -m conventional has no estimator to score; it supports --pops only"
+              << std::endl;
     return 1;
   }
   if (!o.pops_out.empty() && o.gt_path.empty()) {
@@ -561,6 +623,7 @@ int main(int argc, char** argv) {
           case Method::LSH: run<cfg_##id, Method::LSH>(o); break;                   \
           case Method::PQ:  run<cfg_##id, Method::PQ>(o);  break;                   \
           case Method::RQ:  run<cfg_##id, Method::RQ>(o);  break;                   \
+          case Method::CONV: run<cfg_##id, Method::CONV>(o); break;                 \
         }                                                                           \
         dispatched = true;                                                          \
       }
