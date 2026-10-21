@@ -67,6 +67,22 @@ g = jasper.Graph.load(
 )
 ```
 
+## RaBitQ quantized search
+
+RaBitQ stores each vector as a few bits per dimension plus two float factors.
+`search_rabitq()` walks the graph using RaBitQ distance estimates and reranks
+the final beam against the full vectors, so the returned distances are exact.
+
+```python
+g.build_rabitq(bits=4)   # bits per dimension: 1, 2, 4 or 8
+
+indices, distances = g.search_rabitq(queries, k=10, beam_width=64)
+# indices:   torch.Tensor, int32,   shape [n_queries, k]
+# distances: torch.Tensor, float32, shape [n_queries, k] — exact distances
+```
+
+`append`, and a `compact` that reclaims slots, discard the codes (`g.has_rabitq` becomes `False`); call `build_rabitq` again afterwards.
+
 ## Insert and delete vectors
 
 Jasper supports updating a live graph without a full rebuild.

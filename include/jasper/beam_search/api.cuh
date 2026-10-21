@@ -2,8 +2,10 @@
 
 #include "jasper/beam_search/beam_search.cuh"
 #include "jasper/beam_search/directional_beam_search.cuh"
+#include "jasper/beam_search/rabitq_beam_search.cuh"
 #include "jasper/beam_search/config.cuh"
 #include "jasper/lsh/lsh_globals.cuh"
+#include "jasper/rabitq/index.cuh"
 
 namespace jasper {
 
@@ -135,6 +137,77 @@ beam_search_result<GRAPH_CFG> directional_search(
   else throw std::invalid_argument(
       "beam_width " + std::to_string(bw) +
       " is too large (beam_width + 64 must be < 2048)");
+}
+
+// ───────────────────────────── rabitq_search ───────────────────────────────
+
+template <typename GRAPH_CFG,
+          uint32_t BLOCK_SIZE,
+          uint32_t MAX_SEARCH_WIDTH,
+          uint32_t TILE_SIZE>
+beam_search_result<GRAPH_CFG> rabitq_search_impl(
+    const graph<GRAPH_CFG>&            g,
+    const rabitq_index&                rq,
+    typename GRAPH_CFG::vector_view_t& d_queries,
+    const rabitq_queries&              prepared,
+    const search_params&               params) {
+
+  using Cfg = beam_search_config<
+      GRAPH_CFG, GRAPH_CFG::dist_func,
+      BLOCK_SIZE, MAX_SEARCH_WIDTH, TILE_SIZE>;
+
+  beam_search_params<Cfg> bp {
+    .graph           = g,
+    .query_vectors   = d_queries,
+    .use_range       = false,
+    .medoid          = g.medoid,
+    .k               = params.k,
+    .beam_width      = params.beam_width,
+    .limit           = params.limit,
+    .get_visited     = params.get_visited,
+    .max_result_size = params.max_result_size,
+  };
+  return rabitq_beam_search<Cfg>(bp, rq, prepared);
+}
+
+// Beam search scored by RaBitQ distance estimates, then an exact rerank of the
+// final beam: the walk reads compact codes instead of full vectors, and only
+// the beam_width survivors touch the original vectors. Returned distances are
+// exact. `rq` must come from build_rabitq_index(g) and still match g's slots.
+template <typename GRAPH_CFG,
+          uint32_t BLOCK_SIZE = 64,
+          uint32_t TILE_SIZE  = 8>
+beam_search_result<GRAPH_CFG> rabitq_search(
+    const graph<GRAPH_CFG>&           g,
+    const rabitq_index&               rq,
+    typename GRAPH_CFG::vector_view_t d_queries,
+    const search_params&              params = {}) {
+  auto lk = g.lock_shared();  // shared: concurrent searches OK, blocks mutations
+  const uint32_t bw = params.beam_width;
+  if (bw + 64 >= 2048) {
+    throw std::invalid_argument(
+        "beam_width " + std::to_string(bw) +
+        " is too large (beam_width + 64 must be < 2048)");
+  }
+  validate_rabitq_index(g, rq);
+
+  rabitq_queries prepared = rq.prepare_queries(d_queries);
+  auto run = [&]() -> beam_search_result<GRAPH_CFG> {
+    if      (bw + 64 < 128)  return rabitq_search_impl<GRAPH_CFG, BLOCK_SIZE, 128,  TILE_SIZE>(g, rq, d_queries, prepared, params);
+    else if (bw + 64 < 256)  return rabitq_search_impl<GRAPH_CFG, BLOCK_SIZE, 256,  TILE_SIZE>(g, rq, d_queries, prepared, params);
+    else if (bw + 64 < 512)  return rabitq_search_impl<GRAPH_CFG, BLOCK_SIZE, 512,  TILE_SIZE>(g, rq, d_queries, prepared, params);
+    else if (bw + 64 < 1024) return rabitq_search_impl<GRAPH_CFG, BLOCK_SIZE, 1024, TILE_SIZE>(g, rq, d_queries, prepared, params);
+    else                     return rabitq_search_impl<GRAPH_CFG, BLOCK_SIZE, 2048, TILE_SIZE>(g, rq, d_queries, prepared, params);
+  };
+  beam_search_result<GRAPH_CFG> result;
+  try {
+    result = run();
+  } catch (...) {
+    prepared.deallocate();
+    throw;
+  }
+  prepared.deallocate();
+  return result;
 }
 
 }  // namespace jasper

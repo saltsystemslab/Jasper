@@ -67,6 +67,8 @@ _get_n_tombstoned_fn = _mod.jasper_get_n_tombstoned
 _get_n_live_fn = _mod.jasper_get_n_live
 _reserve_ids_fn = _mod.jasper_reserve_ids
 _get_dim_fn = _mod.jasper_get_dim
+_free_rabitq_fn = _mod.jasper_free_rabitq
+_has_rabitq_fn = _mod.jasper_has_rabitq
 
 
 def _get_fns(config_id: str):
@@ -81,6 +83,8 @@ def _get_fns(config_id: str):
             getattr(_mod, f"jasper_consolidate_{config_id}"),
             getattr(_mod, f"jasper_compact_{config_id}"),
             getattr(_mod, f"jasper_append_{config_id}"),
+            getattr(_mod, f"jasper_build_rabitq_{config_id}"),
+            getattr(_mod, f"jasper_search_rabitq_{config_id}"),
         )
     return _fn_cache[config_id]
 
@@ -121,6 +125,10 @@ class Graph:
 
         # Search
         indices, distances = g.search(queries, k=10)
+
+        # Search over RaBitQ codes, with an exact rerank of the final beam
+        g.build_rabitq(bits=4)
+        indices, distances = g.search_rabitq(queries, k=10)
     """
 
     def __init__(
@@ -141,7 +149,8 @@ class Graph:
         self._torch_dtype = _DTYPE_MAP[data_type]
         (_, _, self._search_fn, self._save_fn, self._get_vector_fn,
          self._mark_deleted_fn, self._consolidate_fn,
-         self._compact_fn, self._append_fn) = _get_fns(config_id)
+         self._compact_fn, self._append_fn,
+         self._build_rabitq_fn, self._search_rabitq_fn) = _get_fns(config_id)
 
     @classmethod
     def load(
@@ -281,7 +290,81 @@ class Graph:
             distances: float32 tensor [n_queries, k]
         """
         self._check_alive()
+        return self._run_search(
+            self._search_fn, queries, k, beam_width, print_throughput
+        )
 
+    def build_rabitq(self, bits: int = 4, seed: int = 0) -> None:
+        """
+        Quantize the graph's vectors with RaBitQ, enabling ``search_rabitq``.
+
+        Each vector is centered on the dataset centroid, randomly rotated, and
+        stored as a ``bits``-per-dimension code plus two float factors (72
+        bytes per 128-dim vector at 4 bits, versus 256 bytes as float16). The
+        graph itself is unchanged; the codes live next to it on the GPU.
+        Calling this again replaces the previous codes.
+
+        The codes snapshot the graph's current slots. ``append``, and a
+        ``compact`` that reclaims slots, discard them (``has_rabitq`` becomes
+        False), so call ``build_rabitq`` again afterwards. ``mark_deleted`` and
+        ``consolidate`` keep them valid.
+
+        Args:
+            bits: Bits per dimension: 1, 2, 4 or 8. More bits give tighter
+                  distance estimates at a higher memory and bandwidth cost.
+            seed: Seed for the random rotation.
+        """
+        self._check_alive()
+        if bits not in (1, 2, 4, 8):
+            raise ValueError(f"bits must be 1, 2, 4 or 8, got {bits}")
+        self._build_rabitq_fn(self._handle, bits, seed)
+
+    @property
+    def has_rabitq(self) -> bool:
+        """Whether RaBitQ codes are built and current (see ``build_rabitq``)."""
+        self._check_alive()
+        return bool(_has_rabitq_fn(self._handle))
+
+    def free_rabitq(self) -> None:
+        """Free the RaBitQ codes built by ``build_rabitq``; the graph is kept."""
+        self._check_alive()
+        _free_rabitq_fn(self._handle)
+
+    def search_rabitq(
+        self,
+        queries: torch.Tensor,
+        k: int = 10,
+        beam_width: int = 64,
+        print_throughput: bool = False
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Run beam search scored by RaBitQ distance estimates, then rerank the
+        final beam with exact distances.
+
+        The graph walk reads the compact RaBitQ codes instead of the full
+        vectors; only the ``beam_width`` surviving candidates are rescored
+        against the original vectors, so the returned distances are exact and
+        directly comparable to ``search``. Requires ``build_rabitq()`` first.
+
+        Args:
+            queries:    CUDA tensor of shape [n_queries, dim].
+            k:          Number of nearest neighbors to return.
+            beam_width: Search beam width (also the number of reranked candidates).
+        Returns:
+            indices:   int32  tensor [n_queries, k] of **stable ids**
+            distances: float32 tensor [n_queries, k] (exact)
+        """
+        self._check_alive()
+        if not self.has_rabitq:
+            raise RuntimeError(
+                "No RaBitQ codes for this graph: call build_rabitq() first "
+                "(append and compact discard them)"
+            )
+        return self._run_search(
+            self._search_rabitq_fn, queries, k, beam_width, print_throughput
+        )
+
+    def _run_search(self, search_fn, queries, k, beam_width, print_throughput):
         if not queries.is_cuda:
             raise ValueError("queries must be a CUDA tensor")
         if queries.dtype != self._torch_dtype:
@@ -307,8 +390,8 @@ class Graph:
 
         # limit is automaticall set to 2x the beam_width
         limit = beam_width * 2
-        
-        self._search_fn(
+
+        search_fn(
             self._handle, queries, out_indices, out_distances,
             k, beam_width, limit, print_throughput
         )
@@ -369,7 +452,8 @@ class Graph:
         """
         Append a batch of vectors to the live graph, wiring their edges into the
         existing graph (beam-search + robust-prune, same as construction) and
-        assigning each a fresh monotonic stable id.
+        assigning each a fresh monotonic stable id. Discards any RaBitQ codes;
+        call ``build_rabitq`` again to keep using ``search_rabitq``.
 
         Args:
             vectors: CUDA tensor [n, dim] of the graph's data type (float16).
@@ -429,6 +513,8 @@ class Graph:
 
         Stable ids are preserved: a vector keeps the same id across ``compact``
         (only internal slots are renumbered, transparently via the id map).
+        If slots were reclaimed, RaBitQ codes are discarded; call
+        ``build_rabitq`` again to keep using ``search_rabitq``.
         """
         self._check_alive()
         self._compact_fn(self._handle)

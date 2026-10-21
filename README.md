@@ -100,6 +100,33 @@ indices, distances = g.search(
 # distances: torch.Tensor, float32, shape [n_queries, k]
 ```
 
+### Search with RaBitQ quantization
+
+Quantize the graph's vectors with RaBitQ, then search over the compact codes.
+The graph walk scores candidates with RaBitQ distance estimates and only the
+final beam is reranked against the full vectors, so returned distances are exact.
+
+```python
+g.build_rabitq(
+    bits=4,                # int — bits per dimension: 1, 2, 4 or 8
+)
+# returns: None — codes are kept on the GPU next to the graph
+
+indices, distances = g.search_rabitq(
+    queries,              # torch.Tensor  [n_queries, dim], dtype=torch.float16, CUDA
+    k=10,                  # int    — number of neighbors to return
+    beam_width=64,          # int    — search beam width (= candidates reranked)
+)
+# indices:   torch.Tensor, int32,   shape [n_queries, k]
+# distances: torch.Tensor, float32, shape [n_queries, k] — exact distances
+```
+
+The codes snapshot the graph's vectors: `append`, and a `compact` that reclaims
+slots, discard them (`g.has_rabitq` becomes `False`), so call `build_rabitq`
+again afterwards. `mark_deleted` and `consolidate` keep them valid. From C++,
+the same path is `jasper::build_rabitq_index(g, bits)` + `jasper::rabitq_search(g, rq, queries, params)`,
+and `run_query --rabitq_bits 4` benchmarks it.
+
 ### Save a graph
 
 ```python

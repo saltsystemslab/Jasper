@@ -4,10 +4,14 @@
 #include <curand.h>
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
+#include <algorithm>
+#include <array>
 #include <cmath>
 #include <queue>
 #include <vector>
 #include <iostream>
+#include <stdexcept>
+#include <string>
 
 #include "jasper/rabitq/layout.cuh"
 #include "jasper/rabitq/distance.cuh"
@@ -130,6 +134,15 @@ static __host__ double get_const_scaling_factors(uint32_t dim, uint32_t bits_per
   return sum / n_samples;
 }
 
+// Rescale constant for a `bits_per_dim`-bit code. One bit is the sign, so the
+// magnitude calc_multi_code clamps to has bits_per_dim - 1 bits; t must be
+// fitted to that range, or the largest coordinates saturate. 1-bit codes are
+// sign-only and ignore t.
+static __host__ double rabitq_t_const(uint32_t dim, uint32_t bits_per_dim) {
+  if (bits_per_dim <= 1) return 0.0;
+  return get_const_scaling_factors(dim, bits_per_dim - 1);
+}
+
 // ═══════════════════════════════════════════════════════════════
 // Device kernels — runtime dim via shared memory
 // ═══════════════════════════════════════════════════════════════
@@ -179,6 +192,10 @@ __device__ float calc_multi_code(
   return ip_norm_inv;
 }
 
+__host__ __device__ inline uint32_t rabitq_quantize_smem_per_tile(uint32_t dim) {
+  return (static_cast<uint32_t>(sizeof(float) + sizeof(uint8_t)) * dim + 3u) & ~3u;
+}
+
 // Main quantize kernel — SIZE_PER_DIM is compile-time, dim is runtime
 template <uint32_t SIZE_PER_DIM, uint16_t TILE_SIZE = 4>
 __global__ void rabitq_quantize_kernel(
@@ -200,9 +217,10 @@ __global__ void rabitq_quantize_kernel(
   uint32_t dim = out_store.dim;
 
   // Dynamic shared memory: per-tile workspace
-  // Layout: [tiles_per_block][dim floats + dim uint8s]
+  // Layout: [tiles_per_block][dim floats + dim uint8s], stride rounded up to 4B
+  // so every tile's float array stays aligned for odd dims.
   extern __shared__ char rq_smem[];
-  uint32_t per_tile_bytes = sizeof(float) * dim + sizeof(uint8_t) * dim;
+  uint32_t per_tile_bytes = rabitq_quantize_smem_per_tile(dim);
   float* residual_vec = reinterpret_cast<float*>(
       rq_smem + tile_id_in_block * per_tile_bytes);
   uint8_t* uncompressed_code = reinterpret_cast<uint8_t*>(
@@ -275,27 +293,148 @@ __global__ void rabitq_quantize_kernel(
   }
 }
 
-// ── Flatten kernel (replaces data_vector → float*) ─────────────
+// ── Convert (padded) rows to contiguous float rows ─────────────
+// in:  [n_vectors * in_stride] (e.g. a vector_view's padded rows)
+// out: [n_vectors * dim], the unpadded row-major layout cuBLAS rotation expects
 template <typename T>
-__global__ void flatten_to_float_kernel(
-    const T* __restrict__ in,  // flat [n_vectors * dim]
+__global__ void rows_to_float_kernel(
+    const T* __restrict__ in,
+    uint32_t in_stride,
     float* __restrict__ out,
     uint32_t dim,
     uint64_t n_vectors) {
-  uint64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
   uint64_t total = n_vectors * dim;
-  if (idx < total) {
-    out[idx] = static_cast<float>(in[idx]);
+  for (uint64_t idx = blockIdx.x * static_cast<uint64_t>(blockDim.x) + threadIdx.x;
+       idx < total; idx += static_cast<uint64_t>(gridDim.x) * blockDim.x) {
+    uint64_t row = idx / dim;
+    uint32_t col = static_cast<uint32_t>(idx % dim);
+    out[idx] = static_cast<float>(in[row * in_stride + col]);
   }
 }
 
+template <typename T>
+__host__ void rows_to_float(const T* in, uint32_t in_stride, float* out,
+                            uint32_t dim, uint64_t n_vectors,
+                            cudaStream_t stream = 0) {
+  uint64_t total = n_vectors * dim;
+  uint32_t grid = static_cast<uint32_t>(
+      std::min<uint64_t>((total + 255) / 256, 65535));
+  if (grid == 0) return;
+  rows_to_float_kernel<<<grid, 256, 0, stream>>>(in, in_stride, out, dim, n_vectors);
+}
+
+// Per-query estimator factors, one tile per query. `add` is the query half of
+// the additive term: ||q_r - c_r||^2 for L2, -<q_r, c_r> for IP.
+template <uint32_t TILE_SIZE = 4>
+__global__ void rabitq_query_factor_kernel(
+    const float* __restrict__ rot_queries,   // [n_queries * dim]
+    uint32_t n_queries,
+    uint32_t dim,
+    const float* __restrict__ rot_centroid,  // [dim]
+    uint32_t bits_per_dim,
+    MetricType metric_type,
+    RabitqQueryFactor* __restrict__ factors) {
+
+  auto block = cg::this_thread_block();
+  auto tile = cg::tiled_partition<TILE_SIZE>(block);
+
+  uint64_t tiles_per_block = blockDim.x / TILE_SIZE;
+  uint64_t global_tile_id = block.thread_rank() / TILE_SIZE + blockIdx.x * tiles_per_block;
+  uint64_t total_tiles = gridDim.x * tiles_per_block;
+
+  const float c_1 = -0.5f;
+  const float c_b = -static_cast<float>((1u << bits_per_dim) - 1u) / 2.0f;
+
+  for (uint64_t i = global_tile_id; i < n_queries; i += total_tiles) {
+    const float* q = rot_queries + i * dim;
+    float sqr_norm_tmp = 0, ip_cent_tmp = 0, sumq_tmp = 0;
+    for (uint32_t j = tile.thread_rank(); j < dim; j += tile.size()) {
+      float diff = q[j] - rot_centroid[j];
+      sqr_norm_tmp += diff * diff;
+      ip_cent_tmp  += q[j] * rot_centroid[j];
+      sumq_tmp     += q[j];
+    }
+    float sqr_norm = cg::reduce(tile, sqr_norm_tmp, cg::plus<float>());
+    float ip_cent  = cg::reduce(tile, ip_cent_tmp,  cg::plus<float>());
+    float sumq     = cg::reduce(tile, sumq_tmp,     cg::plus<float>());
+
+    if (tile.thread_rank() == 0) {
+      RabitqQueryFactor fac;
+      fac.add     = (metric_type == METRIC_L2) ? sqr_norm : -ip_cent;
+      fac.k1xSumq = c_1 * sumq;
+      fac.kBxSumq = c_b * sumq;
+      factors[i] = fac;
+    }
+  }
+}
+
+namespace detail {
+
+// One cuBLAS handle per host thread for the per-search query rotation:
+// creating a handle costs more than rotating a query batch, and a handle must
+// not be shared by threads that search concurrently (search only takes a
+// shared lock on the graph).
+inline cublasHandle_t thread_local_cublas_handle() {
+  struct handle_holder {
+    cublasHandle_t handle = nullptr;
+    handle_holder()  { cublasCreate(&handle); }
+    ~handle_holder() { if (handle) cublasDestroy(handle); }
+  };
+  thread_local handle_holder holder;
+  return holder.handle;
+}
+
+}  // namespace detail
+
 // ═══════════════════════════════════════════════════════════════
-// Host entry point
+// Host entry points
 // ═══════════════════════════════════════════════════════════════
+
+// Quantize n_vectors already-rotated rows into out_store[0, n_vectors).
+// `out_store` may be a window into a larger store (data offset by whole
+// nodes), which is how batched builds fill one store incrementally.
+template <uint32_t SIZE_PER_DIM>
+__host__ void rabitq_quantize_rotated(
+    const float* d_rot_vectors,            // device, [n_vectors * dim]
+    uint64_t n_vectors,
+    const float* d_rot_centroid,           // device, [dim]
+    double t_const,
+    MetricType metric_type,
+    rabitq_data_store<float> out_store,    // device store to write into
+    cudaStream_t stream = 0) {
+  if (n_vectors == 0) return;
+
+  // Size the block to the per-tile smem workspace so large dims still launch
+  // (64 tiles of dim=960 would need ~300KB).
+  constexpr uint32_t TILE_SIZE = 4;
+  constexpr uint32_t MAX_TILES_PER_BLOCK = 64;
+  constexpr size_t   DEFAULT_SMEM_LIMIT = 48 * 1024;
+  const size_t smem_per_tile = rabitq_quantize_smem_per_tile(out_store.dim);
+  const uint32_t tiles_per_block = static_cast<uint32_t>(std::clamp<size_t>(
+      DEFAULT_SMEM_LIMIT / smem_per_tile, 1, MAX_TILES_PER_BLOCK));
+  const size_t smem = smem_per_tile * tiles_per_block;
+
+  auto kernel = rabitq_quantize_kernel<SIZE_PER_DIM, TILE_SIZE>;
+  if (smem > DEFAULT_SMEM_LIMIT) {
+    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         static_cast<int>(smem));
+  }
+  uint32_t grid = static_cast<uint32_t>(std::min<uint64_t>(
+      (n_vectors + tiles_per_block - 1) / tiles_per_block, 1u << 20));
+
+  kernel<<<grid, tiles_per_block * TILE_SIZE, smem, stream>>>(
+      d_rot_vectors, n_vectors, out_store, d_rot_centroid, t_const, metric_type);
+
+  cudaError_t err = cudaStreamSynchronize(stream);
+  if (err != cudaSuccess) {
+    std::cerr << "Quantize kernel failed: "
+              << cudaGetErrorString(err) << std::endl;
+  }
+}
 
 template <uint32_t SIZE_PER_DIM = 1>
 __host__ rabitq_data_store<float> rabitq_quantize(
-    vector_view<float> original_vectors,   // device, [n_vectors * dim]
+    vector_view<float> original_vectors,   // device, [n_vectors * padded_dim]
     float* d_rotation_matrix,              // device, [dim * dim] column-major
     float* d_centroid,                     // device, [dim]
     MetricType metric_type) {
@@ -306,11 +445,20 @@ __host__ rabitq_data_store<float> rabitq_quantize(
   cublasHandle_t handle;
   cublasCreate(&handle);
 
+  // cuBLAS rotation reads unpadded rows; compact padded rows first.
+  float* d_vectors = original_vectors.data;
+  if (original_vectors.padded_dim != dim) {
+    cudaMalloc(&d_vectors, sizeof(float) * n_vectors * dim);
+    rows_to_float(original_vectors.data, original_vectors.padded_dim,
+                  d_vectors, dim, n_vectors);
+  }
+
   // Rotate data vectors: d_rot = P^T * data^T → stored as [n_vectors * dim]
   float* d_rot_vectors;
   cudaMalloc(&d_rot_vectors, sizeof(float) * n_vectors * dim);
-  rotate_data_vec(handle, original_vectors.data, d_rot_vectors,
+  rotate_data_vec(handle, d_vectors, d_rot_vectors,
                   n_vectors, dim, d_rotation_matrix);
+  if (d_vectors != original_vectors.data) cudaFree(d_vectors);
 
   // Rotate centroid
   float* d_rot_centroid;
@@ -320,31 +468,16 @@ __host__ rabitq_data_store<float> rabitq_quantize(
   cudaDeviceSynchronize();
 
   // Compute t_const
-  double t_const = get_const_scaling_factors(dim, SIZE_PER_DIM);
+  double t_const = rabitq_t_const(dim, SIZE_PER_DIM);
   std::cout << "t_const=" << t_const << std::endl;
 
   // Allocate output store on device
   auto out_store = rabitq_data_store<float>::allocate_device(
       n_vectors, dim, SIZE_PER_DIM);
 
-  // Launch quantization kernel
-  constexpr uint32_t TILE_SIZE = 4;
-  constexpr uint32_t BLOCK_SIZE = 256;
-  uint32_t tiles_per_block = BLOCK_SIZE / TILE_SIZE;
-  uint32_t grid = (n_vectors + tiles_per_block - 1) / tiles_per_block;
-  uint32_t smem_per_tile = sizeof(float) * dim + sizeof(uint8_t) * dim;
-  uint32_t smem = smem_per_tile * tiles_per_block;
-
-  rabitq_quantize_kernel<SIZE_PER_DIM, TILE_SIZE>
-      <<<grid, BLOCK_SIZE, smem>>>(
-          d_rot_vectors, n_vectors, out_store,
-          d_rot_centroid, t_const, metric_type);
-
-  cudaError_t err = cudaDeviceSynchronize();
-  if (err != cudaSuccess) {
-    std::cerr << "Quantize kernel failed: "
-              << cudaGetErrorString(err) << std::endl;
-  }
+  rabitq_quantize_rotated<SIZE_PER_DIM>(
+      d_rot_vectors, n_vectors, d_rot_centroid, t_const, metric_type,
+      out_store);
 
   // Cleanup temporaries
   cudaFree(d_rot_vectors);
@@ -364,21 +497,71 @@ __host__ rabitq_data_store<float> rabitq_quantize(
 
   uint32_t dim = original_vectors.dim;
   uint64_t n_vectors = original_vectors.n_vectors;
-  uint64_t total = n_vectors * dim;
 
-  // Convert to float
+  // Convert to float (dropping row padding)
   float* d_float;
-  cudaMalloc(&d_float, sizeof(float) * total);
-  flatten_to_float_kernel<<<(total + 255) / 256, 256>>>(
-      original_vectors.data, d_float, dim, n_vectors);
+  cudaMalloc(&d_float, sizeof(float) * n_vectors * dim);
+  rows_to_float(original_vectors.data, original_vectors.padded_dim,
+                d_float, dim, n_vectors);
   cudaDeviceSynchronize();
 
-  vector_view<float> float_view(d_float, dim, n_vectors, false /*on_host*/);
+  vector_view<float> float_view(d_float, dim, dim, n_vectors, false /*on_host*/);
   auto result = rabitq_quantize<SIZE_PER_DIM>(
       float_view, d_rotation_matrix, d_centroid, metric_type);
 
   cudaFree(d_float);
   return result;
+}
+
+// Rotate a batch of queries into the codes' space (P^T q, same as the data)
+// and compute their estimator factors. `d_queries` holds padded rows of any
+// element type; `bits_per_dim` and `metric_type` must match the data store.
+// Caller frees the result with rabitq_queries::deallocate().
+template <typename DATA_T>
+__host__ rabitq_queries rabitq_prepare_queries(
+    vector_view<DATA_T> d_queries,
+    float* d_rotation_matrix,              // device, [dim * dim] column-major
+    const float* d_rot_centroid,           // device, [dim], already rotated
+    uint32_t bits_per_dim,
+    MetricType metric_type,
+    cudaStream_t stream = 0) {
+
+  rabitq_queries out;
+  out.n_queries = d_queries.n_vectors;
+  out.dim       = d_queries.dim;
+  if (out.n_queries == 0) return out;
+
+  const uint64_t n   = out.n_queries;
+  const uint32_t dim = out.dim;
+
+  float* d_flat;
+  cudaMalloc(&d_flat, sizeof(float) * n * dim);
+  cudaMalloc(&out.rot_queries, sizeof(float) * n * dim);
+  cudaMalloc(&out.factors, sizeof(RabitqQueryFactor) * n);
+
+  rows_to_float(d_queries.data, d_queries.padded_dim, d_flat, dim, n, stream);
+
+  cublasHandle_t handle = detail::thread_local_cublas_handle();
+  cublasSetStream(handle, stream);
+  rotate_data_vec(handle, d_flat, out.rot_queries, n, dim, d_rotation_matrix);
+  cudaFree(d_flat);
+
+  constexpr uint32_t TILE_SIZE = 4;
+  constexpr uint32_t BLOCK_SIZE = 256;
+  constexpr uint32_t tiles_per_block = BLOCK_SIZE / TILE_SIZE;
+  uint32_t grid = static_cast<uint32_t>(std::min<uint64_t>(
+      (n + tiles_per_block - 1) / tiles_per_block, 65535));
+  rabitq_query_factor_kernel<TILE_SIZE><<<grid, BLOCK_SIZE, 0, stream>>>(
+      out.rot_queries, out.n_queries, dim, d_rot_centroid,
+      bits_per_dim, metric_type, out.factors);
+
+  cudaError_t err = cudaStreamSynchronize(stream);
+  if (err != cudaSuccess) {
+    out.deallocate();
+    throw std::runtime_error(std::string("rabitq_prepare_queries failed: ") +
+                             cudaGetErrorString(err));
+  }
+  return out;
 }
 
 } // namespace jasper

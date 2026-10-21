@@ -21,6 +21,9 @@ def parse_args():
     p.add_argument("-k", type=int, default=1, help="Top-k results (default: 1)")
     p.add_argument("--beam-widths", type=int, nargs="+", default=[1, 2, 4, 8, 16, 32, 64, 128, 256],
                     help="Beam widths to sweep (default: 1 2 4 8 16 32 64 128 256)")
+    p.add_argument("--rabitq-bits", type=int, default=0, choices=[0, 1, 2, 4, 8],
+                    help="Search over RaBitQ codes with this many bits per dim, reranking "
+                         "the final beam exactly (default: 0 = exact search)")
 
     return p.parse_args()
 
@@ -41,12 +44,17 @@ def main():
     queries = jasper.read_bin(args.queries, args.dtype).to(device="cuda")
     gt_indices, _ = jasper.read_groundtruth(args.groundtruth, args.k)
 
+    search = g.search
+    if args.rabitq_bits:
+        g.build_rabitq(bits=args.rabitq_bits)
+        search = g.search_rabitq
+
     # warmup
-    g.search(queries, k=args.k, beam_width=max(args.beam_widths), print_throughput=False)
+    search(queries, k=args.k, beam_width=max(args.beam_widths), print_throughput=False)
 
     # sweep beam widths
     for bw in args.beam_widths:
-        indices, _ = g.search(queries, k=args.k, beam_width=bw, print_throughput=True)
+        indices, _ = search(queries, k=args.k, beam_width=bw, print_throughput=True)
         jasper.get_recall(gt_indices, indices, args.k, len(queries))
 
     g.free()

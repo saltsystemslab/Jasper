@@ -152,7 +152,8 @@ __host__ inline void rotate_data_vec(
 
 // Rotate a single data vector (the centroid path in rabitq quantize).
 // Equivalent to a GEMV but expressed as a single-column GEMM so it can use
-// the same Ex API.
+// the same Ex API. Applies P^T, the same orientation as rotate_data_vec, so a
+// rotated centroid lands in the same space as the rotated data/query vectors.
 template <typename DataT>
 __host__ inline void rotate_single_data_vec(
     cublasHandle_t handle,
@@ -168,7 +169,7 @@ __host__ inline void rotate_single_data_vec(
   cudaDataType io_type = detail::cublas_dtype<DataT>();
   cublasStatus_t stat = cublasGemmEx(
       handle,
-      CUBLAS_OP_N, CUBLAS_OP_N,
+      CUBLAS_OP_T, CUBLAS_OP_N,
       dim, 1, dim,
       &alpha,
       d_P,                   io_type, dim,

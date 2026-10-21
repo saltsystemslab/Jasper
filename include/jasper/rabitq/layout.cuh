@@ -57,6 +57,13 @@ struct rabitq_data_store {
     return (raw + align - 1) / align * align;
   }
 
+  // Number of floats a rotated query must be zero-padded to. The distance
+  // estimator walks the code one 32-bit word (32 / bits_per_dim dims) at a
+  // time, so it reads query lanes up to the end of the last code word.
+  __host__ __device__ uint32_t query_padded_dim() const {
+    return code_bytes() * 8 / bits_per_dim;
+  }
+
   // Total bytes per node
   __host__ __device__ uint32_t node_bytes() const {
     uint32_t n_scalars = 2;
@@ -70,12 +77,12 @@ struct rabitq_data_store {
 
   // Get a mutable view of node i
   __host__ __device__ rabitq_node_view<T> operator[](uint32_t i) {
-    return rabitq_node_view<T>(data + i * node_bytes(), code_bytes());
+    return rabitq_node_view<T>(data + static_cast<size_t>(i) * node_bytes(), code_bytes());
   }
 
   // Get a const view of node i
   __host__ __device__ const_rabitq_node_view<T> operator[](uint32_t i) const {
-    return const_rabitq_node_view<T>(data + i * node_bytes(), code_bytes());
+    return const_rabitq_node_view<T>(data + static_cast<size_t>(i) * node_bytes(), code_bytes());
   }
 
   __host__ static rabitq_data_store<T> allocate_host(
@@ -147,6 +154,22 @@ struct RabitqQueryFactor {
   float add = 0;
   float k1xSumq = 0;
   float kBxSumq = 0;
+};
+
+// Queries prepared for RaBitQ search (device memory): each query rotated into
+// the codes' space, plus its per-query estimator factors.
+struct rabitq_queries {
+  float*             rot_queries = nullptr;  // [n_queries * dim], row-major, unpadded
+  RabitqQueryFactor* factors     = nullptr;  // [n_queries]
+  uint32_t           n_queries   = 0;
+  uint32_t           dim         = 0;
+
+  void deallocate() {
+    cudaFree(rot_queries);
+    cudaFree(factors);
+    rot_queries = nullptr;
+    factors     = nullptr;
+  }
 };
 
 } // namespace jasper

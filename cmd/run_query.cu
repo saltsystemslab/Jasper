@@ -125,8 +125,11 @@ float get_recall(const GroundTruth& gt,
 }
 
 // ── Single search round ────────────────────────────────────────
+// With `rq` set, runs RaBitQ search (estimated walk + exact rerank); the timed
+// region then includes rotating the queries into the codes' space.
 template <typename GraphCfg, typename DataT>
 void run_search_round(jasper::graph<GraphCfg>& graph,
+                      const jasper::rabitq_index* rq,
                       DataT* d_queries,
                       uint32_t n_queries,
                       uint32_t dim,
@@ -153,7 +156,8 @@ void run_search_round(jasper::graph<GraphCfg>& graph,
   CUDA_CHECK(cudaGetLastError());
 
   cudaEventRecord(e0);
-  auto result = jasper::search(graph, query_view, params);
+  auto result = rq ? jasper::rabitq_search(graph, *rq, query_view, params)
+                   : jasper::search(graph, query_view, params);
   CUDA_CHECK(cudaGetLastError());
   cudaDeviceSynchronize();
   CUDA_CHECK(cudaGetLastError());
@@ -210,12 +214,21 @@ void load_and_bench(const std::string& index_path,
                     const std::string& src_dtype,
                     uint32_t dim,
                     uint32_t k,
+                    uint32_t rabitq_bits,
                     const std::vector<std::pair<uint32_t, uint32_t>>& beam_limit_pairs) {
 
   // Load graph
   std::cout << "Loading index..." << std::endl;
   auto graph = jasper::load_graph_from_file<GraphCfg>(index_path, dim);
   std::cout << "  " << graph.n_vectors << " vectors, dim=" << graph.dim << std::endl;
+
+  // Optional RaBitQ codes for the quantized search path
+  jasper::rabitq_index rq;
+  if (rabitq_bits > 0) {
+    std::cout << "Building RaBitQ index (" << rabitq_bits << " bits/dim)..." << std::endl;
+    rq = jasper::build_rabitq_index(graph, rabitq_bits);
+  }
+  const jasper::rabitq_index* rq_ptr = (rabitq_bits > 0) ? &rq : nullptr;
 
   // Load queries, casting src_dtype -> DataT (__half)
   std::cout << "Loading queries..." << std::endl;
@@ -258,19 +271,22 @@ void load_and_bench(const std::string& index_path,
   std::cout << "\nWarmup..." << std::endl;
   auto [warmup_bw, warmup_limit] = beam_limit_pairs.front();
   run_search_round<GraphCfg, DataT>(
-    graph, d_queries, n_queries, dim, k,
+    graph, rq_ptr, d_queries, n_queries, dim, k,
     warmup_bw, warmup_limit, nullptr, false);
 
   // Benchmark rounds
-  std::cout << "\n=== Benchmark (k=" << k << ") ===" << std::endl;
+  std::cout << "\n=== Benchmark (k=" << k
+            << (rq_ptr ? ", rabitq_bits=" + std::to_string(rabitq_bits) : std::string{})
+            << ") ===" << std::endl;
   for (auto& [bw, lim] : beam_limit_pairs) {
     run_search_round<GraphCfg, DataT>(
-      graph, d_queries, n_queries, dim, k,
+      graph, rq_ptr, d_queries, n_queries, dim, k,
       bw, lim, has_gt ? &gt : nullptr, true);
   }
 
   // Cleanup
   cudaFree(d_queries);
+  rq.deallocate();
   graph.deallocate();
 }
 
@@ -337,6 +353,12 @@ int main(int argc, char** argv) {
     .nargs(argparse::nargs_pattern::at_least_one)
     .help("beam_width:limit pairs to benchmark (e.g. 16:128 64:256)");
 
+  program.add_argument("--rabitq_bits", "-r")
+    .default_value(uint32_t{0})
+    .scan<'u', uint32_t>()
+    .help("Search over RaBitQ codes with this many bits per dim (1, 2, 4, 8), "
+          "reranking the final beam exactly; 0 (default) = exact search");
+
   try {
     program.parse_args(argc, argv);
   } catch (const std::exception& err) {
@@ -354,6 +376,13 @@ int main(int argc, char** argv) {
   auto dim          = program.get<uint32_t>("--dim");
   auto k            = program.get<uint32_t>("--k");
   auto beam_args    = program.get<std::vector<std::string>>("--beam_limits");
+  auto rabitq_bits  = program.get<uint32_t>("--rabitq_bits");
+
+  if (rabitq_bits != 0 && rabitq_bits != 1 && rabitq_bits != 2 &&
+      rabitq_bits != 4 && rabitq_bits != 8) {
+    std::cerr << "Error: --rabitq_bits must be 0, 1, 2, 4 or 8" << std::endl;
+    return 1;
+  }
 
   std::vector<std::pair<uint32_t, uint32_t>> beam_limit_pairs;
   try {
@@ -372,6 +401,7 @@ int main(int argc, char** argv) {
   std::cout << "  n_neighbors:  " << n_neighbors << std::endl;
   std::cout << "  dim:          " << dim << std::endl;
   std::cout << "  k:            " << k << std::endl;
+  std::cout << "  rabitq_bits:  " << (rabitq_bits ? std::to_string(rabitq_bits) : std::string{"off"}) << std::endl;
   std::cout << "  beam_limits:  ";
   for (auto& [bw, lim] : beam_limit_pairs)
     std::cout << bw << ":" << lim << " ";
@@ -385,7 +415,7 @@ int main(int argc, char** argv) {
         std::cout << "  Config: " #id << std::endl;                           \
         load_and_bench<cfg_##id, DAT>(                                        \
             index_path, query_path, gt_path, datatype,                        \
-            dim, k, beam_limit_pairs);                                        \
+            dim, k, rabitq_bits, beam_limit_pairs);                           \
         dispatched = true;                                                     \
       }
 

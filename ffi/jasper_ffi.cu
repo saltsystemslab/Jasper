@@ -67,6 +67,86 @@ __global__ void unpack_results_kernel(
   }
 }
 
+// RaBitQ indexes, keyed by the handle of the graph they were built from.
+static std::unordered_map<int64_t, jasper::rabitq_index> g_rabitq;
+
+// Free the RaBitQ index built for `handle` once the graph's slot count moves
+// away from it: append adds slots and compact renumbers them, so the codes no
+// longer line up. Codes survive mark_deleted/consolidate (slots stay put).
+static void drop_stale_rabitq(int64_t handle, uint64_t n_vectors) {
+  std::lock_guard<std::mutex> lock(g_mutex);
+  auto it = g_rabitq.find(handle);
+  if (it != g_rabitq.end() && it->second.n_vectors() != n_vectors) {
+    it->second.deallocate();
+    g_rabitq.erase(it);
+  }
+}
+
+// Shared body of the search entry points: time `search_fn`, then translate
+// internal slots to stable ids and unpack into the caller's output tensors.
+template <typename CFG, typename DAT, typename SearchFn>
+void run_search(jasper::graph<CFG>& g,
+                ffi::TensorView queries,
+                ffi::TensorView out_indices,
+                ffi::TensorView out_distances,
+                int64_t k, int64_t beam_width, int64_t limit,
+                bool print_throughput,
+                const char* label,
+                SearchFn&& search_fn) {
+  uint32_t n_queries = static_cast<uint32_t>(queries.size(0));
+  uint32_t dim_ = g.dim;
+
+  jasper::vector_view<DAT> d_queries(
+      static_cast<DAT*>(queries.data_ptr()), dim_, n_queries, false);
+
+  jasper::search_params params{
+      .k          = static_cast<uint32_t>(k),
+      .beam_width = static_cast<uint32_t>(beam_width),
+      .limit      = static_cast<uint32_t>(limit),
+      .get_visited = false,
+  };
+
+  cudaEvent_t e0, e1;
+  cudaEventCreate(&e0);
+  cudaEventCreate(&e1);
+
+  cudaEventRecord(e0);
+  auto result = search_fn(d_queries, params);
+  cudaEventRecord(e1);
+  cudaEventSynchronize(e1);
+
+  float duration_ms = 0;
+  cudaEventElapsedTime(&duration_ms, e0, e1);
+
+  cudaEventDestroy(e0);
+  cudaEventDestroy(e1);
+
+  if (print_throughput)
+    std::cout << "[" << label << "] duration=" << duration_ms
+      << "ms, throughput=" << (n_queries * 1000.0f)/duration_ms
+      << std::endl;
+
+  DLDevice device = queries.device();
+  cudaStream_t stream = static_cast<cudaStream_t>(
+      TVMFFIEnvGetStream(device.device_type, device.device_id));
+
+  uint32_t total = n_queries * static_cast<uint32_t>(k);
+  uint32_t threads = 256;
+  uint32_t blocks = (total + threads - 1) / threads;
+
+  /* translate internal slots -> stable ids before returning */
+  jasper::translate_slots_to_ids_kernel<CFG>
+      <<<blocks, threads, 0, stream>>>(g.view(), result.frontier, total);
+
+  unpack_results_kernel<<<blocks, threads, 0, stream>>>(
+      result.frontier,
+      static_cast<int32_t*>(out_indices.data_ptr()),
+      static_cast<float*>(out_distances.data_ptr()),
+      total);
+
+  cudaFree(result.frontier);
+}
+
 // ── Per-config load/search/construct implementations ───────────
 
 #define DEFINE_OPS(id, IDX, R, DAT, DIST, FUNC)                                \
@@ -176,60 +256,60 @@ void Search_##id(int64_t handle,                                               \
     TVM_FFI_ICHECK(it != g_graphs.end()) << "Invalid handle: " << handle;      \
     gp = &std::get<jasper::graph<cfg_##id>>(it->second);                       \
   }                                                                            \
-  auto& g = *gp;                                                               \
+  run_search<cfg_##id, DAT>(                                                   \
+      *gp, queries, out_indices, out_distances, k, beam_width, limit,          \
+      print_throughput, "beam_search",                                         \
+      [&](auto& d_queries, const auto& params) {                               \
+        return jasper::search(*gp, d_queries, params);                         \
+      });                                                                      \
+}                                                                              \
                                                                                \
-  uint32_t n_queries = static_cast<uint32_t>(queries.size(0));                 \
-  uint32_t dim_ = g.dim;                                                       \
+/* Quantize every vector of the graph with RaBitQ (bits per dim: 1, 2, 4, 8)   \
+   and keep the codes next to the graph for SearchRabitq. Replaces any         \
+   previous RaBitQ index for this handle. */                                   \
+void BuildRabitq_##id(int64_t handle, int64_t bits, int64_t seed) {            \
+  jasper::graph<cfg_##id>* gp;                                                 \
+  {                                                                            \
+    std::lock_guard<std::mutex> lock(g_mutex);                                 \
+    auto it = g_graphs.find(handle);                                           \
+    TVM_FFI_ICHECK(it != g_graphs.end()) << "Invalid handle: " << handle;      \
+    gp = &std::get<jasper::graph<cfg_##id>>(it->second);                       \
+  }                                                                            \
+  TVM_FFI_ICHECK(bits == 1 || bits == 2 || bits == 4 || bits == 8)             \
+      << "RaBitQ bits must be 1, 2, 4 or 8, got " << bits;                     \
+  auto rq = jasper::build_rabitq_index<cfg_##id>(                              \
+      *gp, static_cast<uint32_t>(bits), static_cast<uint64_t>(seed));          \
+  std::lock_guard<std::mutex> lock(g_mutex);                                   \
+  auto& slot = g_rabitq[handle];                                               \
+  slot.deallocate();                                                           \
+  slot = rq;                                                                   \
+}                                                                              \
                                                                                \
-  jasper::vector_view<DAT> d_queries(                                          \
-      static_cast<DAT*>(queries.data_ptr()), dim_, n_queries, false);          \
-                                                                               \
-  jasper::search_params params{                                                \
-      .k          = static_cast<uint32_t>(k),                                  \
-      .beam_width = static_cast<uint32_t>(beam_width),                         \
-      .limit      = static_cast<uint32_t>(limit),                              \
-      .get_visited = false,                                                    \
-  };                                                                           \
-                                                                               \
-  cudaEvent_t e0, e1;                                                          \
-  cudaEventCreate(&e0);                                                        \
-  cudaEventCreate(&e1);                                                        \
-                                                                               \
-  cudaEventRecord(e0);                                                         \
-  auto result = jasper::search(g, d_queries, params);                          \
-  cudaEventRecord(e1);                                                         \
-  cudaEventSynchronize(e1);                                                    \
-                                                                               \
-  float duration_ms = 0;                                                       \
-  cudaEventElapsedTime(&duration_ms, e0, e1);                                  \
-                                                                               \
-  cudaEventDestroy(e0);                                                        \
-  cudaEventDestroy(e1);                                                        \
-                                                                               \
-  if (print_throughput)                                                        \
-    std::cout << "[beam_search] duration=" << duration_ms                      \
-      << "ms, throughput=" << (n_queries * 1000.0f)/duration_ms                \
-      << std::endl;                                                            \
-                                                                               \
-  DLDevice device = queries.device();                                          \
-  cudaStream_t stream = static_cast<cudaStream_t>(                             \
-      TVMFFIEnvGetStream(device.device_type, device.device_id));               \
-                                                                               \
-  uint32_t total = n_queries * static_cast<uint32_t>(k);                       \
-  uint32_t threads = 256;                                                      \
-  uint32_t blocks = (total + threads - 1) / threads;                           \
-                                                                               \
-  /* translate internal slots -> stable ids before returning */               \
-  jasper::translate_slots_to_ids_kernel<cfg_##id>                              \
-      <<<blocks, threads, 0, stream>>>(g.view(), result.frontier, total);      \
-                                                                               \
-  unpack_results_kernel<<<blocks, threads, 0, stream>>>(                       \
-      result.frontier,                                                         \
-      static_cast<int32_t*>(out_indices.data_ptr()),                           \
-      static_cast<float*>(out_distances.data_ptr()),                           \
-      total);                                                                  \
-                                                                               \
-  cudaFree(result.frontier);                                                   \
+void SearchRabitq_##id(int64_t handle,                                         \
+                       ffi::TensorView queries,                                \
+                       ffi::TensorView out_indices,                            \
+                       ffi::TensorView out_distances,                          \
+                       int64_t k, int64_t beam_width, int64_t limit,           \
+                       bool print_throughput) {                                \
+  jasper::graph<cfg_##id>* gp;                                                 \
+  jasper::rabitq_index rq;                                                     \
+  {                                                                            \
+    std::lock_guard<std::mutex> lock(g_mutex);                                 \
+    auto it = g_graphs.find(handle);                                           \
+    TVM_FFI_ICHECK(it != g_graphs.end()) << "Invalid handle: " << handle;      \
+    gp = &std::get<jasper::graph<cfg_##id>>(it->second);                       \
+    auto rit = g_rabitq.find(handle);                                          \
+    TVM_FFI_ICHECK(rit != g_rabitq.end())                                      \
+        << "No RaBitQ index for handle " << handle                             \
+        << " (never built, or dropped by append/compact); build one first";    \
+    rq = rit->second;                                                          \
+  }                                                                            \
+  run_search<cfg_##id, DAT>(                                                   \
+      *gp, queries, out_indices, out_distances, k, beam_width, limit,          \
+      print_throughput, "rabitq_search",                                       \
+      [&](auto& d_queries, const auto& params) {                               \
+        return jasper::rabitq_search(*gp, rq, d_queries, params);              \
+      });                                                                      \
 }                                                                              \
                                                                                \
 /* ids: contiguous CPU int32 tensor of vertex ids to soft-delete */            \
@@ -270,6 +350,7 @@ void Compact_##id(int64_t handle) {                                            \
     gp = &std::get<jasper::graph<cfg_##id>>(it->second);                       \
   }                                                                            \
   jasper::compact<construct_cfg_##id>(*gp, static_cast<IDX>(0));               \
+  drop_stale_rabitq(handle, static_cast<uint64_t>(gp->n_vectors));             \
 }                                                                              \
                                                                                \
 /* Append a batch of vectors ([n, dim], __half, device). Returns the assigned  \
@@ -292,6 +373,7 @@ void Append_##id(int64_t handle, ffi::TensorView vectors, double alpha,        \
   for (size_t i = 0; i < ids.size(); i++) h[i] = static_cast<int32_t>(ids[i]); \
   cudaMemcpy(out_ids.data_ptr(), h.data(),                                     \
              h.size() * sizeof(int32_t), cudaMemcpyDefault);                   \
+  drop_stale_rabitq(handle, static_cast<uint64_t>(gp->n_vectors));             \
 }
 
 JASPER_FOR_EACH_CONFIG(DEFINE_OPS)
@@ -302,6 +384,12 @@ void FreeGraph(int64_t handle) {
   std::lock_guard<std::mutex> lock(g_mutex);
   auto it = g_graphs.find(handle);
   TVM_FFI_ICHECK(it != g_graphs.end()) << "Invalid handle: " << handle;
+
+  auto rit = g_rabitq.find(handle);
+  if (rit != g_rabitq.end()) {
+    rit->second.deallocate();
+    g_rabitq.erase(rit);
+  }
 
   std::visit([](auto& g) {
     using T = std::decay_t<decltype(g)>;
@@ -396,6 +484,21 @@ int64_t GetDim(int64_t handle) {
   }, it->second);
 }
 
+// Free the graph's RaBitQ index, if any (the graph itself is untouched).
+void FreeRabitq(int64_t handle) {
+  std::lock_guard<std::mutex> lock(g_mutex);
+  auto it = g_rabitq.find(handle);
+  if (it != g_rabitq.end()) {
+    it->second.deallocate();
+    g_rabitq.erase(it);
+  }
+}
+
+bool HasRabitq(int64_t handle) {
+  std::lock_guard<std::mutex> lock(g_mutex);
+  return g_rabitq.count(handle) != 0;
+}
+
 // ── Export all generated functions ──────────────────────────────
 #define EXPORT_OPS(id, ...)                                                    \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_load_##id,      jasper_ffi::LoadGraph_##id);      \
@@ -406,7 +509,9 @@ int64_t GetDim(int64_t handle) {
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_mark_deleted_##id, jasper_ffi::MarkDeleted_##id); \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_consolidate_##id,  jasper_ffi::Consolidate_##id); \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_compact_##id,      jasper_ffi::Compact_##id); \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_append_##id,       jasper_ffi::Append_##id);
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_append_##id,       jasper_ffi::Append_##id); \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_build_rabitq_##id,  jasper_ffi::BuildRabitq_##id); \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_search_rabitq_##id, jasper_ffi::SearchRabitq_##id);
 
 JASPER_FOR_EACH_CONFIG(EXPORT_OPS)
 #undef EXPORT_OPS
@@ -417,5 +522,7 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_get_n_tombstoned, jasper_ffi::GetNumTombsto
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_get_n_live,    jasper_ffi::GetNumLive);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_reserve_ids,   jasper_ffi::ReserveIds);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_get_dim,       jasper_ffi::GetDim);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_free_rabitq,   jasper_ffi::FreeRabitq);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(jasper_has_rabitq,    jasper_ffi::HasRabitq);
 
 } // namespace jasper_ffi
