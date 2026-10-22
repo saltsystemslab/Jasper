@@ -178,6 +178,16 @@ float get_recall(const GroundTruth& gt,
   return recall;
 }
 
+// ── One --beam_limits entry: beam_width:limit[:gamma] ──────────
+// gamma < 0 (field omitted) keeps classic beam-width termination. gamma ≥ 0
+// runs Adaptive Beam Search (search_params::adaptive_gamma), where beam_width
+// only caps the candidate list. Directional searches only.
+struct search_point {
+  uint32_t beam_width;
+  uint32_t limit;
+  float    gamma;
+};
+
 // ── Single search round ────────────────────────────────────────
 template <typename GraphCfg, typename DataT>
 void run_search_round(jasper::graph<GraphCfg>& graph,
@@ -197,6 +207,7 @@ void run_search_round(jasper::graph<GraphCfg>& graph,
     .beam_width = beam_width,
     .limit      = limit,
     .get_visited = false,
+    .max_result_size = limit + 1,  // also a pop cap without a visited log; let limit be the one cap
   };
 
   cudaEvent_t e0, e1;
@@ -266,6 +277,7 @@ void run_directional_round(jasper::graph<GraphCfg>& graph,
                            uint32_t k,
                            uint32_t beam_width,
                            uint32_t limit,
+                           float gamma,
                            const GroundTruth* gt,
                            bool print_throughput) {
 
@@ -276,6 +288,8 @@ void run_directional_round(jasper::graph<GraphCfg>& graph,
     .beam_width = beam_width,
     .limit      = limit,
     .get_visited = false,
+    .max_result_size = limit + 1,  // also a pop cap without a visited log; let limit be the one cap
+    .adaptive_gamma = gamma,
   };
 
   cudaEvent_t e0, e1;
@@ -303,8 +317,10 @@ void run_directional_round(jasper::graph<GraphCfg>& graph,
   if (print_throughput) {
     float throughput = (n_queries * 1000.0f) / duration_ms;
     std::cout << "  beam_width=" << beam_width
-              << " limit=" << limit
-              << " duration=" << std::fixed << std::setprecision(2) << duration_ms << "ms"
+              << " limit=" << limit;
+    if (gamma >= 0.0f)
+      std::cout << " gamma=" << std::defaultfloat << std::setprecision(6) << gamma;
+    std::cout << " duration=" << std::fixed << std::setprecision(2) << duration_ms << "ms"
               << " throughput=" << std::setprecision(0) << throughput << " QPS"
               << std::endl;
   }
@@ -349,6 +365,7 @@ void run_pq_round(jasper::graph<GraphCfg>& graph,
                   uint32_t k,
                   uint32_t beam_width,
                   uint32_t limit,
+                  float gamma,
                   const GroundTruth* gt,
                   bool print_throughput) {
 
@@ -359,6 +376,8 @@ void run_pq_round(jasper::graph<GraphCfg>& graph,
     .beam_width = beam_width,
     .limit      = limit,
     .get_visited = false,
+    .max_result_size = limit + 1,  // also a pop cap without a visited log; let limit be the one cap
+    .adaptive_gamma = gamma,
   };
 
   cudaEvent_t e0, e1;
@@ -386,8 +405,10 @@ void run_pq_round(jasper::graph<GraphCfg>& graph,
   if (print_throughput) {
     float throughput = (n_queries * 1000.0f) / duration_ms;
     std::cout << "  beam_width=" << beam_width
-              << " limit=" << limit
-              << " duration=" << std::fixed << std::setprecision(2) << duration_ms << "ms"
+              << " limit=" << limit;
+    if (gamma >= 0.0f)
+      std::cout << " gamma=" << std::defaultfloat << std::setprecision(6) << gamma;
+    std::cout << " duration=" << std::fixed << std::setprecision(2) << duration_ms << "ms"
               << " throughput=" << std::setprecision(0) << throughput << " QPS"
               << std::endl;
   }
@@ -432,6 +453,7 @@ void run_rq_round(jasper::graph<GraphCfg>& graph,
                   uint32_t k,
                   uint32_t beam_width,
                   uint32_t limit,
+                  float gamma,
                   const GroundTruth* gt,
                   bool print_throughput) {
 
@@ -442,6 +464,8 @@ void run_rq_round(jasper::graph<GraphCfg>& graph,
     .beam_width = beam_width,
     .limit      = limit,
     .get_visited = false,
+    .max_result_size = limit + 1,  // also a pop cap without a visited log; let limit be the one cap
+    .adaptive_gamma = gamma,
   };
 
   cudaEvent_t e0, e1;
@@ -469,8 +493,10 @@ void run_rq_round(jasper::graph<GraphCfg>& graph,
   if (print_throughput) {
     float throughput = (n_queries * 1000.0f) / duration_ms;
     std::cout << "  beam_width=" << beam_width
-              << " limit=" << limit
-              << " duration=" << std::fixed << std::setprecision(2) << duration_ms << "ms"
+              << " limit=" << limit;
+    if (gamma >= 0.0f)
+      std::cout << " gamma=" << std::defaultfloat << std::setprecision(6) << gamma;
+    std::cout << " duration=" << std::fixed << std::setprecision(2) << duration_ms << "ms"
               << " throughput=" << std::setprecision(0) << throughput << " QPS"
               << std::endl;
   }
@@ -644,7 +670,7 @@ void load_and_bench_lsh(const std::string& index_path,
                         bool do_rotate,
                         bool on_host,
                         bool prepopulated,
-                        const std::vector<std::pair<uint32_t, uint32_t>>& beam_limit_pairs) {
+                        const std::vector<search_point>& search_points) {
 
   // Load graph (LSH config; edge_lsh storage is allocated lazily below).
   // Rotation, generate_lsh_globals and populate_edge_lsh all work on host now,
@@ -753,17 +779,17 @@ void load_and_bench_lsh(const std::string& index_path,
 
   // Warmup
   std::cout << "\nWarmup..." << std::endl;
-  auto [warmup_bw, warmup_limit] = beam_limit_pairs.front();
+  auto [warmup_bw, warmup_limit, warmup_gamma] = search_points.front();
   run_directional_round<GraphCfg, DataT>(
     graph, lsh_globals, d_queries, n_queries, dim, k,
-    warmup_bw, warmup_limit, nullptr, false);
+    warmup_bw, warmup_limit, warmup_gamma, nullptr, false);
 
   // Benchmark rounds
   std::cout << "\n=== Directional Beam Search Benchmark (k=" << k << ") ===" << std::endl;
-  for (auto& [bw, lim] : beam_limit_pairs) {
+  for (auto& [bw, lim, gamma] : search_points) {
     run_directional_round<GraphCfg, DataT>(
       graph, lsh_globals, d_queries, n_queries, dim, k,
-      bw, lim, has_gt ? &gt : nullptr, true);
+      bw, lim, gamma, has_gt ? &gt : nullptr, true);
   }
 
   cudaFree(d_queries);
@@ -783,7 +809,7 @@ void load_and_bench_pq(const std::string& index_path,
                        uint32_t pq_train,
                        bool on_host,
                        bool prepopulated,
-                       const std::vector<std::pair<uint32_t, uint32_t>>& beam_limit_pairs) {
+                       const std::vector<search_point>& search_points) {
 
   // Load graph (LSH config; edge_pqs storage is allocated lazily below).
   // See load_and_bench_lsh for what --prepopulated changes.
@@ -890,17 +916,17 @@ void load_and_bench_pq(const std::string& index_path,
 
   // Warmup
   std::cout << "\nWarmup..." << std::endl;
-  auto [warmup_bw, warmup_limit] = beam_limit_pairs.front();
+  auto [warmup_bw, warmup_limit, warmup_gamma] = search_points.front();
   run_pq_round<GraphCfg, DataT>(
     graph, pq_codebooks.view(), d_queries, n_queries, dim, k,
-    warmup_bw, warmup_limit, nullptr, false);
+    warmup_bw, warmup_limit, warmup_gamma, nullptr, false);
 
   // Benchmark rounds
   std::cout << "\n=== PQ Directional Beam Search Benchmark (k=" << k << ") ===" << std::endl;
-  for (auto& [bw, lim] : beam_limit_pairs) {
+  for (auto& [bw, lim, gamma] : search_points) {
     run_pq_round<GraphCfg, DataT>(
       graph, pq_codebooks.view(), d_queries, n_queries, dim, k,
-      bw, lim, has_gt ? &gt : nullptr, true);
+      bw, lim, gamma, has_gt ? &gt : nullptr, true);
   }
 
   cudaFree(d_queries);
@@ -928,7 +954,7 @@ void load_and_bench_rq(const std::string& index_path,
                        bool do_rotate,
                        bool on_host,
                        bool prepopulated,
-                       const std::vector<std::pair<uint32_t, uint32_t>>& beam_limit_pairs) {
+                       const std::vector<search_point>& search_points) {
 
   if (!do_rotate)
     throw std::runtime_error(
@@ -1039,18 +1065,18 @@ void load_and_bench_rq(const std::string& index_path,
 
   // Warmup
   std::cout << "\nWarmup..." << std::endl;
-  auto [warmup_bw, warmup_limit] = beam_limit_pairs.front();
+  auto [warmup_bw, warmup_limit, warmup_gamma] = search_points.front();
   run_rq_round<GraphCfg, DataT>(
     graph, rq_globals, d_queries, n_queries, dim, k,
-    warmup_bw, warmup_limit, nullptr, false);
+    warmup_bw, warmup_limit, warmup_gamma, nullptr, false);
 
   // Benchmark rounds
   std::cout << "\n=== RaBitQ Directional Beam Search Benchmark (k=" << k << ") ==="
             << std::endl;
-  for (auto& [bw, lim] : beam_limit_pairs) {
+  for (auto& [bw, lim, gamma] : search_points) {
     run_rq_round<GraphCfg, DataT>(
       graph, rq_globals, d_queries, n_queries, dim, k,
-      bw, lim, has_gt ? &gt : nullptr, true);
+      bw, lim, gamma, has_gt ? &gt : nullptr, true);
   }
 
   cudaFree(d_queries);
@@ -1066,7 +1092,7 @@ void load_and_bench(const std::string& index_path,
                     uint32_t dim,
                     uint32_t k,
                     bool on_host,
-                    const std::vector<std::pair<uint32_t, uint32_t>>& beam_limit_pairs) {
+                    const std::vector<search_point>& search_points) {
 
   // Load graph (optionally directly into host memory).
   std::cout << "Loading index..." << std::endl;
@@ -1134,17 +1160,17 @@ void load_and_bench(const std::string& index_path,
 
   // Warmup
   std::cout << "\nWarmup..." << std::endl;
-  auto [warmup_bw, warmup_limit] = beam_limit_pairs.front();
+  const search_point& warmup = search_points.front();
   run_search_round<GraphCfg, DataT>(
     graph, d_queries, n_queries, dim, k,
-    warmup_bw, warmup_limit, nullptr, false);
+    warmup.beam_width, warmup.limit, nullptr, false);
 
   // Benchmark rounds
   std::cout << "\n=== Benchmark (k=" << k << ") ===" << std::endl;
-  for (auto& [bw, lim] : beam_limit_pairs) {
+  for (const search_point& pt : search_points) {
     run_search_round<GraphCfg, DataT>(
       graph, d_queries, n_queries, dim, k,
-      bw, lim, has_gt ? &gt : nullptr, true);
+      pt.beam_width, pt.limit, has_gt ? &gt : nullptr, true);
   }
 
   // Cleanup
@@ -1152,19 +1178,28 @@ void load_and_bench(const std::string& index_path,
   graph.deallocate();
 }
 
-// ── Parse "beam_width:limit" pairs ─────────────────────────────
-std::vector<std::pair<uint32_t, uint32_t>> parse_beam_limit_pairs(
-    const std::vector<std::string>& args) {
-  std::vector<std::pair<uint32_t, uint32_t>> pairs;
+// ── Parse "beam_width:limit[:gamma]" entries ───────────────────
+std::vector<search_point> parse_search_points(const std::vector<std::string>& args) {
+  std::vector<search_point> points;
   for (auto& s : args) {
-    auto colon = s.find(':');
-    if (colon == std::string::npos)
-      throw std::runtime_error("Expected beam_width:limit format, got: " + s);
-    uint32_t bw  = static_cast<uint32_t>(std::stoul(s.substr(0, colon)));
-    uint32_t lim = static_cast<uint32_t>(std::stoul(s.substr(colon + 1)));
-    pairs.emplace_back(bw, lim);
+    const auto c1 = s.find(':');
+    if (c1 == std::string::npos)
+      throw std::runtime_error("Expected beam_width:limit[:gamma] format, got: " + s);
+    const auto c2 = s.find(':', c1 + 1);
+    search_point pt{};
+    pt.beam_width = static_cast<uint32_t>(std::stoul(s.substr(0, c1)));
+    pt.limit      = static_cast<uint32_t>(std::stoul(
+        s.substr(c1 + 1, c2 == std::string::npos ? std::string::npos : c2 - c1 - 1)));
+    pt.gamma      = -1.0f;
+    if (c2 != std::string::npos) {
+      pt.gamma = std::stof(s.substr(c2 + 1));
+      if (!(pt.gamma >= 0.0f))
+        throw std::runtime_error("gamma must be >= 0 (omit it for beam-width "
+                                 "termination), got: " + s);
+    }
+    points.push_back(pt);
   }
-  return pairs;
+  return points;
 }
 
 // ── Argument parsing ───────────────────────────────────────────
@@ -1213,7 +1248,10 @@ int main(int argc, char** argv) {
       "1:128", "2:128", "4:128", "8:128", "16:128", "32:128", "64:128", "128:256", "256:512"
     })
     .nargs(argparse::nargs_pattern::at_least_one)
-    .help("beam_width:limit pairs to benchmark (e.g. 16:128 64:256)");
+    .help("beam_width:limit[:gamma] points to benchmark (e.g. 16:128 64:256 "
+          "256:2048:0.1). A gamma switches that point to Adaptive Beam Search "
+          "termination, with beam_width as the candidate-list cap; it needs "
+          "--lsh, --pq or --rabitq.");
 
   program.add_argument("--lsh")
     .default_value(false)
@@ -1311,12 +1349,21 @@ int main(int argc, char** argv) {
   }
 
 
-  std::vector<std::pair<uint32_t, uint32_t>> beam_limit_pairs;
+  std::vector<search_point> search_points;
   try {
-    beam_limit_pairs = parse_beam_limit_pairs(beam_args);
+    search_points = parse_search_points(beam_args);
   } catch (const std::exception& err) {
     std::cerr << "Error parsing --beam_limits: " << err.what() << std::endl;
     return 1;
+  }
+  if (!use_lsh && !use_pq && !use_rq) {
+    for (const search_point& pt : search_points) {
+      if (pt.gamma >= 0.0f) {
+        std::cerr << "Error: adaptive termination (beam_width:limit:gamma) is "
+                     "only implemented for --lsh, --pq and --rabitq" << std::endl;
+        return 1;
+      }
+    }
   }
 
   std::cout << "=== run_query ===" << std::endl;
@@ -1329,8 +1376,11 @@ int main(int argc, char** argv) {
   std::cout << "  dim:          " << dim << std::endl;
   std::cout << "  k:            " << k << std::endl;
   std::cout << "  beam_limits:  ";
-  for (auto& [bw, lim] : beam_limit_pairs)
-    std::cout << bw << ":" << lim << " ";
+  for (const search_point& pt : search_points) {
+    std::cout << pt.beam_width << ":" << pt.limit;
+    if (pt.gamma >= 0.0f) std::cout << ":" << pt.gamma;
+    std::cout << " ";
+  }
   std::cout << std::endl;
   std::cout << "  lsh:          " << (use_lsh ? "true" : "false") << std::endl;
   std::cout << "  pq:           " << (use_pq ? "true" : "false") << std::endl;
@@ -1365,7 +1415,7 @@ int main(int argc, char** argv) {
           load_and_bench_rq<cfg_##id, DAT>(                                    \
               index_path, query_path, gt_path, datatype,                       \
               dim, k, rotate_seed, !no_rotate, on_host, prepopulated,          \
-              beam_limit_pairs);                                               \
+              search_points);                                                  \
           dispatched = true;                                                   \
         }
 
@@ -1390,7 +1440,7 @@ int main(int argc, char** argv) {
           load_and_bench_pq<cfg_##id, DAT>(                                    \
               index_path, query_path, gt_path, datatype,                       \
               dim, k, rotate_seed, !no_rotate, pq_train, on_host,             \
-              prepopulated, beam_limit_pairs);                                 \
+              prepopulated, search_points);                                   \
           dispatched = true;                                                   \
         }
 
@@ -1413,7 +1463,7 @@ int main(int argc, char** argv) {
           load_and_bench_lsh<cfg_##id, DAT>(                                   \
               index_path, query_path, gt_path, datatype,                       \
               dim, k, rotate_seed, !no_rotate, on_host, prepopulated,          \
-              beam_limit_pairs);                                               \
+              search_points);                                                  \
           dispatched = true;                                                   \
         }
 
@@ -1433,7 +1483,7 @@ int main(int argc, char** argv) {
           std::cout << "  Config: " #id << std::endl;                           \
           load_and_bench<cfg_##id, DAT>(                                        \
               index_path, query_path, gt_path, datatype,                        \
-              dim, k, on_host, beam_limit_pairs);                              \
+              dim, k, on_host, search_points);                                  \
           dispatched = true;                                                     \
         }
 

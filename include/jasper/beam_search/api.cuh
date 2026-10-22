@@ -17,6 +17,9 @@ struct search_params {
   uint32_t limit            = 512;
   bool     get_visited      = false;
   uint32_t max_result_size  = 2048;
+  // < 0: stop on beam width. ≥ 0: Adaptive Beam Search with this γ, see
+  // beam_search_params::adaptive_gamma. Directional searches only.
+  float    adaptive_gamma   = -1.0f;
 };
 
 template <typename GRAPH_CFG,
@@ -63,6 +66,12 @@ beam_search_result<GRAPH_CFG> search(
     const graph<GRAPH_CFG>&           g,
     typename GRAPH_CFG::vector_view_t d_queries,
     const search_params&              params = {}) {
+  // The plain kernel (beam_search.cuh) has only the beam-width rule; refuse
+  // rather than silently run something other than what was asked for.
+  if (params.adaptive_gamma >= 0.0f)
+    throw std::invalid_argument(
+        "adaptive_gamma is implemented for directional_search / pq_search / "
+        "rq_search only, not for conventional search()");
   const uint32_t bw = params.beam_width;
   if      (bw + 64 < 128)  return search_dispatch_width<GRAPH_CFG, BLOCK_SIZE, 128,  TILE_SIZE>(g, d_queries, params);
   else if (bw + 64 < 256)  return search_dispatch_width<GRAPH_CFG, BLOCK_SIZE, 256,  TILE_SIZE>(g, d_queries, params);
@@ -102,6 +111,7 @@ beam_search_result<GRAPH_CFG> directional_search_impl(
     .limit           = params.limit,
     .get_visited     = params.get_visited,
     .max_result_size = params.max_result_size,
+    .adaptive_gamma  = params.adaptive_gamma,
   };
   return directional_beam_search<Cfg>(bp, globals);
 }
@@ -169,6 +179,7 @@ beam_search_result<GRAPH_CFG> pq_search_impl(
     .limit           = params.limit,
     .get_visited     = params.get_visited,
     .max_result_size = params.max_result_size,
+    .adaptive_gamma  = params.adaptive_gamma,
   };
   return pq_beam_search<Cfg>(bp, codebooks);
 }
@@ -239,6 +250,7 @@ beam_search_result<GRAPH_CFG> rq_search_impl(
     .limit           = params.limit,
     .get_visited     = params.get_visited,
     .max_result_size = params.max_result_size,
+    .adaptive_gamma  = params.adaptive_gamma,
   };
   return rq_beam_search<Cfg>(bp, globals);
 }

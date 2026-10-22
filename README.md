@@ -120,6 +120,12 @@ scripts and `distortion_sweep`):
 | `bench_locale_ksweep.sbatch` | The same sweep on the LOCALE genomic embeddings: `DATASET=sra50` or `sra500`, degree fixed at 64, with an optional query-mutation axis (`MUTATIONS="0.00 0.05 0.10"`). Supports `RUN_POPS=1`. SRA500 must first be converted from its Hugging Face bundle (see `scripts/locale_bundle_to_fbin.py` below). |
 | `distortion_sweep.sbatch` | Estimator accuracy microbenchmarks with `distortion_test` on device-resident datasets (BigANN 10M, Deep 10M, GIST, OpenAI, SRA50). For each dataset, estimator and `r` it writes recall vs nodes popped, plus estimated-vs-exact edge distances for (query, popped node) pairs taken from real searches and for random (node, query) pairs. Then it draws the distortion scatters and ranking plots. |
 
+### Search termination (beam width vs Adaptive Beam Search)
+
+| Script | What it measures |
+|---|---|
+| `bench_adaptive_termination.sbatch` | Compares directional search's classic stop rule (the `beam_width` best candidates are all expanded) with the distance-based rule of Adaptive Beam Search (Al-Jazzazi et al. 2025): stop once the next candidate's estimate is at least (1+γ)× the k-th best exact distance. For each dataset, estimator and `r` it runs a beam-width sweep (16 to 1983) and a γ sweep at each of those widths as the candidate-list capacity, in one `run_query` (QPS) and one `distortion_test --pops` (nodes popped) invocation, so both rules search the same codes. Each cell runs twice: once with the graph on the device and once on the host (`--on_host`, every read over PCIe). The summary checks that pops and recall match between the two placements. It then reports the best QPS and the fewest pops under each rule at matched recall. Points are `beam_width:limit[:gamma]` in both binaries' `--beam_limits`. With a gamma, `beam_width` only caps the candidate list. Reuses `distortion_sweep`'s plain indexes. |
+
 ### Index construction at scale (DiskANN-style shard and merge)
 
 | Script | What it measures |
@@ -134,6 +140,7 @@ scripts and `distortion_sweep`):
 | `locale_bundle_to_fbin.py` | Converts the LOCALE Hugging Face release (503 base shards plus per-mutation queries and ground truth) into the `base.fbin` / `query_mut*.fbin` / `gt_mut*.ibin` layout the locale scripts read. Run it once before `DATASET=sra500`. |
 | `tile_queries.py` | Repeats a small query set (and its ground truth) up to a target batch size so the GPU is saturated. Recall is unchanged. |
 | `plot_pops.py` | Recall vs nodes popped per query, from `--pops` CSVs. |
+| `adaptive_summary.py` | Joins `run_query` throughput with `--pops` rows for `bench_adaptive_termination`. For each rule it gives the best QPS and the fewest pops at each target recall. |
 | `plot_distortion.py` | Estimated-vs-true distance density grids, from edge-score CSVs. |
 | `neighborhood_ranking.py` | Within-neighborhood ranking accuracy (recall@m, Spearman) vs bytes per edge, from edge-score CSVs. |
 | `export_distortion_pgf.py` | Exports a distortion grid as pgfplots CSVs plus a ready-to-`\input` `.tex` figure. |

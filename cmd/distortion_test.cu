@@ -5,12 +5,16 @@
 // Loads a plain index, rotates it, builds ONE estimator's codes at load (same
 // path as run_query without --prepopulated), then runs any of:
 //
-//   --pops <csv>        Search every query at each --beam_limits pair with
+//   --pops <csv>        Search every query at each --beam_limits point with
 //                       visited logging on, and record recall@k against the
 //                       number of nodes popped per query. Recall per POP takes
 //                       the estimator's run-time cost out of the comparison:
 //                       a method that needs fewer pops for the same recall
-//                       ranks better, whatever its QPS.
+//                       ranks better, whatever its QPS. A point is
+//                       beam_width:limit, or beam_width:limit:gamma for
+//                       Adaptive Beam Search termination (directional methods
+//                       only); the trailing stop,gamma columns say which rule
+//                       each row ran (gamma is blank for stop=beam).
 //
 //   --trajectory <csv>  Search at --traj_beam, then score the out-edges of
 //                       (query, popped node) pairs drawn uniformly from the
@@ -101,6 +105,14 @@ static const char* method_name(Method m) {
   return "?";
 }
 
+// One --beam_limits entry: beam_width:limit[:gamma]. gamma < 0 (omitted) =
+// beam-width termination; gamma >= 0 = search_params::adaptive_gamma.
+struct search_point {
+  uint32_t beam_width;
+  uint32_t limit;
+  float    gamma;
+};
+
 struct Opts {
   std::string index_path, query_path, gt_path, datatype;
   uint32_t    dim = 0, k = 10, pq_train = 40000;
@@ -109,7 +121,7 @@ struct Opts {
   Method      method = Method::LSH;
 
   std::string pops_out, traj_out, random_out;
-  std::vector<std::pair<uint32_t, uint32_t>> beam_limits;
+  std::vector<search_point> beam_limits;
   std::pair<uint32_t, uint32_t> traj_beam{64, 256};
   uint32_t    samples = 10000;
   uint64_t    seed    = 7;
@@ -233,11 +245,13 @@ __global__ void conventional_vectors_fetched(
 template <typename GraphCfg, Method M>
 static Trajectories<GraphCfg> search_logged(jasper::graph<GraphCfg>& g, Codes<GraphCfg>& c,
                                             jasper::vector_view<__half> q, uint32_t k,
-                                            uint32_t bw, uint32_t limit) {
+                                            uint32_t bw, uint32_t limit,
+                                            float gamma) {
   jasper::search_params p{
     .k = k, .beam_width = bw, .limit = limit,
     .get_visited = true,
     .max_result_size = limit + 1,  // the loop pops at most limit + 1 nodes
+    .adaptive_gamma = gamma,
   };
   jasper::beam_search_result<GraphCfg> r{};
   if constexpr (M == Method::LSH) r = jasper::directional_search(g, c.lsh, q, p);
@@ -327,12 +341,12 @@ static void run_pops(jasper::graph<GraphCfg>& g, Codes<GraphCfg>& c,
   std::ofstream out(o.pops_out);
   if (!out) throw std::runtime_error("Cannot open output: " + o.pops_out);
   out << "method,k_ranks,beam_width,limit,recall,mean_pops,p50_pops,p95_pops,capped_frac,"
-         "mean_vectors_fetched\n";
+         "mean_vectors_fetched,stop,gamma\n";
   std::cout << "\n=== recall vs pops (" << method_name(M) << " k_ranks="
             << static_cast<uint32_t>(GraphCfg::k_ranks) << ") ===" << std::endl;
 
-  for (auto [bw, lim] : o.beam_limits) {
-    auto t = search_logged<GraphCfg, M>(g, c, q, o.k, bw, lim);
+  for (auto [bw, lim, gamma] : o.beam_limits) {
+    auto t = search_logged<GraphCfg, M>(g, c, q, o.k, bw, lim, gamma);
 
     uint64_t hits = 0;
     for (uint32_t i = 0; i < t.n_queries; ++i) {
@@ -358,8 +372,12 @@ static void run_pops(jasper::graph<GraphCfg>& g, Codes<GraphCfg>& c,
     out << method_name(M) << ',' << static_cast<uint32_t>(GraphCfg::k_ranks) << ','
         << bw << ',' << lim << ',' << std::setprecision(6) << recall << ',' << mean << ','
         << cnt[cnt.size() / 2] << ',' << cnt[cnt.size() * 95 / 100] << ',' << capped << ','
-        << fetched << '\n';
-    std::cout << "  beam_width=" << bw << " limit=" << lim << std::fixed
+        << fetched << ',';
+    if (gamma >= 0.0f) out << "adaptive," << gamma << '\n';
+    else               out << "beam,\n";
+    std::cout << "  beam_width=" << bw << " limit=" << lim;
+    if (gamma >= 0.0f) std::cout << " gamma=" << std::setprecision(6) << gamma;
+    std::cout << std::fixed
               << std::setprecision(4) << " recall@" << o.k << "=" << recall
               << std::setprecision(1) << " mean_pops=" << mean
               << " p95_pops=" << cnt[cnt.size() * 95 / 100]
@@ -378,7 +396,7 @@ static void run_trajectory(jasper::graph<GraphCfg>& g, Codes<GraphCfg>& c,
             << static_cast<uint32_t>(GraphCfg::k_ranks) << ", beam_width=" << bw
             << " limit=" << lim << ", " << o.samples << " pops, seed " << o.seed
             << ") ===" << std::endl;
-  auto t = search_logged<GraphCfg, M>(g, c, q, o.k, bw, lim);
+  auto t = search_logged<GraphCfg, M>(g, c, q, o.k, bw, lim, /*gamma=*/-1.0f);
 
   // Uniform over every (query, pop) the search made. Each method samples its
   // OWN trajectories — the pops it actually ranks — so pairs differ by method;
@@ -523,6 +541,18 @@ static std::pair<uint32_t, uint32_t> parse_pair(const std::string& s) {
           static_cast<uint32_t>(std::stoul(s.substr(c + 1)))};
 }
 
+static search_point parse_point(const std::string& s) {
+  const auto c2 = s.find(':', s.find(':') + 1);
+  const auto [bw, lim] = parse_pair(s.substr(0, c2));
+  search_point pt{bw, lim, -1.0f};
+  if (c2 != std::string::npos) {
+    pt.gamma = std::stof(s.substr(c2 + 1));
+    if (!(pt.gamma >= 0.0f))
+      throw std::runtime_error("gamma must be >= 0 (omit it for beam-width termination), got: " + s);
+  }
+  return pt;
+}
+
 int main(int argc, char** argv) {
   argparse::ArgumentParser program("distortion_test");
   program.add_argument("--index", "-i").required().help("Plain index (no codes needed).");
@@ -548,7 +578,9 @@ int main(int argc, char** argv) {
   program.add_argument("--beam_limits", "-b")
       .default_value(std::vector<std::string>{"8:64", "16:128", "32:128", "64:256",
                                               "128:256", "256:512", "512:1024"})
-      .nargs(argparse::nargs_pattern::at_least_one);
+      .nargs(argparse::nargs_pattern::at_least_one)
+      .help("beam_width:limit[:gamma] points for --pops; a gamma runs that point with "
+            "Adaptive Beam Search termination (not with -m conventional).");
   program.add_argument("--trajectory").default_value(std::string{})
       .help("CSV: edge scores for (query, popped node) pairs from real searches.");
   program.add_argument("--traj_beam").default_value(std::string{"64:256"})
@@ -590,7 +622,7 @@ int main(int argc, char** argv) {
 
   try {
     for (auto& s : program.get<std::vector<std::string>>("--beam_limits"))
-      o.beam_limits.push_back(parse_pair(s));
+      o.beam_limits.push_back(parse_point(s));
     o.traj_beam = parse_pair(program.get<std::string>("--traj_beam"));
   } catch (const std::exception& e) {
     std::cerr << "Error: " << e.what() << std::endl;
@@ -603,6 +635,13 @@ int main(int argc, char** argv) {
   if (o.method == Method::CONV && (!o.traj_out.empty() || !o.random_out.empty())) {
     std::cerr << "Error: -m conventional has no estimator to score; it supports --pops only"
               << std::endl;
+    return 1;
+  }
+  if (o.method == Method::CONV &&
+      std::any_of(o.beam_limits.begin(), o.beam_limits.end(),
+                  [](const search_point& pt) { return pt.gamma >= 0.0f; })) {
+    std::cerr << "Error: adaptive termination (beam_width:limit:gamma) is only "
+                 "implemented for the directional methods" << std::endl;
     return 1;
   }
   if (!o.pops_out.empty() && o.gt_path.empty()) {

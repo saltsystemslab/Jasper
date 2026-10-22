@@ -37,6 +37,12 @@
 //                                           scores u's newly-appended
 //                                           out-edges at result_buffer[offset,
 //                                           offset+n_edges).
+//
+// Termination. The search stops when the beam_width best candidates have all
+// been expanded (classic beam search), on `limit`, or — with
+// beam_search_params::adaptive_gamma ≥ 0 — on the distance rule of Adaptive
+// Beam Search (Al-Jazzazi et al. 2025, eq. 3): stop once the next candidate is
+// at least (1+γ)× farther than the k-th best result. See adaptive_stop_slack.
 #pragma once
 
 #include <cub/cub.cuh>
@@ -50,6 +56,24 @@
 #include "jasper/beam_search/beam_search_common.cuh"
 
 namespace jasper {
+
+// ===== Host: adaptive termination slack =====
+// The paper states the rule in metric distance: stop at candidate x once
+// d(q,x) ≥ (1+γ)·d_k, d_k being the k-th best distance found. Entries hold
+// SQUARED L2, where the same rule reads (1+γ)²·d_k², so γ keeps the paper's
+// meaning (γ = 2 is exact on a navigable graph when distances are exact).
+// Inner product is no metric, and its entries hold −⟨q,v⟩; there γ is a
+// relative gap instead, stop once ⟨q,x⟩ ≤ ⟨q,v_k⟩ − γ·|⟨q,v_k⟩|. Both are
+//   d_x ≥ d_k + slack·|d_k|
+// on stored distances, which is the test the kernel makes. Negative γ (off)
+// gives a negative slack.
+template <distance_func DISTANCE_FUNC>
+__host__ inline float adaptive_stop_slack(float gamma) {
+  if (gamma < 0.0f) return -1.0f;
+  if constexpr (DISTANCE_FUNC == distance_func::L2)
+    return (1.0f + gamma) * (1.0f + gamma) - 1.0f;
+  return gamma;
+}
 
 // ===== The kernel =====
 template <typename GRAPH_CFG, uint32_t BLOCK_SIZE, distance_func DISTANCE_FUNC,
@@ -69,7 +93,8 @@ __global__ void graph_beam_search_kernel(
     uint32_t                               beam_width,
     uint32_t                               limit,
     bool                                   get_visited,
-    uint32_t                               max_result_size)
+    uint32_t                               max_result_size,
+    float                                  adaptive_slack)
 {
   using INDEX_T    = typename GRAPH_CFG::index_t;
   using DATA_T     = typename GRAPH_CFG::data_t;
@@ -182,6 +207,20 @@ __global__ void graph_beam_search_kernel(
 
     const INDEX_T u_gid =
         static_cast<INDEX_T>(get_index(result_buffer[frontierIdx]));
+
+    // 2b) Adaptive termination (adaptive_stop_slack): stop before visiting u
+    //     once its ESTIMATED distance is past the slack around the k-th best
+    //     EXACT distance. The paper compares exact distances, but u has only
+    //     its estimate until it is visited, and visiting it just to decide
+    //     would spend the vector read the rule exists to save. Every thread
+    //     reads the same shared values after the barrier above, so the break
+    //     is block-uniform.
+    if (adaptive_slack >= 0.0f && frontier_buffer_count[0] == k) {
+      const float d_k = get_distance(frontier_buffer[k - 1]);
+      if (get_distance(result_buffer[frontierIdx]) >=
+          d_k + adaptive_slack * fabsf(d_k))
+        break;
+    }
 
     // 3) Fetch u's exact/base distance via the estimator (the ONE I/O per
     //    explored node): ||q-u||² for L2, or the raw dot ⟨q,u⟩ for IP.
@@ -313,6 +352,7 @@ graph_beam_search(
   const uint32_t padded_dim = p.graph.get_padded_dim();
   const uint32_t smem = get_graph_search_smem_size<graph_cfg_t, ESTIMATOR>(
       p.beam_width, p.k, padded_dim);
+  const float adaptive_slack = adaptive_stop_slack<Cfg::dist_func>(p.adaptive_gamma);
 
   beam_search_result<graph_cfg_t> result{};
   cudaMalloc(&result.frontier, sizeof(entry_t) * n_query_vectors * p.k);
@@ -336,7 +376,7 @@ graph_beam_search(
       result.frontier, result.visited, result.visited_counts,
       p.query_vectors, p.use_range, p.query_start, p.query_end,
       p.medoid, p.k, p.beam_width, p.limit,
-      p.get_visited, p.max_result_size);
+      p.get_visited, p.max_result_size, adaptive_slack);
 
   cudaError_t err = cudaStreamSynchronize(stream);
   if (err != cudaSuccess) {
@@ -369,6 +409,7 @@ graph_beam_search(
   const uint32_t padded_dim = p.graph.get_padded_dim();
   const uint32_t smem = get_graph_search_smem_size<graph_cfg_t, ESTIMATOR>(
       p.beam_width, p.k, padded_dim);
+  const float adaptive_slack = adaptive_stop_slack<Cfg::dist_func>(p.adaptive_gamma);
 
   auto kernel = graph_beam_search_kernel<
       graph_cfg_t, Cfg::block_size, Cfg::dist_func,
@@ -384,7 +425,7 @@ graph_beam_search(
       result.frontier, result.visited, result.visited_counts,
       p.query_vectors, p.use_range, p.query_start, p.query_end,
       p.medoid, p.k, p.beam_width, p.limit,
-      p.get_visited, p.max_result_size);
+      p.get_visited, p.max_result_size, adaptive_slack);
 
   cudaError_t err = cudaStreamSynchronize(stream);
   if (err != cudaSuccess) {

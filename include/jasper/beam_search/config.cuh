@@ -52,6 +52,15 @@ struct beam_search_params {
   // plain runtime knobs rather than template parameters.
   bool                        get_visited     = false;
   uint32_t                    max_result_size = 1024;
+
+  // Adaptive Beam Search termination (Al-Jazzazi et al. 2025, eq. 3). Negative
+  // (the default) = off: search stops once the beam_width best candidates are
+  // all expanded. γ ≥ 0 also stops as soon as the next candidate is at least
+  // (1+γ)× farther than the k-th best result so far, so beam_width becomes a
+  // cap on the candidate list rather than the stopping rule. Only the
+  // directional kernel (graph_beam_search.cuh) implements it. A runtime knob
+  // like get_visited, not a template axis.
+  float                       adaptive_gamma  = -1.0f;
 };
 
 template <typename GRAPH_CFG>
