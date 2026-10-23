@@ -167,10 +167,10 @@ float get_recall(const GroundTruth& gt,
     std::set<int32_t> gt_set(
       gt.indices.data() + q * k,
       gt.indices.data() + q * k + k);
-    for (uint32_t j = 0; j < k; j++) {
-      if (gt_set.count(result_indices[q * k + j]))
-        hits++;
-    }
+    std::set<int32_t> found(
+      result_indices + q * k,
+      result_indices + q * k + k);
+    for (int32_t id : found) hits += gt_set.count(id);
   }
   float recall = static_cast<float>(hits) / (n_queries * k);
   std::cout << "  Recall@" << k << ": "

@@ -13,8 +13,11 @@
 //                       ranks better, whatever its QPS. A point is
 //                       beam_width:limit, or beam_width:limit:gamma for
 //                       Adaptive Beam Search termination (directional methods
-//                       only); the trailing stop,gamma columns say which rule
-//                       each row ran (gamma is blank for stop=beam).
+//                       only); the stop,gamma columns say which rule each row
+//                       ran (gamma is blank for stop=beam). The last two
+//                       columns count duplicates (see run_pops):
+//                       mean_unique_pops and dup_topk_frac. Recall counts each
+//                       returned id once.
 //
 //   --trajectory <csv>  Search at --traj_beam, then score the out-edges of
 //                       (query, popped node) pairs drawn uniformly from the
@@ -341,20 +344,43 @@ static void run_pops(jasper::graph<GraphCfg>& g, Codes<GraphCfg>& c,
   std::ofstream out(o.pops_out);
   if (!out) throw std::runtime_error("Cannot open output: " + o.pops_out);
   out << "method,k_ranks,beam_width,limit,recall,mean_pops,p50_pops,p95_pops,capped_frac,"
-         "mean_vectors_fetched,stop,gamma\n";
+         "mean_vectors_fetched,stop,gamma,mean_unique_pops,dup_topk_frac\n";
   std::cout << "\n=== recall vs pops (" << method_name(M) << " k_ranks="
             << static_cast<uint32_t>(GraphCfg::k_ranks) << ") ===" << std::endl;
 
   for (auto [bw, lim, gamma] : o.beam_limits) {
     auto t = search_logged<GraphCfg, M>(g, c, q, o.k, bw, lim, gamma);
 
-    uint64_t hits = 0;
+    // Duplicates. In directional search a node reached from two parents
+    // carries two different estimates, so dedup_results cannot pair its
+    // copies; graph_beam_search_kernel keeps one list entry per node (step
+    // 6b). Check that it holds: distinct nodes among the pops (a node clipped
+    // from the list and the top-k can still be re-added and expanded again),
+    // and queries whose top-k holds an id twice, which should be none.
+    // Conventional search scores with exact distances, so its copies always
+    // sort together: the control. Recall counts each returned id once.
+    constexpr uint32_t INVALID = 0x7FFFFFFFu;
+    uint64_t hits = 0, unique_pops = 0, dup_queries = 0;
+    std::vector<uint32_t> ids;
     for (uint32_t i = 0; i < t.n_queries; ++i) {
       std::set<uint32_t> truth(gt.ids.begin() + size_t(i) * o.k,
                                gt.ids.begin() + size_t(i + 1) * o.k);
-      for (uint32_t j = 0; j < o.k; ++j) hits += truth.count(t.topk[size_t(i) * o.k + j]);
+      ids.assign(t.topk.begin() + size_t(i) * o.k, t.topk.begin() + size_t(i + 1) * o.k);
+      ids.erase(std::remove(ids.begin(), ids.end(), INVALID), ids.end());
+      std::sort(ids.begin(), ids.end());
+      const auto top_end = std::unique(ids.begin(), ids.end());
+      dup_queries += (top_end != ids.end());
+      for (auto it = ids.begin(); it != top_end; ++it) hits += truth.count(*it);
+
+      const auto* v = t.visited.data() + size_t(i) * t.stride;
+      ids.resize(t.counts[i]);
+      for (uint32_t j = 0; j < t.counts[i]; ++j) ids[j] = v[j].first;
+      std::sort(ids.begin(), ids.end());
+      unique_pops += static_cast<uint64_t>(std::unique(ids.begin(), ids.end()) - ids.begin());
     }
-    const double recall = double(hits) / (double(t.n_queries) * o.k);
+    const double recall      = double(hits) / (double(t.n_queries) * o.k);
+    const double mean_unique = double(unique_pops) / t.n_queries;
+    const double dup_frac    = double(dup_queries) / t.n_queries;
 
     std::vector<uint32_t> cnt = t.counts;
     std::sort(cnt.begin(), cnt.end());
@@ -373,8 +399,9 @@ static void run_pops(jasper::graph<GraphCfg>& g, Codes<GraphCfg>& c,
         << bw << ',' << lim << ',' << std::setprecision(6) << recall << ',' << mean << ','
         << cnt[cnt.size() / 2] << ',' << cnt[cnt.size() * 95 / 100] << ',' << capped << ','
         << fetched << ',';
-    if (gamma >= 0.0f) out << "adaptive," << gamma << '\n';
-    else               out << "beam,\n";
+    if (gamma >= 0.0f) out << "adaptive," << gamma;
+    else               out << "beam,";
+    out << ',' << mean_unique << ',' << dup_frac << '\n';
     std::cout << "  beam_width=" << bw << " limit=" << lim;
     if (gamma >= 0.0f) std::cout << " gamma=" << std::setprecision(6) << gamma;
     std::cout << std::fixed
@@ -382,7 +409,9 @@ static void run_pops(jasper::graph<GraphCfg>& g, Codes<GraphCfg>& c,
               << std::setprecision(1) << " mean_pops=" << mean
               << " p95_pops=" << cnt[cnt.size() * 95 / 100]
               << std::setprecision(3) << " capped=" << capped
-              << std::setprecision(1) << " vectors_fetched=" << fetched << std::endl;
+              << std::setprecision(1) << " vectors_fetched=" << fetched
+              << " unique_pops=" << mean_unique
+              << std::setprecision(4) << " dup_topk=" << dup_frac << std::endl;
     std::cout.unsetf(std::ios::fixed);
   }
   std::cout << "  wrote " << o.pops_out << std::endl;

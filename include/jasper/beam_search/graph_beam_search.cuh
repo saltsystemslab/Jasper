@@ -2,11 +2,12 @@
 //
 // Generic directional-storage beam search. The skeleton (pop → mark visited →
 // fetch exact distance → grow frontier → expand out-edges → estimate their
-// distances → sort/dedup/clip) is identical whether out-edges are scored with
-// cross-polytope LSH or PQ/ADC; the only thing that differs is *how* a node's
-// out-edges are scored. That scoring scheme is factored out into an
-// "estimator" type (see lsh_estimator in directional_beam_search.cuh and
-// pq_estimator in pq_beam_search.cuh), and this file is templated on it.
+// distances → drop copies of nodes already listed → sort/dedup/clip) is
+// identical whether out-edges are scored with cross-polytope LSH or PQ/ADC;
+// the only thing that differs is *how* a node's out-edges are scored. That
+// scoring scheme is factored out into an "estimator" type (see lsh_estimator
+// in directional_beam_search.cuh and pq_estimator in pq_beam_search.cuh), and
+// this file is templated on it.
 //
 // An ESTIMATOR must provide:
 //   - `using globals_t = ...;`             query-invariant per-graph metadata
@@ -42,7 +43,8 @@
 // been expanded (classic beam search), on `limit`, or — with
 // beam_search_params::adaptive_gamma ≥ 0 — on the distance rule of Adaptive
 // Beam Search (Al-Jazzazi et al. 2025, eq. 3): stop once the next candidate is
-// at least (1+γ)× farther than the k-th best result. See adaptive_stop_slack.
+// at least (1+γ)× farther than the k-th best other discovered candidate, both
+// by estimate. See adaptive_stop_slack and step 2b of the kernel.
 #pragma once
 
 #include <cub/cub.cuh>
@@ -73,6 +75,13 @@ __host__ inline float adaptive_stop_slack(float gamma) {
   if constexpr (DISTANCE_FUNC == distance_func::L2)
     return (1.0f + gamma) * (1.0f + gamma) - 1.0f;
   return gamma;
+}
+
+// Smallest b with 2^b >= x (x >= 1).
+__host__ __device__ constexpr uint32_t ceil_log2(uint32_t x) {
+  uint32_t b = 0;
+  while ((1u << b) < x) ++b;
+  return b;
 }
 
 // ===== The kernel =====
@@ -152,6 +161,14 @@ __global__ void graph_beam_search_kernel(
   for (uint32_t i = threadIdx.x; i < padded_dim; i += BLOCK_SIZE)
     smem_query_vec[i] = query_vec_src[i];
 
+  // ---- Hash of the popped node's new neighbor ids (step 6b) ----
+  // Twice the out-degree, rounded up to a power of two, so linear probing
+  // stays short.
+  constexpr uint32_t NEW_ID_HASH_BITS  = ceil_log2(2u * GRAPH_CFG::n_neighbors);
+  constexpr uint32_t NEW_ID_HASH_SLOTS = 1u << NEW_ID_HASH_BITS;
+  __shared__ uint32_t new_id_hash[NEW_ID_HASH_SLOTS];  // node id, or EMPTY_SLOT
+  __shared__ uint32_t new_id_pos[NEW_ID_HASH_SLOTS];   // its offset past `offset`
+
   // ---- CUB temp storage for candidate sort/dedup ----
   constexpr uint32_t TAIL_EPT =
     (GRAPH_CFG::n_neighbors + BLOCK_SIZE - 1) / BLOCK_SIZE;
@@ -209,17 +226,30 @@ __global__ void graph_beam_search_kernel(
         static_cast<INDEX_T>(get_index(result_buffer[frontierIdx]));
 
     // 2b) Adaptive termination (adaptive_stop_slack): stop before visiting u
-    //     once its ESTIMATED distance is past the slack around the k-th best
-    //     EXACT distance. The paper compares exact distances, but u has only
-    //     its estimate until it is visited, and visiting it just to decide
-    //     would spend the vector read the rule exists to save. Every thread
-    //     reads the same shared values after the barrier above, so the break
-    //     is block-uniform.
-    if (adaptive_slack >= 0.0f && frontier_buffer_count[0] == k) {
-      const float d_k = get_distance(frontier_buffer[k - 1]);
-      if (get_distance(result_buffer[frontierIdx]) >=
-          d_k + adaptive_slack * fabsf(d_k))
-        break;
+    //     once its estimate is past the slack around d_k, the k-th best of the
+    //     OTHER discovered candidates. That is the paper's B (the k best
+    //     discovered nodes, the candidate itself excluded), with the estimates
+    //     standing in for distances directional search never computes: visited
+    //     entries keep the estimate they were popped with. Both sides of the
+    //     test are therefore estimates, and counting the list exactly as the
+    //     beam-width rule does (the medoid's seed entry included) makes γ = 0
+    //     stop where beam_width = k would (up to ties between estimates).
+    //
+    //     Not the k-th best EXACT distance in frontier_buffer: that ranks only
+    //     the expanded nodes, a few hundred per search, so at k = 100 it sits
+    //     near the worst node expanded and the test never trips.
+    //
+    //     Every thread reads the same shared values after the barrier above,
+    //     so the break is block-uniform.
+    if (adaptive_slack >= 0.0f) {
+      // u is at frontierIdx; step past it when it is among the first k.
+      const uint32_t kth = (frontierIdx < k) ? k : k - 1;
+      if (kth < result_buffer_count[0]) {
+        const float d_k = get_distance(result_buffer[kth]);
+        if (get_distance(result_buffer[frontierIdx]) >=
+            d_k + adaptive_slack * fabsf(d_k))
+          break;
+      }
     }
 
     // 3) Fetch u's exact/base distance via the estimator (the ONE I/O per
@@ -263,6 +293,84 @@ __global__ void graph_beam_search_kernel(
     estimator.estimate_neighbors(graph, u_gid, smem_query_vec,
                                  result_buffer, offset, n_edges);
     CLOCK_ACCUM(t_estimate, PHASE_ESTIMATE);
+
+    // 6b) Keep one list entry per node. A node reached from two parents carries
+    //     two different estimates, so its copies do not sort next to each
+    //     other and dedup_results cannot pair them. Left alone, every copy
+    //     takes a beam slot, and the best nodes, reached from the most parents,
+    //     take the most: a beam of width L holds far fewer than L distinct
+    //     candidates. Copies of an expanded node also pop again, re-expand, and
+    //     re-enter the top-k as repeats.
+    //
+    //     So each new neighbor is checked against the list (head) and the top-k
+    //     before it is merged in. The list holds at most one copy per node
+    //     going in, by induction, so there is at most one match:
+    //       - in the top-k, or matched by a visited list entry: the node is
+    //         expanded, and the new copy is dropped;
+    //       - matched by an unvisited entry: the lower estimate stays, as it
+    //         would have popped first anyway.
+    //     A node expanded and since clipped from both the list and the top-k
+    //     can still come back and be expanded again: a wasted pop, but its
+    //     exact distance cannot win it a place in the top-k a second time.
+    //
+    //     The new ids go into a small hash table in shared memory, and each
+    //     list and top-k entry looks itself up once. Dropped entries get
+    //     DROPPED_INDEX and keep their estimate, so the head stays sorted for
+    //     the merge, and dedup_results removes them after it.
+    CLOCK_START(t_unique);
+    {
+      constexpr uint32_t EMPTY_SLOT = 0xFFFFFFFFu;
+      const auto slot_of = [&](uint32_t id) {
+        return (id * 0x9E3779B1u) >> (32u - NEW_ID_HASH_BITS);
+      };
+      const auto drop = [](ENTRY_T e) { return set_index(e, DROPPED_INDEX); };
+
+      for (uint32_t s = threadIdx.x; s < NEW_ID_HASH_SLOTS; s += BLOCK_SIZE)
+        new_id_hash[s] = EMPTY_SLOT;
+      __syncthreads();
+
+      for (uint32_t j = threadIdx.x; j < n_edges; j += BLOCK_SIZE) {
+        const uint32_t id = get_index(result_buffer[offset + j]);
+        if (id == INVALID_INDEX) continue;  // out-of-range neighbor
+        for (uint32_t s = slot_of(id);; s = (s + 1) & (NEW_ID_HASH_SLOTS - 1)) {
+          const uint32_t prev = atomicCAS(&new_id_hash[s], EMPTY_SLOT, id);
+          if (prev == EMPTY_SLOT) { new_id_pos[s] = j; break; }
+          if (prev == id) {  // listed twice in u's edges
+            result_buffer[offset + j] = drop(result_buffer[offset + j]);
+            break;
+          }
+        }
+      }
+      __syncthreads();
+
+      // Position of id's new copy, or ~0u if u's edges do not reach id.
+      const auto new_copy_of = [&](uint32_t id) -> uint32_t {
+        for (uint32_t s = slot_of(id);; s = (s + 1) & (NEW_ID_HASH_SLOTS - 1)) {
+          const uint32_t h = new_id_hash[s];
+          if (h == id) return new_id_pos[s];
+          if (h == EMPTY_SLOT) return ~0u;
+        }
+      };
+      for (uint32_t i = threadIdx.x; i < offset; i += BLOCK_SIZE) {
+        const ENTRY_T e  = result_buffer[i];
+        const uint32_t id = get_index(e);
+        if (id == INVALID_INDEX || id == DROPPED_INDEX) continue;
+        const uint32_t j = new_copy_of(id);
+        if (j == ~0u) continue;
+        const ENTRY_T fresh = result_buffer[offset + j];
+        // Qualified: the kernel's bool `get_visited` parameter hides the helper.
+        if (jasper::get_visited(e) || get_distance(e) <= get_distance(fresh))
+          result_buffer[offset + j] = drop(fresh);
+        else
+          result_buffer[i] = drop(e);
+      }
+      for (uint32_t i = threadIdx.x; i < frontier_buffer_count[0]; i += BLOCK_SIZE) {
+        const uint32_t j = new_copy_of(get_index(frontier_buffer[i]));
+        if (j != ~0u) result_buffer[offset + j] = drop(result_buffer[offset + j]);
+      }
+      __syncthreads();
+    }
+    CLOCK_ACCUM(t_unique, PHASE_DEDUP);
 
     // 7) Sort / dedup / clip the candidate buffer (estimated distances).
     CLOCK_START(t_sort);

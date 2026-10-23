@@ -193,7 +193,7 @@ static __device__ void clip_k(uint32_t* result_buffer_count, const uint32_t & be
 }
 
 // deduplicate the frontier list
-// assume the list is already sorted
+// assume the list is already sorted; also drops entries marked DROPPED_INDEX
 template <typename INDEX_T, typename DISTANCE_T, uint32_t BLOCK_SIZE,
           uint32_t MAX_SEARCH_WIDTH, typename BlockScanT>
 __device__ void dedup_results(ENTRY_T *result_buffer,
@@ -252,7 +252,7 @@ __device__ void dedup_results(ENTRY_T *result_buffer,
     uint32_t element_id = threadIdx.x * ELEMENTS_PER_THREAD + i;
     if (element_id < count) {
       INDEX_T this_index = static_cast<INDEX_T>(get_index(this_entry[i]));
-      is_unique[i] = (this_index != prev_index);
+      is_unique[i] = (this_index != prev_index) && (this_index != DROPPED_INDEX);
       prev_index   = this_index;
 
 #if MEASURE_WASTED_CALCS

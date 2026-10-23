@@ -2,15 +2,16 @@
 """Beam-width vs adaptive termination, compared at matched recall.
 
 Joins the two halves of sbatch/bench_adaptive_termination.sbatch for every
-(dataset, method, k_ranks, placement) cell found in <raw_dir>:
+(dataset, method, k_ranks, k, placement) cell found in <raw_dir>, k being the
+search k of recall k@k:
 
-  <ds>_<method>_k<k>_<placement>.qps.log
+  <ds>_<method>_k<k_ranks>_top<k>_<placement>.qps.log
                                 run_query output: per point, one
                                 "beam_width=.. limit=.. [gamma=..] .. throughput=.. QPS"
                                 line followed by "Recall@k: ..". A point listed
                                 more than once (REPEATS) is reduced to its
                                 median QPS.
-  <ds>_<method>_k<k>_<placement>.pops.csv
+  <ds>_<method>_k<k_ranks>_top<k>_<placement>.pops.csv
                                 distortion_test --pops over the same points,
                                 with the stop,gamma columns.
 
@@ -18,7 +19,7 @@ placement is device or host (graph in pinned host memory, --on_host).
 
 Writes --out, one row per (cell, point):
 
-  dataset,method,k_ranks,placement,stop,beam_width,limit,gamma,recall,qps,qps_runs,
+  dataset,method,k_ranks,topk,placement,stop,beam_width,limit,gamma,recall,qps,qps_runs,
   recall_pops,mean_pops,p50_pops,p95_pops,capped_frac
 
 and prints, per cell and target recall, the best configuration of each rule
@@ -44,15 +45,18 @@ import statistics
 import sys
 from pathlib import Path
 
-NAME_RE = re.compile(r"^(?P<ds>.+)_(?P<method>lsh|pq|rabitq)_k(?P<k>\d+)_(?P<place>device|host)"
+NAME_RE = re.compile(r"^(?P<ds>.+)_(?P<method>conventional|lsh|pq|rabitq)_k(?P<k>\d+)"
+                     r"_top(?P<topk>\d+)"
+                     r"_(?P<place>device|host)"
                      r"\.(?P<kind>qps\.log|pops\.csv)$")
 QPS_RE = re.compile(r"beam_width=(\d+) limit=(\d+)(?: gamma=(\S+))? duration=\S+ "
                     r"throughput=(\d+) QPS")
 RECALL_RE = re.compile(r"Recall@\d+: ([0-9.]+)")
 
-FIELDS = ["dataset", "method", "k_ranks", "placement", "stop", "beam_width", "limit", "gamma",
+FIELDS = ["dataset", "method", "k_ranks", "topk", "placement", "stop", "beam_width", "limit", "gamma",
           "recall", "qps", "qps_runs", "recall_pops", "mean_pops", "p50_pops",
-          "p95_pops", "capped_frac"]
+          "p95_pops", "capped_frac", "mean_vectors_fetched", "mean_unique_pops",
+          "dup_topk_frac"]
 
 
 def point_key(bw, limit, gamma):
@@ -89,13 +93,14 @@ def fnum(x):
     return None if x in (None, "") else float(x)
 
 
-def cell_rows(ds, method, k, place, qps: dict, pops: dict) -> list[dict]:
+def cell_rows(ds, method, k, topk, place, qps: dict, pops: dict) -> list[dict]:
     rows = []
     for key in list(qps) + [k_ for k_ in pops if k_ not in qps]:
         bw, limit, gamma = key
         q, p = qps.get(key), pops.get(key)
         rows.append({
-            "dataset": ds, "method": method, "k_ranks": k, "placement": place,
+            "dataset": ds, "method": method, "k_ranks": k, "topk": topk,
+            "placement": place,
             "stop": "beam" if gamma is None else "adaptive",
             "beam_width": bw, "limit": limit, "gamma": "" if gamma is None else gamma,
             "recall": statistics.fmean(q["recall"]) if q and q["recall"] else None,
@@ -106,6 +111,12 @@ def cell_rows(ds, method, k, place, qps: dict, pops: dict) -> list[dict]:
             "p50_pops": fnum(p["p50_pops"]) if p else None,
             "p95_pops": fnum(p["p95_pops"]) if p else None,
             "capped_frac": fnum(p["capped_frac"]) if p else None,
+            # One per pop for DBS, one per appended neighbor for conventional:
+            # the work measure that compares across the two.
+            "mean_vectors_fetched": fnum(p.get("mean_vectors_fetched")) if p else None,
+            # Duplicate columns; absent from --pops CSVs written before them.
+            "mean_unique_pops": fnum(p.get("mean_unique_pops")) if p else None,
+            "dup_topk_frac": fnum(p.get("dup_topk_frac")) if p else None,
         })
     return rows
 
@@ -122,8 +133,16 @@ def best(rows, stop, target, recall_col, value_col, pick):
     return pick(ok, key=lambda r: r[value_col]) if ok else None
 
 
-def report(ds, method, k, place, rows, targets):
-    print(f"\n{ds}  {method}  k_ranks={k}  on {place}")
+def report(ds, method, k, topk, place, rows, targets):
+    if method == "conventional":
+        # Beam-width rule only: no rule comparison to make; plot_pareto.py
+        # compares it with the DBS methods.
+        top = max((r for r in rows if r["recall"] is not None),
+                  key=lambda r: r["recall"], default=None)
+        print(f"\n{ds}  conventional  recall {topk}@{topk}  on {place}: {len(rows)} beam points"
+              + (f", max recall {top['recall']:.4f} ({config(top)})" if top else ""))
+        return
+    print(f"\n{ds}  {method}  k_ranks={k}  recall {topk}@{topk}  on {place}")
     hdr = (f"  {'recall':>6} | {'beam QPS':>9} {'':<12} {'adapt QPS':>9} {'':<14} {'QPS x':>6} |"
            f" {'beam pops':>9} {'':<12} {'adapt pops':>10} {'':<14} {'pops':>7}")
     print(hdr)
@@ -171,9 +190,37 @@ def report(ds, method, k, place, rows, targets):
         worst = max(capped, key=lambda r: r["capped_frac"])
         print(f"  WARNING: {len(capped)} point(s) hit LIMIT on some queries "
               f"(worst {100 * worst['capped_frac']:.2f}% at {config(worst)}); raise LIMIT")
+    duplicates(rows)
 
 
-def placement_check(ds, method, k, by_place: dict) -> None:
+def duplicates(rows) -> None:
+    """A node reached from two parents carries two estimates that dedup cannot
+    pair; the kernel keeps one list entry per node. Report what still gets
+    through: re-expansions of nodes clipped from the list and the top-k and
+    then re-added (a wasted pop), and repeated top-k ids (a bug if nonzero)."""
+    d = [r for r in rows if r["mean_unique_pops"] is not None and r["mean_pops"]]
+    if not d:
+        return
+    reexp = max(d, key=lambda r: 1 - r["mean_unique_pops"] / r["mean_pops"])
+    share = 1 - reexp["mean_unique_pops"] / reexp["mean_pops"]
+    dup = max(d, key=lambda r: r["dup_topk_frac"])
+    if share <= 0 and dup["dup_topk_frac"] <= 0:
+        print("  duplicates: none (every pop a distinct node, no repeated top-k id)")
+        return
+    parts = []
+    for stop in ("beam", "adaptive"):
+        sub = [r for r in d if r["stop"] == stop]
+        if sub:
+            avg = statistics.fmean(1 - r["mean_unique_pops"] / r["mean_pops"] for r in sub)
+            parts.append(f"{stop} {100 * avg:.1f}%")
+    print(f"  re-expanded pops: {', '.join(parts)} on average, worst {100 * share:.1f}% "
+          f"at {config(reexp)}")
+    if dup["dup_topk_frac"] > 0:
+        print(f"  WARNING: top-k repeats an id in {100 * dup['dup_topk_frac']:.1f}% of queries "
+              f"at {config(dup)}; the kernel's repeat check is not holding")
+
+
+def placement_check(ds, method, k, topk, by_place: dict) -> None:
     """Pops and recall are properties of the search, so device and host should
     agree point for point. Codes are rebuilt per run, so allow a little drift."""
     if not {"device", "host"} <= by_place.keys():
@@ -192,7 +239,7 @@ def placement_check(ds, method, k, by_place: dict) -> None:
     if n:
         flag = "  <- larger than code-rebuild noise; check the host run" \
             if worst_pops > 0.01 or worst_recall > 0.002 else ""
-        print(f"\n{ds}  {method}  k_ranks={k}: host vs device over {n} points: "
+        print(f"\n{ds}  {method}  k_ranks={k}  {topk}@{topk}: host vs device over {n} points: "
               f"max |d pops| {100 * worst_pops:.2f}%, max |d recall| {worst_recall:.4f}{flag}")
 
 
@@ -211,26 +258,29 @@ def main() -> int:
         m = NAME_RE.match(p.name)
         if not m or (args.dataset and m["ds"] != args.dataset):
             continue
-        cells.setdefault((m["ds"], m["method"], int(m["k"]), m["place"]), {})[m["kind"]] = p
+        cells.setdefault((m["ds"], m["method"], int(m["k"]), int(m["topk"]), m["place"]),
+                         {})[m["kind"]] = p
     if not cells:
-        print(f"no <dataset>_<method>_k<k>_<placement>.{{qps.log,pops.csv}} in {args.raw_dir}",
+        print(f"no <dataset>_<method>_k<k_ranks>_top<k>_<placement>.{{qps.log,pops.csv}} "
+              f"in {args.raw_dir}",
               file=sys.stderr)
         return 1
 
     all_rows = []
     by_cell: dict = {}
-    for (ds, method, k, place), files in sorted(cells.items()):
+    for (ds, method, k, topk, place), files in sorted(cells.items()):
         qps = read_qps(files["qps.log"]) if "qps.log" in files else {}
         pops = read_pops(files["pops.csv"]) if "pops.csv" in files else {}
-        rows = cell_rows(ds, method, k, place, qps, pops)
+        rows = cell_rows(ds, method, k, topk, place, qps, pops)
         if not rows:
-            print(f"\n{ds}  {method}  k_ranks={k}  on {place}: no points parsed", file=sys.stderr)
+            print(f"\n{ds}  {method}  k_ranks={k}  {topk}@{topk}  on {place}: no points parsed",
+                  file=sys.stderr)
             continue
-        report(ds, method, k, place, rows, args.targets)
-        by_cell.setdefault((ds, method, k), {})[place] = rows
+        report(ds, method, k, topk, place, rows, args.targets)
+        by_cell.setdefault((ds, method, k, topk), {})[place] = rows
         all_rows += rows
-    for (ds, method, k), by_place in by_cell.items():
-        placement_check(ds, method, k, by_place)
+    for (ds, method, k, topk), by_place in by_cell.items():
+        placement_check(ds, method, k, topk, by_place)
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     with args.out.open("w", newline="") as f:

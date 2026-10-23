@@ -13,6 +13,12 @@ namespace jasper {
 // - 32 bits: distance
 typedef uint64_t ENTRY_T;
 
+// Index that marks an entry for removal: dedup_results drops every entry
+// carrying it. One below the 31-bit max that empty_entry() stores, so it is
+// never a real node id. graph_beam_search_kernel uses it for copies of a node
+// already in the list (see step 6b there).
+static constexpr uint32_t DROPPED_INDEX = 0x7FFFFFFEu;
+
 static __device__ __forceinline__ ENTRY_T create_entry(uint32_t index, float distance) {
   uint64_t entry = 0;
   entry |= (uint64_t(index) & 0x7FFFFFFFul) << 32;
