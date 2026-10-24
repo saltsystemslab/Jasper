@@ -43,6 +43,14 @@ CPMAddPackage (
 option(JASPER_STABLE_IDS    "Enable WarpSpeed-backed stable-id labels" OFF)
 option(JASPER_ENABLE_COMPACT "Enable graph compaction (compact())"     OFF)
 
+# directional_search / rq_search compile list widths up to 2048 entries; this
+# adds a 4096 instance per config (beam_width + rerank + 64 < 4096). OFF by
+# default: it is the slowest instance to compile. JASPER_WIDE_TIER_BLOCK sets
+# its block size, 0 keeping the caller's (128); 256 halves the per-thread list
+# work, 27% more QPS at width 4031 on sra50 (device and host).
+option(JASPER_WIDE_TIER "Compile a 4096-entry list width for directional searches" OFF)
+set(JASPER_WIDE_TIER_BLOCK 256 CACHE STRING "Block size of the 4096 width (0 = same as the other widths)")
+
 # WarpSpeed GPU hash tables — only needed when the stable-id layer is enabled.
 if(JASPER_STABLE_IDS)
   CPMAddPackage(
@@ -71,6 +79,8 @@ target_include_directories(jasper
 target_compile_definitions(jasper INTERFACE
   JASPER_STABLE_IDS=$<BOOL:${JASPER_STABLE_IDS}>
   JASPER_ENABLE_COMPACT=$<BOOL:${JASPER_ENABLE_COMPACT}>
+  JASPER_WIDE_TIER=$<BOOL:${JASPER_WIDE_TIER}>
+  JASPER_WIDE_TIER_BLOCK=${JASPER_WIDE_TIER_BLOCK}
 )
 if(JASPER_STABLE_IDS)
   target_include_directories(jasper INTERFACE

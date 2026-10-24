@@ -1437,6 +1437,8 @@ int main(int argc, char** argv) {
   std::cout << "  on_host:      " << (on_host ? "true" : "false") << std::endl;
   std::cout << "  query_chunk:  "
             << (g_query_chunk ? std::to_string(g_query_chunk) : std::string("all")) << std::endl;
+  std::cout << "  max list:     " << jasper::directional_max_width
+            << " (directional), 2048 (conventional, pq)" << std::endl;
   if (use_lsh || use_pq || use_rq) {
     std::cout << "  k_ranks:      " << k_ranks << std::endl;
     if (use_rq)

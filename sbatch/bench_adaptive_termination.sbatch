@@ -63,6 +63,20 @@
 #             stay under 2048, and each M also runs the widths that fill a tier
 #             to its top (tier top - M). RERANK_MULTS="" turns this off.
 #
+# ── Wide tier ──────────────────────────────────────────────────────────────
+# WIDE_TIER=1 builds with -DJASPER_WIDE_TIER=ON (in build_wide/, so the default
+# build is not recompiled), which gives lsh and rabitq a 4096-entry list:
+# their points may then reach beam_width + M + 64 < 4096. Beam adds WIDE_WIDTHS
+# (default 2380 2856 3427 4031: the 20% steps past 1983, then the top),
+# adaptive adds WIDE_CAPACITIES (4031), and re-rank adds WIDE_WIDTHS and 4031 - M.
+# Conventional and pq keep 2048: conventional reaches every target recall
+# within it. The 4096 instance runs 256 threads (WIDE_TIER_BLOCK; 0 = 128 like
+# the other widths): at 128 the per-pop list work outgrew the PCIe reads, and
+# 256 gave 27% more QPS at width 4031 on sra50, same recall. The build step
+# prints each list width's registers, stack and spills. ONLY_WIDE=1 runs just the
+# points whose list lands in the 4096 width, for a quick check of whether the
+# recall ceiling moves (cells left with no points are skipped).
+#
 # ── Placements ─────────────────────────────────────────────────────────────
 #   device   the graph is resident on the card
 #   host     the graph lives in pinned host memory (--on_host), so every
@@ -74,7 +88,7 @@
 #
 # ── Reading the capacity axis ──────────────────────────────────────────────
 # Per-pop cost is set by the compiled search width the dispatch derives from
-# beam_width (the first of 128/256/512/1024/2048 above beam_width + 64), not by
+# beam_width (the first of 128/256/512/1024/2048[/4096] above beam_width + 64), not by
 # the rule. Adaptive at capacity C and beam at width C run on the same tier and
 # pay the same per pop, so there the QPS gap is the pop gap. A larger capacity
 # costs more per pop; a smaller one saturates: once the list holds fewer
@@ -131,6 +145,8 @@
 #   QUERY_BATCH=100000 sbatch sbatch/bench_adaptive_termination.sbatch  # tile for QPS
 #   PLACEMENTS=host RUN_POPS=0 sbatch sbatch/bench_adaptive_termination.sbatch
 #   SUMMARY_ONLY=1 ./sbatch/bench_adaptive_termination.sbatch   # re-join raw/, no GPU
+#   WIDE_TIER=1 ONLY_WIDE=1 DATASETS=sra50 METHODS="lsh rabitq" K_LIST=16 \
+#     OUT=$HOME/jasper/wide_trial sbatch sbatch/bench_adaptive_termination.sbatch
 
 set -euo pipefail
 
@@ -163,6 +179,12 @@ BUILD_L="${BUILD_L:-192}"              # create_diskann_index's build L (cmake -
 TWO_PASS="${TWO_PASS:-1}"              # 0 = --one_pass
 QUERY_CHUNK_device="${QUERY_CHUNK_device:-0}"
 QUERY_CHUNK_host="${QUERY_CHUNK_host:-0}"
+WIDE_TIER="${WIDE_TIER:-0}"            # 1 = lsh/rabitq get a 4096-entry list (see "Wide tier")
+WIDE_TIER_BLOCK="${WIDE_TIER_BLOCK:-256}" # its block size; 0 = the other widths' (128)
+WIDE_WIDTHS="${WIDE_WIDTHS:-2380 2856 3427 4031}"
+WIDE_CAPACITIES="${WIDE_CAPACITIES-4031}"
+ONLY_WIDE="${ONLY_WIDE:-0}"            # 1 = only points whose list lands in the 4096 width
+BUILD_DIR="${BUILD_DIR:-build$([ "$WIDE_TIER" != 1 ] || echo "_wide$([ "$WIDE_TIER_BLOCK" = 256 ] || echo "$WIDE_TIER_BLOCK")")}"
 DRY_RUN="${DRY_RUN:-0}"
 SUMMARY_ONLY="${SUMMARY_ONLY:-0}"
 
@@ -172,7 +194,7 @@ LOCALE="${LOCALE:-/tmp2/ann_data/locale}"
 REPO="${REPO:-$HOME/jasper}"
 WORK="${WORK:-/projects/SaltSystemsLab/${USER:-$(id -un)}/distortion}"
 INDEX_DIR="${INDEX_DIR:-/scratch/${USER:-$(id -un)}}"
-BUILD_TAG="L${BUILD_L}$([ "$TWO_PASS" = 1 ] && echo _2pass)"
+BUILD_TAG="L${BUILD_L}$([ "$TWO_PASS" != 1 ] || echo _2pass)"
 OUT="${OUT:-$REPO/adaptive_termination}"
 RAW="$OUT/raw"
 
@@ -189,6 +211,43 @@ dataset_spec() {
 }
 
 stamp() { date '+%Y-%m-%d %H:%M:%S'; }
+
+# Registers and stack of the directional kernels, by compiled list width: the
+# largest Lj<n>E template argument of the mangled name (block size, degree,
+# k_ranks and tile are all <= 256, so widths 128 and 256 show as "<=256").
+# STACK is the merge window's per-thread arrays (2 x width/block x 8 bytes, in
+# local memory); LOCAL above 0 is a register spill. Never fails the job.
+kernel_resources() {                   # $1 = binary, $2 = its build dir
+  local nvcc_dir objdump
+  # The cuda module is unloaded by now; cuobjdump sits next to the nvcc cmake used.
+  nvcc_dir=$(dirname "$(sed -n 's/^CMAKE_CUDA_COMPILER:[A-Z]*=//p' "$2/CMakeCache.txt" 2>/dev/null)")
+  objdump=$(command -v cuobjdump || { [ -x "$nvcc_dir/cuobjdump" ] && echo "$nvcc_dir/cuobjdump"; } || true)
+  [ -n "$objdump" ] || { echo "  (no cuobjdump on PATH or in $nvcc_dir: register check skipped)"; return 0; }
+  echo "  directional kernels by list width (max over configs):"
+  { "$objdump" -res-usage "$1" 2>/dev/null || true; } | awk '
+    /graph_beam_search_kernel/ {
+      w = 0; name = $0
+      while (match(name, /Lj[0-9]+E/)) {
+        v = substr(name, RSTART + 2, RLENGTH - 3) + 0
+        if (v > w) w = v
+        name = substr(name, RSTART + RLENGTH)
+      }
+      w = (w > 256) ? w : "<=256"; want = 1; next
+    }
+    want && /REG:/ {
+      for (i = 1; i <= NF; i++) {
+        split($i, kv, ":")
+        if (kv[1] == "REG"   && kv[2] + 0 > reg[w]) reg[w] = kv[2] + 0
+        if (kv[1] == "STACK" && kv[2] + 0 > stk[w]) stk[w] = kv[2] + 0
+        if (kv[1] == "LOCAL" && kv[2] + 0 > lcl[w]) lcl[w] = kv[2] + 0
+      }
+      n[w]++; want = 0
+    }
+    END {
+      for (w in n) printf "    width %-6s %3d kernels   REG %-4d STACK %-5d LOCAL %d\n", w, n[w], reg[w], stk[w], lcl[w]
+      if (length(n) == 0) print "    (no graph_beam_search_kernel found)"
+    }' | sort -k2 -n || true
+}
 
 # Default beam sweep: BEAM_RATIO steps from BEAM_MIN to BEAM_MAX (at least +1
 # each), plus each compiled tier's widest width — one wider moves the search to
@@ -224,29 +283,37 @@ if [ "$SUMMARY_ONLY" != "0" ]; then
 fi
 
 # ── Points ─────────────────────────────────────────────────────────────────
-# Built per search k: the searches dispatch on beam_width + 64 < 2048, so 1983
-# is the widest point, and a width under k cannot hold the k results.
-fits() { [ "$1" -ge "$2" ] && [ $(( $1 + 64 )) -lt 2048 ]; }
+# Built per search k and method: the searches dispatch on list + 64 < 2048
+# (4096 for lsh and rabitq under WIDE_TIER=1), where the list is beam_width,
+# plus M with re-rank; and a width under k cannot hold the k results.
+max_list() {                           # $1 = method
+  if [ "$WIDE_TIER" = 1 ] && { [ "$1" = lsh ] || [ "$1" = rabitq ]; }; then echo 4096; else echo 2048; fi
+}
+fits() {                               # $1 = list, $2 = search k, $3 = method
+  [ "$1" -ge "$2" ] && [ $(( $1 + 64 )) -lt "$(max_list "$3")" ] &&
+    { [ "$ONLY_WIDE" = 0 ] || [ $(( $1 + 64 )) -ge 2048 ]; }
+}
 build_points() {                       # $1 = search k, $2 = method
   local topk=$1 method=${2:-lsh} w g mult rr
   BEAM_POINTS=""; ADAPT_POINTS=""; RERANK_POINTS=""
-  for w in $BEAM_WIDTHS; do
-    if fits "$w" "$topk"; then BEAM_POINTS="$BEAM_POINTS $w:$LIMIT"; fi
+  for w in $BEAM_WIDTHS $WIDE_WIDTHS; do
+    if fits "$w" "$topk" "$method"; then BEAM_POINTS="$BEAM_POINTS $w:$LIMIT"; fi
   done
-  for w in $CAPACITIES; do
+  for w in $CAPACITIES $WIDE_CAPACITIES; do
     [ "$method" = "conventional" ] && break   # beam-width rule only
-    fits "$w" "$topk" || continue
+    fits "$w" "$topk" "$method" || continue
     for g in $GAMMAS; do ADAPT_POINTS="$ADAPT_POINTS $w:$LIMIT:$g"; done
   done
   # Re-rank on top of the beam-width rule. The list holds w + M, and that is
   # what picks the tier, so each M also gets the widths that fill a tier to its
-  # top (63 191 447 959 1983, less M): the cheapest per slot, as on the beam grid.
+  # top (63 191 447 959 1983 [4031], less M): the cheapest per slot, as on the
+  # beam grid.
   [ "$method" = "conventional" ] || for mult in $RERANK_MULTS; do
     rr=$(( mult * topk ))
-    for w in $(printf '%s\n' $RERANK_WIDTHS $(( 63 - rr )) $(( 191 - rr )) $(( 447 - rr )) \
-                 $(( 959 - rr )) $(( 1983 - rr )) | sort -n -u); do
+    for w in $(printf '%s\n' $RERANK_WIDTHS $WIDE_WIDTHS $(( 63 - rr )) $(( 191 - rr )) $(( 447 - rr )) \
+                 $(( 959 - rr )) $(( 1983 - rr )) $(( 4031 - rr )) | sort -n -u); do
       [ "$w" -ge "$topk" ] || continue
-      if fits $(( w + rr )) "$topk"; then RERANK_POINTS="$RERANK_POINTS $w:$LIMIT:-:$rr"; fi
+      if fits $(( w + rr )) "$topk" "$method"; then RERANK_POINTS="$RERANK_POINTS $w:$LIMIT:-:$rr"; fi
     done
   done
   POINTS="${BEAM_POINTS# } ${ADAPT_POINTS# } ${RERANK_POINTS# }"
@@ -263,7 +330,7 @@ build_points() {                       # $1 = search k, $2 = method
 for topk in $K; do
   case "$topk" in ''|*[!0-9]*|0) echo "bad search k: $topk" >&2; exit 2;; esac
   build_points "$topk"
-  [ -n "$POINTS" ] || { echo "no points to run at k=$topk (need $topk <= width <= 1983)" >&2; exit 2; }
+  [ -n "$POINTS" ] || { echo "no points to run at k=$topk (need $topk <= width <= 1983, or 4031 with WIDE_TIER=1)" >&2; exit 2; }
 done
 
 # Neighbors per query in a ground-truth file: the second int32 of its header.
@@ -287,13 +354,15 @@ echo "              x gammas $GAMMAS"
 echo "  rerank:     $([ -n "${RERANK_MULTS// }" ] && echo "widths $RERANK_WIDTHS" || echo off)"
 [ -n "${RERANK_MULTS// }" ] && echo "              x M = (${RERANK_MULTS}) x k"
 for topk in $K; do
+  build_points "$topk" conventional; n_conv=$N_BEAM
   build_points "$topk"
-  printf "  %-11s %s beam + %s adaptive + %s rerank points per DBS cell, %s for conventional\n" \
-    "${topk}@${topk}:" "$N_BEAM" "$N_ADAPT" "$N_RERANK" "$N_BEAM"
+  printf "  %-11s %s beam + %s adaptive + %s rerank points per lsh/rabitq cell, %s for conventional\n" \
+    "${topk}@${topk}:" "$N_BEAM" "$N_ADAPT" "$N_RERANK" "$n_conv"
 done
 echo "  limit:      $LIMIT pops    qps passes: $REPEATS    query batch: $([ "$QUERY_BATCH" = 0 ] && echo untiled || echo "$QUERY_BATCH")"
 echo "  chunks:     device $QUERY_CHUNK_device, host $QUERY_CHUNK_host (0 = all at once; per-method QUERY_CHUNK_<placement>_<method> overrides)"
 echo "  build:      $BUILD_TAG -> $INDEX_DIR"
+echo "  wide tier:  $([ "$WIDE_TIER" = 1 ] && echo "on (lsh, rabitq; block $([ "$WIDE_TIER_BLOCK" = 0 ] && echo 128 || echo "$WIDE_TIER_BLOCK")), widths $WIDE_WIDTHS, capacities ${WIDE_CAPACITIES:-none}$([ "$ONLY_WIDE" = 1 ] && echo ', ONLY those points')" || echo off)    binaries: $BUILD_DIR"
 echo "  placements: $PLACEMENTS"
 echo "  steps:      $([ "$RUN_QPS" = 1 ] && echo 'run_query ')$([ "$RUN_POPS" = 1 ] && echo 'distortion_test --pops')"
 echo "  graph:      R_int=$R_INT R_fin=$R_FIN dist=l2"
@@ -338,6 +407,7 @@ for ds in $DATASETS; do
     fi
     for c in $combos; do
       build_points "$topk" "${c%%:*}"
+      [ -n "$POINTS" ] || { echo "    ${c%%:*} ${topk}@${topk}: SKIP (no points)"; continue; }
       CELLS="$CELLS $ds:$c:$topk"
       TOTAL_POINTS=$(( TOTAL_POINTS + N_BEAM + N_ADAPT + N_RERANK ))
     done
@@ -369,10 +439,14 @@ THRUST_DIR="${THRUST_DIR:-/projects/SaltSystemsLab/zikun/env/lib/rapids/cmake/th
 
 echo
 echo "=== building binaries ==="
-cmake -B build -DJASPER_BUILD_CMD=ON -DJASPER_BUILD_TESTS=OFF -DJASPER_BUILD_FFI=OFF \
-  -DJASPER_BUILD_L="$BUILD_L" -DThrust_DIR="$THRUST_DIR" -DCMAKE_PREFIX_PATH="$CONDA_PREFIX" >/dev/null
-cmake --build build --target create_diskann_index run_query distortion_test -j8 >/dev/null
+cmake -B "$BUILD_DIR" -DJASPER_BUILD_CMD=ON -DJASPER_BUILD_TESTS=OFF -DJASPER_BUILD_FFI=OFF \
+  -DJASPER_BUILD_L="$BUILD_L" \
+  -DJASPER_WIDE_TIER="$([ "$WIDE_TIER" = 1 ] && echo ON || echo OFF)" \
+  -DJASPER_WIDE_TIER_BLOCK="$WIDE_TIER_BLOCK" \
+  -DThrust_DIR="$THRUST_DIR" -DCMAKE_PREFIX_PATH="$CONDA_PREFIX" >/dev/null
+cmake --build "$BUILD_DIR" --target create_diskann_index run_query distortion_test -j8 >/dev/null
 echo "  ok"
+if [ "$WIDE_TIER" = 1 ]; then kernel_resources "$BUILD_DIR/bin/run_query" "$BUILD_DIR"; fi
 mkdir -p "$WORK" "$INDEX_DIR" "$RAW"
 
 # ── Sweep ──────────────────────────────────────────────────────────────────
@@ -388,7 +462,7 @@ for ds in $DATASETS; do
     echo "[$(stamp)] reusing index $idx"
   else
     echo "[$(stamp)] building plain index -> $idx"
-    ./build/bin/create_diskann_index \
+    "$BUILD_DIR"/bin/create_diskann_index \
         -f "$base" -t "$dtype" -d l2 --dim "$dim" \
         --r_intermediate "$R_INT" --r_final "$R_FIN" \
         --n_parts "$N_PARTS" --n_dup "$N_DUP" -a "$ALPHA" \
@@ -431,7 +505,7 @@ for ds in $DATASETS; do
       if [ "$RUN_QPS" = "1" ]; then
         # No --prepopulated: codes are built at load from the plain index, the
         # same way distortion_test builds them below.
-        ./build/bin/run_query -i "$idx" --dim "$dim" -d l2 -t "$dtype" -n "$R_FIN" -k "$topk" \
+        "$BUILD_DIR"/bin/run_query -i "$idx" --dim "$dim" -d l2 -t "$dtype" -n "$R_FIN" -k "$topk" \
             ${qps_mode[@]+"${qps_mode[@]}"} ${host_arg[@]+"${host_arg[@]}"} \
             --query_chunk "$chunk" \
             -q "$qq" -g "$qg" --beam_limits $QPS_POINTS >| "$RAW/$name.qps.log" 2>&1 \
@@ -440,7 +514,7 @@ for ds in $DATASETS; do
       fi
 
       if [ "$RUN_POPS" = "1" ]; then
-        ./build/bin/distortion_test -i "$idx" --dim "$dim" -t "$dtype" -n "$R_FIN" -k "$topk" \
+        "$BUILD_DIR"/bin/distortion_test -i "$idx" --dim "$dim" -t "$dtype" -n "$R_FIN" -k "$topk" \
             -m "$m" -r "$pops_k" ${host_arg[@]+"${host_arg[@]}"} \
             -q "$q" -g "$gt" --pops "$RAW/$name.pops.csv" -b $POINTS >| "$RAW/$name.pops.log" 2>&1 \
           || echo "  POPS FAILED ($name) — see $RAW/$name.pops.log"

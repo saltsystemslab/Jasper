@@ -9,7 +9,37 @@
 #include "jasper/pq/pq_codebooks.cuh"
 #include "jasper/rabitq/edge_rq.cuh"
 
+#include <stdexcept>
+#include <string>
+
+// JASPER_WIDE_TIER (CMake option, off by default) adds a 4096-entry list width
+// to directional_search and rq_search, for beam_width + rerank past 1983; it
+// is the slowest instance to compile. JASPER_WIDE_TIER_BLOCK sets its block
+// size, 0 keeping the caller's: 256 halves the per-thread share of the list's
+// merge, dedup and scan, which at 128 threads made a pop at width 4031 cost
+// more than its PCIe reads. search() and pq_search() stop at 2048 either way.
+#ifndef JASPER_WIDE_TIER
+#define JASPER_WIDE_TIER 0
+#endif
+#ifndef JASPER_WIDE_TIER_BLOCK
+#define JASPER_WIDE_TIER_BLOCK 256
+#endif
+
 namespace jasper {
+
+inline constexpr uint32_t directional_max_width = JASPER_WIDE_TIER ? 4096u : 2048u;
+
+template <uint32_t BLOCK_SIZE>
+inline constexpr uint32_t wide_tier_block =
+    JASPER_WIDE_TIER_BLOCK ? JASPER_WIDE_TIER_BLOCK : BLOCK_SIZE;
+
+inline std::invalid_argument directional_width_error(uint32_t bw) {
+  return std::invalid_argument(
+      "beam_width + rerank " + std::to_string(bw) +
+      " is too large (beam_width + rerank + 64 must be < " +
+      std::to_string(directional_max_width) + ")" +
+      (JASPER_WIDE_TIER ? "" : "; build with -DJASPER_WIDE_TIER=ON for 4096"));
+}
 
 struct search_params {
   uint32_t k               = 10;
@@ -153,9 +183,10 @@ beam_search_result<GRAPH_CFG> directional_search(
   else if (bw + 64 < 512)  return directional_search_dispatch_width<GRAPH_CFG, BLOCK_SIZE, 512,  TILE_SIZE>(g, globals, d_queries, params);
   else if (bw + 64 < 1024) return directional_search_dispatch_width<GRAPH_CFG, BLOCK_SIZE, 1024, TILE_SIZE>(g, globals, d_queries, params);
   else if (bw + 64 < 2048) return directional_search_dispatch_width<GRAPH_CFG, BLOCK_SIZE, 2048, TILE_SIZE>(g, globals, d_queries, params);
-  else throw std::invalid_argument(
-      "beam_width + rerank " + std::to_string(bw) +
-      " is too large (beam_width + rerank + 64 must be < 2048)");
+#if JASPER_WIDE_TIER
+  else if (bw + 64 < 4096) return directional_search_dispatch_width<GRAPH_CFG, wide_tier_block<BLOCK_SIZE>, 4096, TILE_SIZE>(g, globals, d_queries, params);
+#endif
+  else throw directional_width_error(bw);
 }
 
 // ───────────────────────────────── pq_search ───────────────────────────────
@@ -296,9 +327,10 @@ beam_search_result<GRAPH_CFG> rq_search(
   else if (bw + 64 < 512)  return rq_search_dispatch_width<GRAPH_CFG, BLOCK_SIZE, 512,  TILE_SIZE>(g, globals, d_queries, params);
   else if (bw + 64 < 1024) return rq_search_dispatch_width<GRAPH_CFG, BLOCK_SIZE, 1024, TILE_SIZE>(g, globals, d_queries, params);
   else if (bw + 64 < 2048) return rq_search_dispatch_width<GRAPH_CFG, BLOCK_SIZE, 2048, TILE_SIZE>(g, globals, d_queries, params);
-  else throw std::invalid_argument(
-      "beam_width + rerank " + std::to_string(bw) +
-      " is too large (beam_width + rerank + 64 must be < 2048)");
+#if JASPER_WIDE_TIER
+  else if (bw + 64 < 4096) return rq_search_dispatch_width<GRAPH_CFG, wide_tier_block<BLOCK_SIZE>, 4096, TILE_SIZE>(g, globals, d_queries, params);
+#endif
+  else throw directional_width_error(bw);
 }
 
 }  // namespace jasper
