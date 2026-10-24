@@ -96,7 +96,11 @@ __global__ void estimator_distortion_kernel(
   }
   __syncthreads();
 
-  estimator.estimate_neighbors(graph, u, smem_query_vec, edge_buf, 0, n_edges);
+  // The search kernel stages u's codes in shared memory first; reading the
+  // graph's copy gives the same values.
+  estimator.estimate_neighbors(graph, smem_query_vec,
+                               *ESTIMATOR::edge_codes(graph, u),
+                               edge_buf, 0, n_edges);
 
   // ---- Exact distance, one warp per edge ----
   const uint32_t lane    = threadIdx.x & 31u;

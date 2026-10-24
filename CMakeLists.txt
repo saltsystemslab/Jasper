@@ -137,6 +137,11 @@ if(JASPER_BUILD_CMD)
 
   add_executable(create_diskann_index cmd/create_diskann_index.cu)
   target_link_libraries(create_diskann_index PRIVATE jasper)
+  # Build-time candidate-list size of the graph build (see create_diskann_index.cu).
+  # 192 (with the default two-pass build) cut nodes expanded at matched recall
+  # to 0.3-0.8x of L=64 on deep10M and sra50 (sbatch/bench_graph_build.sbatch).
+  set(JASPER_BUILD_L 192 CACHE STRING "Beam width L of create_diskann_index's build (<= 192)")
+  target_compile_definitions(create_diskann_index PRIVATE JASPER_BUILD_L=${JASPER_BUILD_L})
   set_target_properties(create_diskann_index PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"

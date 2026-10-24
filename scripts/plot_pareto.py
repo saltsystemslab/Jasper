@@ -80,6 +80,8 @@ def read_rows(paths):
                 r["k_ranks"] = int(r["k_ranks"])
                 r["topk"] = int(r["topk"])
                 r["beam_width"] = int(r["beam_width"])
+                # Absent from joined CSVs written before re-ranking existed.
+                r["rerank"] = int(r.get("rerank") or 0)
                 rows.append(r)
     return rows
 
@@ -96,9 +98,10 @@ def series_label(key, multi_k):
 
 
 def config(r):
-    if r["stop"] == "beam":
-        return f"bw={r['beam_width']}"
-    return f"L={r['beam_width']} g={r['gamma']:g}"
+    rr = f" M={r['rerank']}" if r.get("rerank") else ""
+    if r["gamma"] is None:
+        return f"bw={r['beam_width']}{rr}"
+    return f"L={r['beam_width']} g={r['gamma']:g}{rr}"
 
 
 def frontier(points, higher_better):
@@ -190,7 +193,8 @@ def plot_cell(ds, topk, rows, out_dir, fmt, min_recall, linear):
                 fronts.append({"dataset": ds, "topk": topk, "panel": panel, "method": m,
                                "k_ranks": k, "recall": rec, "value": val,
                                "stop": row["stop"], "beam_width": row["beam_width"],
-                               "gamma": "" if row["gamma"] is None else row["gamma"]})
+                               "gamma": "" if row["gamma"] is None else row["gamma"],
+                               "rerank": row["rerank"]})
         ax.set_ylabel(ylabel, fontsize=8, color=INK)
         ax.set_xlabel(f"Recall {topk}@{topk}" + (" (%)" if linear else ""), fontsize=8, color=INK)
     left = min_recall if min_recall is not None else lo
@@ -287,7 +291,8 @@ def main() -> int:
         dst = args.out / f"pareto_{ds}.csv"
         with dst.open("w", newline="") as f:
             w = csv.DictWriter(f, fieldnames=["dataset", "topk", "panel", "method", "k_ranks",
-                                              "recall", "value", "stop", "beam_width", "gamma"])
+                                              "recall", "value", "stop", "beam_width", "gamma",
+                                              "rerank"])
             w.writeheader()
             w.writerows(fronts)
         print(f"\nwrote {dst} ({len(fronts)} frontier points)")

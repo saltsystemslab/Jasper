@@ -86,6 +86,13 @@ struct graph_construct_params {
 
   // Prerotate seed
   uint64_t prerotate_seed = 42;
+
+  // Two-pass build, as in Vamana: a first round at alpha = 1.0 (plain RNG
+  // pruning, short edges), then the round at `alpha` re-inserts every node
+  // with those edges as candidates and adds the long hops. Roughly doubles
+  // build time. merge_candidates_kernel folds a node's existing edges into its
+  // candidates and drops the node itself, so re-inserting is safe.
+  bool two_pass = false;
 };
 
 template <typename INDEX_T>
@@ -994,6 +1001,9 @@ __host__ void construct_graph_into(
     beam_search_tile_size>;
 
   construct_timer timer;
+  if (params.two_pass)
+    construction_round<CONSTRUCT_GRAPH_CONFIG, beam_search_cfg>(
+      g, ws, 1.0f, params.max_batch_size, timer, stream);
   construction_round<CONSTRUCT_GRAPH_CONFIG, beam_search_cfg>(
     g, ws, params.alpha, params.max_batch_size, timer, stream);
   timer.print();
@@ -1147,12 +1157,14 @@ __host__ graph<typename CONSTRUCT_GRAPH_CONFIG::graph_cfg_t> construct_graph(
     CONSTRUCT_GRAPH_CONFIG::beam_search_max_search_width,
     beam_search_tile_size>;
 
-  // first round establish edges
-  // construct_timer first_round_timer;
-  // construction_round<CONSTRUCT_GRAPH_CONFIG, beam_search_cfg>(
-  //   g, ws, 1.0, params.max_batch_size, first_round_timer
-  // );  
-  // first_round_timer.print();
+  // first round establish edges (params.two_pass)
+  if (params.two_pass) {
+    construct_timer first_round_timer;
+    construction_round<CONSTRUCT_GRAPH_CONFIG, beam_search_cfg>(
+      g, ws, 1.0f, params.max_batch_size, first_round_timer, stream
+    );
+    first_round_timer.print();
+  }
 
   // second round add long hop edges
   construct_timer second_round_timer;

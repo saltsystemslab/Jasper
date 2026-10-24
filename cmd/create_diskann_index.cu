@@ -9,6 +9,20 @@
 
 #include "jasper/jasper.cuh"
 
+// Candidate-list size L of the build's beam search (every config below). A
+// build-time knob rather than a config axis, so it never multiplies the
+// tables: configure a separate build directory with -DJASPER_BUILD_L=<L> to
+// get a binary with another one. L <= 192 keeps the build's search width
+// (L + 64) within 256, the visited-log cap. 192 is the default: with the
+// two-pass build it needed 0.3-0.8x the nodes expanded of L=64 at matched
+// recall, and lifted sra50's 10@10 ceiling from 0.94 to 0.995
+// (sbatch/bench_graph_build.sbatch).
+#ifndef JASPER_BUILD_L
+#define JASPER_BUILD_L 192
+#endif
+static_assert(JASPER_BUILD_L >= 1 && JASPER_BUILD_L + 64 <= 256,
+              "JASPER_BUILD_L + 64 must fit the 256-entry build visited log");
+
 // DiskANN-style merge build: shard with polytope LSH (duplicating each vector
 // into n_dup shards), build one intermediate graph per shard at degree R_int,
 // then merge into a final graph at degree R_final.
@@ -25,9 +39,9 @@
 
 #define DECLARE_CONFIGS(id, IDX, RINT, RFIN, DAT, DIST, FUNC)                            \
   using int_cfg_##id = jasper::graph_construct_config<                                    \
-      jasper::graph_config<IDX, RINT, DAT, DIST, FUNC>, 64, 4, RINT, 64>;                 \
+      jasper::graph_config<IDX, RINT, DAT, DIST, FUNC>, 64, 4, RINT, JASPER_BUILD_L>;                 \
   using fin_cfg_##id = jasper::graph_construct_config<                                    \
-      jasper::graph_config<IDX, RFIN, DAT, DIST, FUNC>, 64, 4, RFIN, 64>;
+      jasper::graph_config<IDX, RFIN, DAT, DIST, FUNC>, 64, 4, RFIN, JASPER_BUILD_L>;
 
 JASPER_FOR_EACH_CONFIG(DECLARE_CONFIGS)
 #undef DECLARE_CONFIGS
@@ -81,9 +95,11 @@ JASPER_FOR_EACH_CONFIG(DECLARE_CONFIGS)
 
 #define DECLARE_DIR_CONFIGS(id, IDX, RINT, RFIN, DAT, DIST, FUNC, KR, PACKEDT)           \
   using int_cfg_##id = jasper::graph_construct_config<                                    \
-      jasper::graph_config<IDX, RINT, DAT, DIST, FUNC, true, KR, PACKEDT>, 64, 4, RINT, 64>; \
+      jasper::graph_config<IDX, RINT, DAT, DIST, FUNC, true, KR, PACKEDT>, 64, 4, RINT, \
+      JASPER_BUILD_L>; \
   using fin_cfg_##id = jasper::graph_construct_config<                                    \
-      jasper::graph_config<IDX, RFIN, DAT, DIST, FUNC, true, KR, PACKEDT>, 64, 4, RFIN, 64>;
+      jasper::graph_config<IDX, RFIN, DAT, DIST, FUNC, true, KR, PACKEDT>, 64, 4, RFIN, \
+      JASPER_BUILD_L>;
 
 JASPER_FOR_EACH_DIR_CONFIG(DECLARE_DIR_CONFIGS)
 #undef DECLARE_DIR_CONFIGS
@@ -117,6 +133,7 @@ void construct(
     const std::string& filename,
     const std::string& src_dtype,
     float              alpha,
+    bool               two_pass,
     uint32_t           n_parts,
     uint32_t           n_dup,
     size_t             workspace_budget,
@@ -143,6 +160,7 @@ void construct(
   jasper::graph_construct_params<IntCfg> params;
   params.data_vectors   = vecs;
   params.alpha          = alpha;
+  params.two_pass       = two_pass;
   params.max_batch_size = std::max<uint32_t>(1, vecs.n_vectors / n_parts / 20);
   params.on_host        = false;
 
@@ -210,6 +228,7 @@ void dispatch(
     uint64_t           r_final,
     const std::string& filename,
     float              alpha,
+    bool               two_pass,
     uint32_t           n_parts,
     uint32_t           n_dup,
     size_t             workspace_budget,
@@ -230,7 +249,7 @@ void dispatch(
                                                 RINT, RFIN, k_ranks, dim)) {             \
         std::cout << "  Config: " #id << std::endl;                                      \
         construct<int_cfg_##id, fin_cfg_##id, DAT>(                                      \
-            filename, datatype, alpha, n_parts, n_dup, workspace_budget,                 \
+            filename, datatype, alpha, two_pass, n_parts, n_dup, workspace_budget,       \
             n_vector_limit, index_out, opts);                                             \
         return;                                                                           \
       }
@@ -253,7 +272,7 @@ void dispatch(
     if (config_matches<FUNC>(datatype, distance, r_int, r_final, RINT, RFIN)) {          \
       std::cout << "  Config: " #id << std::endl;                                         \
       construct<int_cfg_##id, fin_cfg_##id, DAT>(                                          \
-          filename, datatype, alpha, n_parts, n_dup, workspace_budget,                    \
+          filename, datatype, alpha, two_pass, n_parts, n_dup, workspace_budget,          \
           n_vector_limit, index_out);                                                     \
       return;                                                                             \
     }
@@ -301,6 +320,15 @@ int main(int argc, char** argv) {
   program.add_argument("--alpha", "-a")
     .default_value(1.2f).scan<'g', float>()
     .help("Pruning factor alpha.");
+
+  program.add_argument("--one_pass")
+    .default_value(false).implicit_value(true)
+    .help("Build in one round at --alpha. The default is Vamana's two-pass "
+          "build: a round at alpha 1.0, then the round at --alpha over the "
+          "same graph (about 1.5-2x the build time).");
+  program.add_argument("--two_pass")
+    .default_value(false).implicit_value(true)
+    .help("The default; accepted so older scripts keep working.");
 
   program.add_argument("--workspace_budget", "-w")
     .required()
@@ -379,6 +407,11 @@ int main(int argc, char** argv) {
   auto n_parts          = program.get<uint32_t>("--n_parts");
   auto n_dup            = program.get<uint32_t>("--n_dup");
   auto alpha            = program.get<float>("--alpha");
+  if (program.get<bool>("--one_pass") && program.get<bool>("--two_pass")) {
+    std::cerr << "Error: --one_pass and --two_pass are mutually exclusive" << std::endl;
+    return 1;
+  }
+  auto two_pass         = !program.get<bool>("--one_pass");
   auto workspace_budget = program.get<size_t>("--workspace_budget");
   auto n_vector_limit   = program.get<size_t>("--n_vector");
   auto index_out        = program.get<std::string>("--index_out");
@@ -403,6 +436,8 @@ int main(int argc, char** argv) {
   std::cout << "  n_parts:          " << n_parts << std::endl;
   std::cout << "  n_dup:            " << n_dup << std::endl;
   std::cout << "  alpha:            " << std::fixed << std::setprecision(2) << alpha << std::endl;
+  std::cout << "  build L:          " << JASPER_BUILD_L << std::endl;
+  std::cout << "  two_pass:         " << (two_pass ? "true" : "false") << std::endl;
   std::cout << "  workspace_budget: "
             << (workspace_budget / (1024.0 * 1024.0 * 1024.0)) << " GB" << std::endl;
   if (n_vector_limit > 0)
@@ -421,7 +456,7 @@ int main(int argc, char** argv) {
 
   try {
     dispatch(datatype, distance, r_int, r_final,
-             filename, alpha, n_parts, n_dup, workspace_budget,
+             filename, alpha, two_pass, n_parts, n_dup, workspace_budget,
              n_vector_limit, index_out, opts, k_ranks, dim);
     std::cout << "  Done." << std::endl;
   } catch (const std::exception& err) {

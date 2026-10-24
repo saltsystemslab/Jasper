@@ -66,12 +66,14 @@ __device__ __forceinline__ void pq_build_lut(
 //   L2            → ||q-v||² ≈ ||q||² - 2·<q,v> + ||v||²,
 //                   using the EXACT stored ||v||² (graph.get_vector_norm) rather
 //                   than a reconstructed norm — both faster and more accurate.
+// `u_pq` is u's edge list, staged in shared memory by the search kernel or the
+// graph's own (distortion.cuh).
 template <typename GRAPH_CFG, distance_func DISTANCE_FUNC, uint32_t M, uint32_t K>
 __device__ __forceinline__ void pq_populate_estimated_distances(
     float                                   q_sq,      // ||q||²  (L2 only)
     float                                   qu_dot,    // <q,u>
     typename graph<GRAPH_CFG>::device_view& graph,
-    typename GRAPH_CFG::index_t             u_gid,
+    const typename GRAPH_CFG::edge_pq_list_t& u_pq,
     const float* __restrict__               lut,
     ENTRY_T*     __restrict__               result_buffer,
     uint32_t                                offset,
@@ -80,12 +82,7 @@ __device__ __forceinline__ void pq_populate_estimated_distances(
   using INDEX_T = typename GRAPH_CFG::index_t;
   constexpr INDEX_T INVALID_INDEX = static_cast<INDEX_T>(0x7FFFFFFFu);
 
-  // Hoist u-side segment lookup (same layout math as the LSH estimator).
-  const INDEX_T  u_lid    = u_gid - graph.global_offset;
-  const uint32_t u_segid  = static_cast<uint32_t>(u_lid / GRAPH_CFG::vectors_per_segment);
-  const uint32_t u_locidx = static_cast<uint32_t>(u_lid % GRAPH_CFG::vectors_per_segment);
-  const auto&    u_segment = graph.segments[u_segid];
-  const uint8_t* __restrict__ code_base = u_segment.edge_pqs[u_locidx].code;
+  const uint8_t* __restrict__ code_base = u_pq.code;
 
   for (uint32_t e = threadIdx.x; e < n_edges; e += blockDim.x) {
     ENTRY_T entry = result_buffer[offset + e];
@@ -116,6 +113,7 @@ __device__ __forceinline__ void pq_populate_estimated_distances(
 //   - globals_t            = pq_codebooks_view<pq_m, pq_k>   (learned centroids)
 //   - extra_smem_size()    = smem for the query's ADC lookup table
 //   - constructor          = builds the ADC LUT (and ||q||² for L2) once per search
+//   - edge_codes_t / edge_codes() = u's edge_pq_list in graph memory
 //   - visit()              = one exact I/O of u: <q,u>, plus (L2) ||u||² via graph norms
 //   - estimate_neighbors() = score u's out-edges via LUT lookups over PQ codes
 template <typename GRAPH_CFG, distance_func DISTANCE_FUNC, uint32_t BLOCK_SIZE>
@@ -124,7 +122,15 @@ struct pq_estimator {
   using INDEX_T = typename GRAPH_CFG::index_t;
   static constexpr uint32_t M = GRAPH_CFG::pq_m;
   static constexpr uint32_t K = GRAPH_CFG::pq_k;
-  using globals_t = pq_codebooks_view<M, K>;
+  using globals_t    = pq_codebooks_view<M, K>;
+  using edge_codes_t = typename GRAPH_CFG::edge_pq_list_t;
+
+  __device__ static const edge_codes_t* edge_codes(
+      const typename graph<GRAPH_CFG>::device_view& graph, INDEX_T u_gid) {
+    const INDEX_T u_lid = u_gid - graph.global_offset;
+    return &graph.segments[u_lid / GRAPH_CFG::vectors_per_segment]
+                .edge_pqs[u_lid % GRAPH_CFG::vectors_per_segment];
+  }
 
   __host__ static uint32_t extra_smem_size(uint32_t /*padded_dim*/) {
     return sizeof(float) * M * K;  // smem_lut
@@ -192,11 +198,12 @@ struct pq_estimator {
   // ESTIMATE distances via PQ ADC using the once-built query LUT. No per-node
   // table rebuild: u enters only through the scalar <q,u>.
   __device__ void estimate_neighbors(typename graph<GRAPH_CFG>::device_view& graph,
-                                      INDEX_T u_gid, DATA_T* /*smem_query_vec*/,
+                                      DATA_T* /*smem_query_vec*/,
+                                      const edge_codes_t& codes,
                                       ENTRY_T* result_buffer, uint32_t offset,
                                       uint8_t n_edges) {
     pq_populate_estimated_distances<GRAPH_CFG, DISTANCE_FUNC, M, K>(
-        q_sq, qu_dot, graph, u_gid, lut, result_buffer, offset, n_edges);
+        q_sq, qu_dot, graph, codes, lut, result_buffer, offset, n_edges);
   }
 };
 

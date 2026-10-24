@@ -12,12 +12,16 @@
 //                       a method that needs fewer pops for the same recall
 //                       ranks better, whatever its QPS. A point is
 //                       beam_width:limit, or beam_width:limit:gamma for
-//                       Adaptive Beam Search termination (directional methods
-//                       only); the stop,gamma columns say which rule each row
-//                       ran (gamma is blank for stop=beam). The last two
-//                       columns count duplicates (see run_pops):
-//                       mean_unique_pops and dup_topk_frac. Recall counts each
-//                       returned id once.
+//                       Adaptive Beam Search termination, and a fourth field
+//                       re-ranks that many candidates (beam_width:limit:-:M
+//                       with no gamma); both directional methods only. The
+//                       stop,gamma columns say which rule each row ran (gamma
+//                       is blank for stop=beam). mean_unique_pops and
+//                       dup_topk_frac count duplicates (see run_pops); rerank
+//                       and mean_reranked give the re-rank setting and the
+//                       candidates it read per query, which are counted in
+//                       mean_vectors_fetched too. Recall counts each returned
+//                       id once.
 //
 //   --trajectory <csv>  Search at --traj_beam, then score the out-edges of
 //                       (query, popped node) pairs drawn uniformly from the
@@ -108,12 +112,14 @@ static const char* method_name(Method m) {
   return "?";
 }
 
-// One --beam_limits entry: beam_width:limit[:gamma]. gamma < 0 (omitted) =
-// beam-width termination; gamma >= 0 = search_params::adaptive_gamma.
+// One --beam_limits entry: beam_width:limit[:gamma[:rerank]]. gamma < 0
+// (omitted, or "-") = beam-width termination; gamma >= 0 =
+// search_params::adaptive_gamma. rerank = search_params::rerank (0 = off).
 struct search_point {
   uint32_t beam_width;
   uint32_t limit;
   float    gamma;
+  uint32_t rerank;
 };
 
 struct Opts {
@@ -219,6 +225,7 @@ struct Trajectories {
   std::vector<thrust::pair<uint32_t, float>> visited;  // [n_queries * stride], pop order
   std::vector<uint32_t> counts;                        // pops per query
   std::vector<uint64_t> fetched;                       // full vectors read per query
+  std::vector<uint32_t> reranked;                      // of those, re-ranked candidates
   std::vector<uint32_t> topk;                          // [n_queries * k]
 };
 
@@ -249,12 +256,13 @@ template <typename GraphCfg, Method M>
 static Trajectories<GraphCfg> search_logged(jasper::graph<GraphCfg>& g, Codes<GraphCfg>& c,
                                             jasper::vector_view<__half> q, uint32_t k,
                                             uint32_t bw, uint32_t limit,
-                                            float gamma) {
+                                            float gamma, uint32_t rerank) {
   jasper::search_params p{
     .k = k, .beam_width = bw, .limit = limit,
     .get_visited = true,
     .max_result_size = limit + 1,  // the loop pops at most limit + 1 nodes
     .adaptive_gamma = gamma,
+    .rerank = rerank,
   };
   jasper::beam_search_result<GraphCfg> r{};
   if constexpr (M == Method::LSH) r = jasper::directional_search(g, c.lsh, q, p);
@@ -278,8 +286,20 @@ static Trajectories<GraphCfg> search_logged(jasper::graph<GraphCfg>& g, Codes<Gr
   t.topk.resize(front.size());
   for (size_t i = 0; i < front.size(); ++i) t.topk[i] = front[i].first;
 
-  // Directional search reads exactly one full vector per pop (visit() of u).
+  // Directional search reads exactly one full vector per pop (visit() of u),
+  // plus one per re-ranked candidate.
   t.fetched.assign(t.counts.begin(), t.counts.end());
+  t.reranked.assign(t.n_queries, 0);
+  if (r.rerank_counts != nullptr) {
+    std::vector<uint32_t> rr(t.n_queries);
+    CUDA_CHECK(cudaMemcpy(rr.data(), r.rerank_counts, sizeof(uint32_t) * t.n_queries,
+                          cudaMemcpyDeviceToHost));
+    for (uint32_t i = 0; i < t.n_queries; ++i) {
+      t.reranked[i] = rr[i];
+      t.fetched[i] += rr[i];
+    }
+    cudaFree(r.rerank_counts);
+  }
   if constexpr (M == Method::CONV) {
     uint64_t* d_fetched = nullptr;
     CUDA_CHECK(cudaMalloc(&d_fetched, sizeof(uint64_t) * t.n_queries));
@@ -344,12 +364,13 @@ static void run_pops(jasper::graph<GraphCfg>& g, Codes<GraphCfg>& c,
   std::ofstream out(o.pops_out);
   if (!out) throw std::runtime_error("Cannot open output: " + o.pops_out);
   out << "method,k_ranks,beam_width,limit,recall,mean_pops,p50_pops,p95_pops,capped_frac,"
-         "mean_vectors_fetched,stop,gamma,mean_unique_pops,dup_topk_frac\n";
+         "mean_vectors_fetched,stop,gamma,mean_unique_pops,dup_topk_frac,rerank,"
+         "mean_reranked\n";
   std::cout << "\n=== recall vs pops (" << method_name(M) << " k_ranks="
             << static_cast<uint32_t>(GraphCfg::k_ranks) << ") ===" << std::endl;
 
-  for (auto [bw, lim, gamma] : o.beam_limits) {
-    auto t = search_logged<GraphCfg, M>(g, c, q, o.k, bw, lim, gamma);
+  for (auto [bw, lim, gamma, rerank] : o.beam_limits) {
+    auto t = search_logged<GraphCfg, M>(g, c, q, o.k, bw, lim, gamma, rerank);
 
     // Duplicates. In directional search a node reached from two parents
     // carries two different estimates, so dedup_results cannot pair its
@@ -394,6 +415,9 @@ static void run_pops(jasper::graph<GraphCfg>& g, Codes<GraphCfg>& c,
     double fetched = 0;
     for (uint64_t x : t.fetched) fetched += double(x);
     fetched /= t.fetched.size();
+    double reranked = 0;
+    for (uint32_t x : t.reranked) reranked += x;
+    reranked /= t.reranked.size();
 
     out << method_name(M) << ',' << static_cast<uint32_t>(GraphCfg::k_ranks) << ','
         << bw << ',' << lim << ',' << std::setprecision(6) << recall << ',' << mean << ','
@@ -401,9 +425,10 @@ static void run_pops(jasper::graph<GraphCfg>& g, Codes<GraphCfg>& c,
         << fetched << ',';
     if (gamma >= 0.0f) out << "adaptive," << gamma;
     else               out << "beam,";
-    out << ',' << mean_unique << ',' << dup_frac << '\n';
+    out << ',' << mean_unique << ',' << dup_frac << ',' << rerank << ',' << reranked << '\n';
     std::cout << "  beam_width=" << bw << " limit=" << lim;
     if (gamma >= 0.0f) std::cout << " gamma=" << std::setprecision(6) << gamma;
+    if (rerank > 0) std::cout << " rerank=" << rerank;
     std::cout << std::fixed
               << std::setprecision(4) << " recall@" << o.k << "=" << recall
               << std::setprecision(1) << " mean_pops=" << mean
@@ -411,7 +436,9 @@ static void run_pops(jasper::graph<GraphCfg>& g, Codes<GraphCfg>& c,
               << std::setprecision(3) << " capped=" << capped
               << std::setprecision(1) << " vectors_fetched=" << fetched
               << " unique_pops=" << mean_unique
-              << std::setprecision(4) << " dup_topk=" << dup_frac << std::endl;
+              << std::setprecision(4) << " dup_topk=" << dup_frac;
+    if (rerank > 0) std::cout << std::setprecision(1) << " reranked=" << reranked;
+    std::cout << std::endl;
     std::cout.unsetf(std::ios::fixed);
   }
   std::cout << "  wrote " << o.pops_out << std::endl;
@@ -425,7 +452,8 @@ static void run_trajectory(jasper::graph<GraphCfg>& g, Codes<GraphCfg>& c,
             << static_cast<uint32_t>(GraphCfg::k_ranks) << ", beam_width=" << bw
             << " limit=" << lim << ", " << o.samples << " pops, seed " << o.seed
             << ") ===" << std::endl;
-  auto t = search_logged<GraphCfg, M>(g, c, q, o.k, bw, lim, /*gamma=*/-1.0f);
+  auto t = search_logged<GraphCfg, M>(g, c, q, o.k, bw, lim, /*gamma=*/-1.0f,
+                                      /*rerank=*/0);
 
   // Uniform over every (query, pop) the search made. Each method samples its
   // OWN trajectories — the pops it actually ranks — so pairs differ by method;
@@ -573,11 +601,19 @@ static std::pair<uint32_t, uint32_t> parse_pair(const std::string& s) {
 static search_point parse_point(const std::string& s) {
   const auto c2 = s.find(':', s.find(':') + 1);
   const auto [bw, lim] = parse_pair(s.substr(0, c2));
-  search_point pt{bw, lim, -1.0f};
+  search_point pt{bw, lim, -1.0f, 0};
   if (c2 != std::string::npos) {
-    pt.gamma = std::stof(s.substr(c2 + 1));
-    if (!(pt.gamma >= 0.0f))
-      throw std::runtime_error("gamma must be >= 0 (omit it for beam-width termination), got: " + s);
+    const auto c3 = s.find(':', c2 + 1);
+    const std::string g =
+        s.substr(c2 + 1, c3 == std::string::npos ? std::string::npos : c3 - c2 - 1);
+    if (!g.empty() && g != "-") {
+      pt.gamma = std::stof(g);
+      if (!(pt.gamma >= 0.0f))
+        throw std::runtime_error("gamma must be >= 0 (omit it, or give \"-\", for "
+                                 "beam-width termination), got: " + s);
+    }
+    if (c3 != std::string::npos)
+      pt.rerank = static_cast<uint32_t>(std::stoul(s.substr(c3 + 1)));
   }
   return pt;
 }
@@ -608,8 +644,9 @@ int main(int argc, char** argv) {
       .default_value(std::vector<std::string>{"8:64", "16:128", "32:128", "64:256",
                                               "128:256", "256:512", "512:1024"})
       .nargs(argparse::nargs_pattern::at_least_one)
-      .help("beam_width:limit[:gamma] points for --pops; a gamma runs that point with "
-            "Adaptive Beam Search termination (not with -m conventional).");
+      .help("beam_width:limit[:gamma[:rerank]] points for --pops; a gamma runs that "
+            "point with Adaptive Beam Search termination (\"-\" = off), a rerank "
+            "re-ranks that many candidates (neither with -m conventional).");
   program.add_argument("--trajectory").default_value(std::string{})
       .help("CSV: edge scores for (query, popped node) pairs from real searches.");
   program.add_argument("--traj_beam").default_value(std::string{"64:256"})
@@ -668,9 +705,9 @@ int main(int argc, char** argv) {
   }
   if (o.method == Method::CONV &&
       std::any_of(o.beam_limits.begin(), o.beam_limits.end(),
-                  [](const search_point& pt) { return pt.gamma >= 0.0f; })) {
-    std::cerr << "Error: adaptive termination (beam_width:limit:gamma) is only "
-                 "implemented for the directional methods" << std::endl;
+                  [](const search_point& pt) { return pt.gamma >= 0.0f || pt.rerank > 0; })) {
+    std::cerr << "Error: adaptive termination and rerank (beam_width:limit:gamma:rerank) "
+                 "are only implemented for the directional methods" << std::endl;
     return 1;
   }
   if (!o.pops_out.empty() && o.gt_path.empty()) {

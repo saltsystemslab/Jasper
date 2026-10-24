@@ -124,7 +124,13 @@ scripts and `distortion_sweep`):
 
 | Script | What it measures |
 |---|---|
-| `bench_adaptive_termination.sbatch` | Pareto comparison of conventional beam search and directional search with CPH/LSH, RaBitQ and PQ codes, all on one plain index. Conventional search sweeps beam width (16 to 1983 in ~5% steps). Each directional method also sweeps the Adaptive Beam Search stop rule (Al-Jazzazi et al. 2025): stop once the next candidate's estimate is at least (1+γ)× the k-th best estimate among the other discovered candidates, at 19 candidate-list widths. Each (dataset, method, `r`, k) cell runs at recall 10@10 and 100@100, with the graph on the device and on the host. `run_query` measures QPS and `distortion_test --pops` measures nodes expanded and vectors read. `scripts/plot_pareto.py` then draws one Pareto curve per method in each panel, and `scripts/adaptive_summary.py` compares the two stop rules within each directional method. Reuses `distortion_sweep`'s plain indexes. |
+| `bench_adaptive_termination.sbatch` | Pareto comparison of conventional beam search and directional search with CPH/LSH, RaBitQ and PQ codes, all on one plain index. Conventional search sweeps beam width (16 to 1983 in ~20% steps, plus each compiled tier's widest width). Each directional method also sweeps the Adaptive Beam Search stop rule (Al-Jazzazi et al. 2025): stop once the next candidate's estimate is at least (1+γ)× the k-th best estimate among the other discovered candidates, at 9 candidate-list widths. They also run fixed beam search with a re-rank (`RERANK_MULTS`, M = 1, 2 and 4 × k): the best M candidates left unexpanded get an exact distance, one vector read each, and compete for the top-k. Each (dataset, method, `r`, k) cell runs at recall 10@10 and 100@100, with the graph on the device and on the host. `run_query` measures QPS and `distortion_test --pops` measures nodes expanded and vectors read. `scripts/plot_pareto.py` then draws one Pareto curve per method in each panel, and `scripts/adaptive_summary.py` compares the two stop rules within each directional method. Reuses `distortion_sweep`'s plain indexes. |
+
+### Graph build quality
+
+| Script | What it measures |
+|---|---|
+| `bench_graph_build.sbatch` | Whether a better graph build helps. Builds each dataset's plain index under each `VARIANTS` entry (`L<n>` = the build search's beam width, `_2pass` = Vamana's two-pass build, otherwise `--one_pass`; `create_diskann_index` now defaults to `L192` two-pass, which needed 0.3–0.8× the nodes expanded of the old `L64` one-pass build at matched recall), then measures recall against nodes expanded per query with `distortion_test --pops` for conventional and directional search at 10@10 and 100@100. `L` is a build-time constant (`cmake -DJASPER_BUILD_L=<n>`), so each distinct `L` gets its own build directory. `scripts/compare_builds.py` summarizes. |
 
 ### Index construction at scale (DiskANN-style shard and merge)
 
@@ -141,6 +147,7 @@ scripts and `distortion_sweep`):
 | `tile_queries.py` | Repeats a small query set (and its ground truth) up to a target batch size so the GPU is saturated. Recall is unchanged. |
 | `plot_pops.py` | Recall vs nodes popped per query, from `--pops` CSVs. |
 | `plot_pareto.py` | Pareto curves (QPS on device and host, nodes expanded, vectors read, each against recall on a logit axis) per method from `bench_adaptive_termination`'s joined CSV, plus the frontier points as CSV and a matched-recall table across methods. |
+| `compare_builds.py` | For `bench_graph_build`: per method and k, each build variant's recall ceiling and the nodes expanded to reach each target recall (interpolated), relative to the first variant, plus build time and average degree. |
 | `adaptive_summary.py` | Joins `run_query` throughput with `--pops` rows for `bench_adaptive_termination`. For each rule it gives the best QPS and the fewest pops at each target recall. |
 | `plot_distortion.py` | Estimated-vs-true distance density grids, from edge-score CSVs. |
 | `neighborhood_ranking.py` | Within-neighborhood ranking accuracy (recall@m, Spearman) vs bytes per edge, from edge-score CSVs. |

@@ -53,6 +53,15 @@
 #             gives this side a second axis, and the grid multiplies by it.
 #             It carries the same tier tops as the beam grid (63 191 447 959
 #             1983), so both rules get the cheapest width per slot.
+#   rerank    (DBS methods only) beam search at every RERANK_WIDTHS entry
+#             with a re-rank of M = m x k candidates for each m in
+#             RERANK_MULTS, as width:LIMIT:-:M: the list keeps M more than the
+#             beam_width it expands, and when the search stops the best M
+#             unexpanded ones get an exact distance (a vector read each, no
+#             expansion) and compete for the top-k. The list then holds
+#             width + M, which picks the compiled tier, so width + M + 64 must
+#             stay under 2048, and each M also runs the widths that fill a tier
+#             to its top (tier top - M). RERANK_MULTS="" turns this off.
 #
 # ── Placements ─────────────────────────────────────────────────────────────
 #   device   the graph is resident on the card
@@ -99,15 +108,26 @@
 #
 # conventional cells are named with k_ranks 0 (k0): it has no codes.
 #
-# Plain indexes are shared with distortion_sweep.sbatch / profile_pcie.sbatch
-# ($WORK/<ds>_r64_64_plain.bin); a missing one is built in one part. L2 only:
-# distortion_test compiles L2 configs only, and every dataset below is L2.
+# Indexes: $INDEX_DIR/<ds>_r64_64_L<BUILD_L>[_2pass]_plain.bin (default
+# /scratch/$USER, L192 two-pass, the same names bench_graph_build.sbatch
+# writes); a missing one is built in one part. The build settings are in the
+# name so a changed default never silently reuses an old graph. INDEX_<ds>
+# overrides the path. L2 only: distortion_test compiles L2 configs only, and
+# every dataset below is L2.
+#
+# Query chunks: QUERY_CHUNK_<placement> (device | host) runs run_query with
+# --query_chunk, bounding the searches in flight, and
+# QUERY_CHUNK_<placement>_<method> overrides it per method. With the graph in
+# host memory too many concurrent searches cost conventional search most of its
+# PCIe bandwidth (sra50: 12-23 GB/s at 10k in flight vs 43-48 at 500), so a
+# fair host comparison runs each method at its own best chunk. 0 = all at once.
 #
 #   DRY_RUN=1 ./sbatch/bench_adaptive_termination.sbatch     # plan, no GPU
 #   sbatch sbatch/bench_adaptive_termination.sbatch
 #   DATASETS="deep10M sra50" K_LIST=16 sbatch sbatch/bench_adaptive_termination.sbatch
 #   METHODS="conventional lsh" K_LIST="4 16" sbatch sbatch/bench_adaptive_termination.sbatch
 #   CAPACITIES=256 GAMMAS="0 0.05 0.1 0.2" sbatch sbatch/bench_adaptive_termination.sbatch
+#   RERANK_MULTS="1 4" METHODS="lsh rabitq" sbatch sbatch/bench_adaptive_termination.sbatch
 #   QUERY_BATCH=100000 sbatch sbatch/bench_adaptive_termination.sbatch  # tile for QPS
 #   PLACEMENTS=host RUN_POPS=0 sbatch sbatch/bench_adaptive_termination.sbatch
 #   SUMMARY_ONLY=1 ./sbatch/bench_adaptive_termination.sbatch   # re-join raw/, no GPU
@@ -121,9 +141,11 @@ K_LIST="${K_LIST:-8}"                  # DBS k_ranks; 8 is valid for every metho
 K="${K:-10 100}"                       # search k, one cell per value (recall k@k)
 BEAM_MIN="${BEAM_MIN:-16}"
 BEAM_MAX="${BEAM_MAX:-1983}"
-BEAM_RATIO="${BEAM_RATIO:-1.05}"       # beam grid step; 1 = every integer width
-CAPACITIES="${CAPACITIES:-16 24 32 48 63 64 96 128 191 192 256 384 447 512 768 959 1024 1536 1983}"
+BEAM_RATIO="${BEAM_RATIO:-1.2}"        # beam grid step; 1 = every integer width
+CAPACITIES="${CAPACITIES:-16 32 63 128 191 256 447 959 1983}"
 GAMMAS="${GAMMAS:-0 0.02 0.04 0.06 0.08 0.1 0.12 0.15 0.2 0.25 0.3 0.4 0.5 0.75 1}"
+RERANK_MULTS="${RERANK_MULTS-1 2 4}"   # re-rank M = m x k per m; "" = no re-rank points
+RERANK_WIDTHS="${RERANK_WIDTHS:-$CAPACITIES}"
 LIMIT="${LIMIT:-8192}"
 REPEATS="${REPEATS:-3}"                # timed passes over the point list; median QPS
 QUERY_BATCH="${QUERY_BATCH:-0}"        # tile queries for QPS; pops use the original set
@@ -137,6 +159,10 @@ N_PARTS="${N_PARTS:-1}"
 N_DUP="${N_DUP:-2}"
 ALPHA="${ALPHA:-1.2}"
 WORKSPACE_BUDGET="${WORKSPACE_BUDGET:-10GB}"
+BUILD_L="${BUILD_L:-192}"              # create_diskann_index's build L (cmake -DJASPER_BUILD_L)
+TWO_PASS="${TWO_PASS:-1}"              # 0 = --one_pass
+QUERY_CHUNK_device="${QUERY_CHUNK_device:-0}"
+QUERY_CHUNK_host="${QUERY_CHUNK_host:-0}"
 DRY_RUN="${DRY_RUN:-0}"
 SUMMARY_ONLY="${SUMMARY_ONLY:-0}"
 
@@ -145,6 +171,8 @@ ANN_GT="${ANN_GT:-/projects/SaltSystemsLab/ann_gt}"
 LOCALE="${LOCALE:-/tmp2/ann_data/locale}"
 REPO="${REPO:-$HOME/jasper}"
 WORK="${WORK:-/projects/SaltSystemsLab/${USER:-$(id -un)}/distortion}"
+INDEX_DIR="${INDEX_DIR:-/scratch/${USER:-$(id -un)}}"
+BUILD_TAG="L${BUILD_L}$([ "$TWO_PASS" = 1 ] && echo _2pass)"
 OUT="${OUT:-$REPO/adaptive_termination}"
 RAW="$OUT/raw"
 
@@ -200,8 +228,8 @@ fi
 # is the widest point, and a width under k cannot hold the k results.
 fits() { [ "$1" -ge "$2" ] && [ $(( $1 + 64 )) -lt 2048 ]; }
 build_points() {                       # $1 = search k, $2 = method
-  local topk=$1 method=${2:-lsh} w g
-  BEAM_POINTS=""; ADAPT_POINTS=""
+  local topk=$1 method=${2:-lsh} w g mult rr
+  BEAM_POINTS=""; ADAPT_POINTS=""; RERANK_POINTS=""
   for w in $BEAM_WIDTHS; do
     if fits "$w" "$topk"; then BEAM_POINTS="$BEAM_POINTS $w:$LIMIT"; fi
   done
@@ -210,14 +238,26 @@ build_points() {                       # $1 = search k, $2 = method
     fits "$w" "$topk" || continue
     for g in $GAMMAS; do ADAPT_POINTS="$ADAPT_POINTS $w:$LIMIT:$g"; done
   done
-  POINTS="${BEAM_POINTS# } ${ADAPT_POINTS# }"
-  POINTS="${POINTS# }"
+  # Re-rank on top of the beam-width rule. The list holds w + M, and that is
+  # what picks the tier, so each M also gets the widths that fill a tier to its
+  # top (63 191 447 959 1983, less M): the cheapest per slot, as on the beam grid.
+  [ "$method" = "conventional" ] || for mult in $RERANK_MULTS; do
+    rr=$(( mult * topk ))
+    for w in $(printf '%s\n' $RERANK_WIDTHS $(( 63 - rr )) $(( 191 - rr )) $(( 447 - rr )) \
+                 $(( 959 - rr )) $(( 1983 - rr )) | sort -n -u); do
+      [ "$w" -ge "$topk" ] || continue
+      if fits $(( w + rr )) "$topk"; then RERANK_POINTS="$RERANK_POINTS $w:$LIMIT:-:$rr"; fi
+    done
+  done
+  POINTS="${BEAM_POINTS# } ${ADAPT_POINTS# } ${RERANK_POINTS# }"
+  POINTS=$(tr -s ' ' <<<"$POINTS"); POINTS="${POINTS# }"; POINTS="${POINTS% }"
   # Whole passes rather than back-to-back repeats, so clock or thermal drift
   # spreads over every point instead of landing on a few.
   QPS_POINTS=""
   for _ in $(seq "$REPEATS"); do QPS_POINTS="$QPS_POINTS $POINTS"; done
   N_BEAM=$(wc -w <<<"$BEAM_POINTS" | tr -d ' ')
   N_ADAPT=$(wc -w <<<"$ADAPT_POINTS" | tr -d ' ')
+  N_RERANK=$(wc -w <<<"$RERANK_POINTS" | tr -d ' ')
 }
 
 for topk in $K; do
@@ -244,12 +284,16 @@ echo "  beam:       widths"
 fold -s -w 96 <<<"$BEAM_WIDTHS" | sed 's/^/                /'
 echo "  adaptive:   capacities $CAPACITIES"
 echo "              x gammas $GAMMAS"
+echo "  rerank:     $([ -n "${RERANK_MULTS// }" ] && echo "widths $RERANK_WIDTHS" || echo off)"
+[ -n "${RERANK_MULTS// }" ] && echo "              x M = (${RERANK_MULTS}) x k"
 for topk in $K; do
   build_points "$topk"
-  printf "  %-11s %s beam + %s adaptive points per DBS cell, %s for conventional\n" \
-    "${topk}@${topk}:" "$N_BEAM" "$N_ADAPT" "$N_BEAM"
+  printf "  %-11s %s beam + %s adaptive + %s rerank points per DBS cell, %s for conventional\n" \
+    "${topk}@${topk}:" "$N_BEAM" "$N_ADAPT" "$N_RERANK" "$N_BEAM"
 done
 echo "  limit:      $LIMIT pops    qps passes: $REPEATS    query batch: $([ "$QUERY_BATCH" = 0 ] && echo untiled || echo "$QUERY_BATCH")"
+echo "  chunks:     device $QUERY_CHUNK_device, host $QUERY_CHUNK_host (0 = all at once; per-method QUERY_CHUNK_<placement>_<method> overrides)"
+echo "  build:      $BUILD_TAG -> $INDEX_DIR"
 echo "  placements: $PLACEMENTS"
 echo "  steps:      $([ "$RUN_QPS" = 1 ] && echo 'run_query ')$([ "$RUN_POPS" = 1 ] && echo 'distortion_test --pops')"
 echo "  graph:      R_int=$R_INT R_fin=$R_FIN dist=l2"
@@ -262,7 +306,7 @@ for ds in $DATASETS; do
   spec=$(dataset_spec "$ds") || { echo "unknown dataset: $ds" >&2; exit 2; }
   IFS='|' read -r base q gt dtype dim <<<"$spec"
   padded=$(( (dim + 7) / 8 * 8 ))
-  ivar="INDEX_$ds"; idx="${!ivar:-$WORK/${ds}_r${R_INT}_${R_FIN}_plain.bin}"
+  ivar="INDEX_$ds"; idx="${!ivar:-$INDEX_DIR/${ds}_r${R_INT}_${R_FIN}_${BUILD_TAG}_plain.bin}"
   printf "  %-10s dim=%-5s %-6s index=%s%s\n" "$ds" "$dim" "$dtype" "$idx" \
     "$([ -s "$idx" ] && echo ' (exists)' || echo ' (will build)')"
   [ -s "$idx" ] || [ -r "$base" ] || echo "    WARNING: no index and no base at $base"
@@ -295,7 +339,7 @@ for ds in $DATASETS; do
     for c in $combos; do
       build_points "$topk" "${c%%:*}"
       CELLS="$CELLS $ds:$c:$topk"
-      TOTAL_POINTS=$(( TOTAL_POINTS + N_BEAM + N_ADAPT ))
+      TOTAL_POINTS=$(( TOTAL_POINTS + N_BEAM + N_ADAPT + N_RERANK ))
     done
   done
 done
@@ -326,17 +370,17 @@ THRUST_DIR="${THRUST_DIR:-/projects/SaltSystemsLab/zikun/env/lib/rapids/cmake/th
 echo
 echo "=== building binaries ==="
 cmake -B build -DJASPER_BUILD_CMD=ON -DJASPER_BUILD_TESTS=OFF -DJASPER_BUILD_FFI=OFF \
-  -DThrust_DIR="$THRUST_DIR" -DCMAKE_PREFIX_PATH="$CONDA_PREFIX" >/dev/null
+  -DJASPER_BUILD_L="$BUILD_L" -DThrust_DIR="$THRUST_DIR" -DCMAKE_PREFIX_PATH="$CONDA_PREFIX" >/dev/null
 cmake --build build --target create_diskann_index run_query distortion_test -j8 >/dev/null
 echo "  ok"
-mkdir -p "$WORK" "$RAW"
+mkdir -p "$WORK" "$INDEX_DIR" "$RAW"
 
 # ── Sweep ──────────────────────────────────────────────────────────────────
 DONE_DS=""
 for ds in $DATASETS; do
   case " $CELLS " in *" $ds:"*) ;; *) continue;; esac
   IFS='|' read -r base q gt dtype dim <<<"$(dataset_spec "$ds")"
-  ivar="INDEX_$ds"; idx="${!ivar:-$WORK/${ds}_r${R_INT}_${R_FIN}_plain.bin}"
+  ivar="INDEX_$ds"; idx="${!ivar:-$INDEX_DIR/${ds}_r${R_INT}_${R_FIN}_${BUILD_TAG}_plain.bin}"
 
   echo
   echo "######## $ds ########"
@@ -348,6 +392,7 @@ for ds in $DATASETS; do
         -f "$base" -t "$dtype" -d l2 --dim "$dim" \
         --r_intermediate "$R_INT" --r_final "$R_FIN" \
         --n_parts "$N_PARTS" --n_dup "$N_DUP" -a "$ALPHA" \
+        $([ "$TWO_PASS" = 1 ] || echo --one_pass) \
         -w "$WORKSPACE_BUDGET" -i "$idx" >| "$RAW/${ds}_build.log" 2>&1 \
       || { echo "  BUILD FAILED (see $RAW/${ds}_build.log) — skipping $ds"; continue; }
   fi
@@ -378,6 +423,8 @@ for ds in $DATASETS; do
     for place in $PLACEMENTS; do
       host_arg=()
       [ "$place" = "host" ] && host_arg=(--on_host)
+      cvar="QUERY_CHUNK_${place}_${m}"; pvar="QUERY_CHUNK_${place}"
+      chunk="${!cvar:-${!pvar:-0}}"
       name="${ds}_${m}_k${k}_top${topk}_${place}"
       echo "[$(stamp)] $ds $m$([ "$m" = conventional ] || echo " k$k") ${topk}@${topk} on $place"
 
@@ -386,6 +433,7 @@ for ds in $DATASETS; do
         # same way distortion_test builds them below.
         ./build/bin/run_query -i "$idx" --dim "$dim" -d l2 -t "$dtype" -n "$R_FIN" -k "$topk" \
             ${qps_mode[@]+"${qps_mode[@]}"} ${host_arg[@]+"${host_arg[@]}"} \
+            --query_chunk "$chunk" \
             -q "$qq" -g "$qg" --beam_limits $QPS_POINTS >| "$RAW/$name.qps.log" 2>&1 \
           || echo "  QPS FAILED ($name) — see $RAW/$name.qps.log"
         echo "  qps:  $(grep -c 'throughput=' "$RAW/$name.qps.log" || true) timed searches -> raw/$name.qps.log"

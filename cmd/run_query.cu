@@ -6,6 +6,7 @@
 #include <string>
 #include <cstdint>
 #include <cstring>
+#include <algorithm>
 #include <set>
 #include <stdexcept>
 #include <vector>
@@ -178,15 +179,73 @@ float get_recall(const GroundTruth& gt,
   return recall;
 }
 
-// ── One --beam_limits entry: beam_width:limit[:gamma] ──────────
-// gamma < 0 (field omitted) keeps classic beam-width termination. gamma ≥ 0
-// runs Adaptive Beam Search (search_params::adaptive_gamma), where beam_width
-// only caps the candidate list. Directional searches only.
+// ── One --beam_limits entry: beam_width:limit[:gamma[:rerank]] ─
+// gamma < 0 (field omitted, or "-") keeps classic beam-width termination.
+// gamma ≥ 0 runs Adaptive Beam Search (search_params::adaptive_gamma), where
+// beam_width only caps the candidate list. rerank > 0 re-ranks that many
+// unexpanded candidates with exact distances (search_params::rerank).
+// Directional searches only, both.
 struct search_point {
   uint32_t beam_width;
   uint32_t limit;
   float    gamma;
+  uint32_t rerank;
 };
+
+// ── Chunked search (--query_chunk) ─────────────────────────────
+// Queries per launch; 0 = all of them in one launch. With the graph in host
+// memory a method's throughput depends on how many searches are in flight:
+// too many scatter more reads than the path to host memory serves well, and
+// conventional search (64 vector reads per pop) loses most of its bandwidth.
+// Chunking bounds that. Each chunk ends with a tail of few running searches,
+// so sweep the size and keep each method's best.
+static uint32_t g_query_chunk = 0;
+
+// Runs `search` (vector_view -> beam_search_result) over consecutive slices of
+// the queries, back to back, and returns one [n_queries * k] frontier covering
+// them all. duration_ms times the searches only; the slices are stitched
+// together afterwards.
+template <typename DataT, typename SearchFn>
+thrust::pair<uint32_t, float>* chunked_search(DataT* d_queries, uint32_t dim,
+                                              uint32_t n_queries, uint32_t k,
+                                              SearchFn&& search, float& duration_ms) {
+  using pair_t = thrust::pair<uint32_t, float>;
+  const uint32_t chunk = (g_query_chunk == 0 || g_query_chunk >= n_queries)
+                             ? n_queries : g_query_chunk;
+  const size_t stride = jasper::vector_view<DataT>::pad(dim);
+  std::vector<pair_t*> parts;
+
+  cudaEvent_t e0, e1;
+  cudaEventCreate(&e0);
+  cudaEventCreate(&e1);
+  cudaEventRecord(e0);
+  for (uint32_t start = 0; start < n_queries; start += chunk) {
+    const uint32_t count = std::min(chunk, n_queries - start);
+    jasper::vector_view<DataT> query_view(d_queries + start * stride, dim, count, false);
+    parts.push_back(search(query_view).frontier);
+    CUDA_CHECK(cudaGetLastError());
+  }
+  cudaDeviceSynchronize();
+  CUDA_CHECK(cudaGetLastError());
+  cudaEventRecord(e1);
+  cudaEventSynchronize(e1);
+  cudaEventElapsedTime(&duration_ms, e0, e1);
+  cudaEventDestroy(e0);
+  cudaEventDestroy(e1);
+
+  if (parts.size() == 1) return parts[0];
+  pair_t* all = nullptr;
+  CUDA_CHECK(cudaMalloc(&all, sizeof(pair_t) * static_cast<size_t>(n_queries) * k));
+  for (size_t i = 0; i < parts.size(); ++i) {
+    const uint32_t start = static_cast<uint32_t>(i) * chunk;
+    const uint32_t count = std::min(chunk, n_queries - start);
+    CUDA_CHECK(cudaMemcpy(all + static_cast<size_t>(start) * k, parts[i],
+                          sizeof(pair_t) * static_cast<size_t>(count) * k,
+                          cudaMemcpyDeviceToDevice));
+    cudaFree(parts[i]);
+  }
+  return all;
+}
 
 // ── Single search round ────────────────────────────────────────
 template <typename GraphCfg, typename DataT>
@@ -200,8 +259,6 @@ void run_search_round(jasper::graph<GraphCfg>& graph,
                       const GroundTruth* gt,
                       bool print_throughput) {
 
-  jasper::vector_view<DataT> query_view(d_queries, dim, n_queries, false);
-
   jasper::search_params params{
     .k          = k,
     .beam_width = beam_width,
@@ -210,25 +267,16 @@ void run_search_round(jasper::graph<GraphCfg>& graph,
     .max_result_size = limit + 1,  // also a pop cap without a visited log; let limit be the one cap
   };
 
-  cudaEvent_t e0, e1;
-  cudaEventCreate(&e0);
-  cudaEventCreate(&e1);
-
   cudaDeviceSynchronize();
   CUDA_CHECK(cudaGetLastError());
-
-  cudaEventRecord(e0);
-  auto result = jasper::search(graph, query_view, params);
-  CUDA_CHECK(cudaGetLastError());
-  cudaDeviceSynchronize();
-  CUDA_CHECK(cudaGetLastError());
-  cudaEventRecord(e1);
-  cudaEventSynchronize(e1);
 
   float duration_ms = 0;
-  cudaEventElapsedTime(&duration_ms, e0, e1);
-  cudaEventDestroy(e0);
-  cudaEventDestroy(e1);
+  auto* frontier = chunked_search(
+      d_queries, dim, n_queries, k,
+      [&](jasper::vector_view<DataT>& query_view) {
+        return jasper::search(graph, query_view, params);
+      },
+      duration_ms);
 
   if (print_throughput) {
     float throughput = (n_queries * 1000.0f) / duration_ms;
@@ -249,7 +297,7 @@ void run_search_round(jasper::graph<GraphCfg>& graph,
   uint32_t threads = 256;
   uint32_t blocks = (total + threads - 1) / threads;
   unpack_results_kernel<<<blocks, threads>>>(
-    result.frontier, d_indices, d_distances, total);
+    frontier, d_indices, d_distances, total);
   CUDA_CHECK(cudaGetLastError());
   CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -264,7 +312,7 @@ void run_search_round(jasper::graph<GraphCfg>& graph,
 
   cudaFree(d_indices);
   cudaFree(d_distances);
-  cudaFree(result.frontier);
+  cudaFree(frontier);
 }
 
 // ── Single directional-search round (LSH) ─────────────────────
@@ -278,10 +326,9 @@ void run_directional_round(jasper::graph<GraphCfg>& graph,
                            uint32_t beam_width,
                            uint32_t limit,
                            float gamma,
+                           uint32_t rerank,
                            const GroundTruth* gt,
                            bool print_throughput) {
-
-  jasper::vector_view<DataT> query_view(d_queries, dim, n_queries, false);
 
   jasper::search_params params{
     .k          = k,
@@ -290,29 +337,21 @@ void run_directional_round(jasper::graph<GraphCfg>& graph,
     .get_visited = false,
     .max_result_size = limit + 1,  // also a pop cap without a visited log; let limit be the one cap
     .adaptive_gamma = gamma,
+    .rerank = rerank,
   };
-
-  cudaEvent_t e0, e1;
-  cudaEventCreate(&e0);
-  cudaEventCreate(&e1);
 
   cudaDeviceSynchronize();
   CUDA_CHECK(cudaGetLastError());
 
   jasper::reset_phase_clocks();
 
-  cudaEventRecord(e0);
-  auto result = jasper::directional_search(graph, globals, query_view, params);
-  CUDA_CHECK(cudaGetLastError());
-  cudaDeviceSynchronize();
-  CUDA_CHECK(cudaGetLastError());
-  cudaEventRecord(e1);
-  cudaEventSynchronize(e1);
-
   float duration_ms = 0;
-  cudaEventElapsedTime(&duration_ms, e0, e1);
-  cudaEventDestroy(e0);
-  cudaEventDestroy(e1);
+  auto* frontier = chunked_search(
+      d_queries, dim, n_queries, k,
+      [&](jasper::vector_view<DataT>& query_view) {
+        return jasper::directional_search(graph, globals, query_view, params);
+      },
+      duration_ms);
 
   if (print_throughput) {
     float throughput = (n_queries * 1000.0f) / duration_ms;
@@ -320,6 +359,8 @@ void run_directional_round(jasper::graph<GraphCfg>& graph,
               << " limit=" << limit;
     if (gamma >= 0.0f)
       std::cout << " gamma=" << std::defaultfloat << std::setprecision(6) << gamma;
+    if (rerank > 0)
+      std::cout << " rerank=" << rerank;
     std::cout << " duration=" << std::fixed << std::setprecision(2) << duration_ms << "ms"
               << " throughput=" << std::setprecision(0) << throughput << " QPS"
               << std::endl;
@@ -335,7 +376,7 @@ void run_directional_round(jasper::graph<GraphCfg>& graph,
   uint32_t threads = 256;
   uint32_t blocks = (total + threads - 1) / threads;
   unpack_results_kernel<<<blocks, threads>>>(
-    result.frontier, d_indices, d_distances, total);
+    frontier, d_indices, d_distances, total);
   CUDA_CHECK(cudaGetLastError());
   CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -352,7 +393,7 @@ void run_directional_round(jasper::graph<GraphCfg>& graph,
 
   cudaFree(d_indices);
   cudaFree(d_distances);
-  cudaFree(result.frontier);
+  cudaFree(frontier);
 }
 
 // ── Single PQ directional-search round (ADC) ───────────────────
@@ -366,10 +407,9 @@ void run_pq_round(jasper::graph<GraphCfg>& graph,
                   uint32_t beam_width,
                   uint32_t limit,
                   float gamma,
+                  uint32_t rerank,
                   const GroundTruth* gt,
                   bool print_throughput) {
-
-  jasper::vector_view<DataT> query_view(d_queries, dim, n_queries, false);
 
   jasper::search_params params{
     .k          = k,
@@ -378,29 +418,21 @@ void run_pq_round(jasper::graph<GraphCfg>& graph,
     .get_visited = false,
     .max_result_size = limit + 1,  // also a pop cap without a visited log; let limit be the one cap
     .adaptive_gamma = gamma,
+    .rerank = rerank,
   };
-
-  cudaEvent_t e0, e1;
-  cudaEventCreate(&e0);
-  cudaEventCreate(&e1);
 
   cudaDeviceSynchronize();
   CUDA_CHECK(cudaGetLastError());
 
   jasper::reset_phase_clocks();
 
-  cudaEventRecord(e0);
-  auto result = jasper::pq_search(graph, codebooks, query_view, params);
-  CUDA_CHECK(cudaGetLastError());
-  cudaDeviceSynchronize();
-  CUDA_CHECK(cudaGetLastError());
-  cudaEventRecord(e1);
-  cudaEventSynchronize(e1);
-
   float duration_ms = 0;
-  cudaEventElapsedTime(&duration_ms, e0, e1);
-  cudaEventDestroy(e0);
-  cudaEventDestroy(e1);
+  auto* frontier = chunked_search(
+      d_queries, dim, n_queries, k,
+      [&](jasper::vector_view<DataT>& query_view) {
+        return jasper::pq_search(graph, codebooks, query_view, params);
+      },
+      duration_ms);
 
   if (print_throughput) {
     float throughput = (n_queries * 1000.0f) / duration_ms;
@@ -408,6 +440,8 @@ void run_pq_round(jasper::graph<GraphCfg>& graph,
               << " limit=" << limit;
     if (gamma >= 0.0f)
       std::cout << " gamma=" << std::defaultfloat << std::setprecision(6) << gamma;
+    if (rerank > 0)
+      std::cout << " rerank=" << rerank;
     std::cout << " duration=" << std::fixed << std::setprecision(2) << duration_ms << "ms"
               << " throughput=" << std::setprecision(0) << throughput << " QPS"
               << std::endl;
@@ -423,7 +457,7 @@ void run_pq_round(jasper::graph<GraphCfg>& graph,
   uint32_t threads = 256;
   uint32_t blocks = (total + threads - 1) / threads;
   unpack_results_kernel<<<blocks, threads>>>(
-    result.frontier, d_indices, d_distances, total);
+    frontier, d_indices, d_distances, total);
   CUDA_CHECK(cudaGetLastError());
   CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -440,7 +474,7 @@ void run_pq_round(jasper::graph<GraphCfg>& graph,
 
   cudaFree(d_indices);
   cudaFree(d_distances);
-  cudaFree(result.frontier);
+  cudaFree(frontier);
 }
 
 // ── Single RaBitQ directional-search round ─────────────────────
@@ -454,10 +488,9 @@ void run_rq_round(jasper::graph<GraphCfg>& graph,
                   uint32_t beam_width,
                   uint32_t limit,
                   float gamma,
+                  uint32_t rerank,
                   const GroundTruth* gt,
                   bool print_throughput) {
-
-  jasper::vector_view<DataT> query_view(d_queries, dim, n_queries, false);
 
   jasper::search_params params{
     .k          = k,
@@ -466,29 +499,21 @@ void run_rq_round(jasper::graph<GraphCfg>& graph,
     .get_visited = false,
     .max_result_size = limit + 1,  // also a pop cap without a visited log; let limit be the one cap
     .adaptive_gamma = gamma,
+    .rerank = rerank,
   };
-
-  cudaEvent_t e0, e1;
-  cudaEventCreate(&e0);
-  cudaEventCreate(&e1);
 
   cudaDeviceSynchronize();
   CUDA_CHECK(cudaGetLastError());
 
   jasper::reset_phase_clocks();
 
-  cudaEventRecord(e0);
-  auto result = jasper::rq_search(graph, globals, query_view, params);
-  CUDA_CHECK(cudaGetLastError());
-  cudaDeviceSynchronize();
-  CUDA_CHECK(cudaGetLastError());
-  cudaEventRecord(e1);
-  cudaEventSynchronize(e1);
-
   float duration_ms = 0;
-  cudaEventElapsedTime(&duration_ms, e0, e1);
-  cudaEventDestroy(e0);
-  cudaEventDestroy(e1);
+  auto* frontier = chunked_search(
+      d_queries, dim, n_queries, k,
+      [&](jasper::vector_view<DataT>& query_view) {
+        return jasper::rq_search(graph, globals, query_view, params);
+      },
+      duration_ms);
 
   if (print_throughput) {
     float throughput = (n_queries * 1000.0f) / duration_ms;
@@ -496,6 +521,8 @@ void run_rq_round(jasper::graph<GraphCfg>& graph,
               << " limit=" << limit;
     if (gamma >= 0.0f)
       std::cout << " gamma=" << std::defaultfloat << std::setprecision(6) << gamma;
+    if (rerank > 0)
+      std::cout << " rerank=" << rerank;
     std::cout << " duration=" << std::fixed << std::setprecision(2) << duration_ms << "ms"
               << " throughput=" << std::setprecision(0) << throughput << " QPS"
               << std::endl;
@@ -511,7 +538,7 @@ void run_rq_round(jasper::graph<GraphCfg>& graph,
   uint32_t threads = 256;
   uint32_t blocks = (total + threads - 1) / threads;
   unpack_results_kernel<<<blocks, threads>>>(
-    result.frontier, d_indices, d_distances, total);
+    frontier, d_indices, d_distances, total);
   CUDA_CHECK(cudaGetLastError());
   CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -528,7 +555,7 @@ void run_rq_round(jasper::graph<GraphCfg>& graph,
 
   cudaFree(d_indices);
   cudaFree(d_distances);
-  cudaFree(result.frontier);
+  cudaFree(frontier);
 }
 
 // Rotate a batch of vectors in place on device by the orthogonal matrix seeded
@@ -779,17 +806,17 @@ void load_and_bench_lsh(const std::string& index_path,
 
   // Warmup
   std::cout << "\nWarmup..." << std::endl;
-  auto [warmup_bw, warmup_limit, warmup_gamma] = search_points.front();
+  auto [warmup_bw, warmup_limit, warmup_gamma, warmup_rerank] = search_points.front();
   run_directional_round<GraphCfg, DataT>(
     graph, lsh_globals, d_queries, n_queries, dim, k,
-    warmup_bw, warmup_limit, warmup_gamma, nullptr, false);
+    warmup_bw, warmup_limit, warmup_gamma, warmup_rerank, nullptr, false);
 
   // Benchmark rounds
   std::cout << "\n=== Directional Beam Search Benchmark (k=" << k << ") ===" << std::endl;
-  for (auto& [bw, lim, gamma] : search_points) {
+  for (auto& [bw, lim, gamma, rerank] : search_points) {
     run_directional_round<GraphCfg, DataT>(
       graph, lsh_globals, d_queries, n_queries, dim, k,
-      bw, lim, gamma, has_gt ? &gt : nullptr, true);
+      bw, lim, gamma, rerank, has_gt ? &gt : nullptr, true);
   }
 
   cudaFree(d_queries);
@@ -916,17 +943,17 @@ void load_and_bench_pq(const std::string& index_path,
 
   // Warmup
   std::cout << "\nWarmup..." << std::endl;
-  auto [warmup_bw, warmup_limit, warmup_gamma] = search_points.front();
+  auto [warmup_bw, warmup_limit, warmup_gamma, warmup_rerank] = search_points.front();
   run_pq_round<GraphCfg, DataT>(
     graph, pq_codebooks.view(), d_queries, n_queries, dim, k,
-    warmup_bw, warmup_limit, warmup_gamma, nullptr, false);
+    warmup_bw, warmup_limit, warmup_gamma, warmup_rerank, nullptr, false);
 
   // Benchmark rounds
   std::cout << "\n=== PQ Directional Beam Search Benchmark (k=" << k << ") ===" << std::endl;
-  for (auto& [bw, lim, gamma] : search_points) {
+  for (auto& [bw, lim, gamma, rerank] : search_points) {
     run_pq_round<GraphCfg, DataT>(
       graph, pq_codebooks.view(), d_queries, n_queries, dim, k,
-      bw, lim, gamma, has_gt ? &gt : nullptr, true);
+      bw, lim, gamma, rerank, has_gt ? &gt : nullptr, true);
   }
 
   cudaFree(d_queries);
@@ -1065,18 +1092,18 @@ void load_and_bench_rq(const std::string& index_path,
 
   // Warmup
   std::cout << "\nWarmup..." << std::endl;
-  auto [warmup_bw, warmup_limit, warmup_gamma] = search_points.front();
+  auto [warmup_bw, warmup_limit, warmup_gamma, warmup_rerank] = search_points.front();
   run_rq_round<GraphCfg, DataT>(
     graph, rq_globals, d_queries, n_queries, dim, k,
-    warmup_bw, warmup_limit, warmup_gamma, nullptr, false);
+    warmup_bw, warmup_limit, warmup_gamma, warmup_rerank, nullptr, false);
 
   // Benchmark rounds
   std::cout << "\n=== RaBitQ Directional Beam Search Benchmark (k=" << k << ") ==="
             << std::endl;
-  for (auto& [bw, lim, gamma] : search_points) {
+  for (auto& [bw, lim, gamma, rerank] : search_points) {
     run_rq_round<GraphCfg, DataT>(
       graph, rq_globals, d_queries, n_queries, dim, k,
-      bw, lim, gamma, has_gt ? &gt : nullptr, true);
+      bw, lim, gamma, rerank, has_gt ? &gt : nullptr, true);
   }
 
   cudaFree(d_queries);
@@ -1178,25 +1205,32 @@ void load_and_bench(const std::string& index_path,
   graph.deallocate();
 }
 
-// ── Parse "beam_width:limit[:gamma]" entries ───────────────────
+// ── Parse "beam_width:limit[:gamma[:rerank]]" entries ──────────
 std::vector<search_point> parse_search_points(const std::vector<std::string>& args) {
   std::vector<search_point> points;
   for (auto& s : args) {
-    const auto c1 = s.find(':');
-    if (c1 == std::string::npos)
-      throw std::runtime_error("Expected beam_width:limit[:gamma] format, got: " + s);
-    const auto c2 = s.find(':', c1 + 1);
-    search_point pt{};
-    pt.beam_width = static_cast<uint32_t>(std::stoul(s.substr(0, c1)));
-    pt.limit      = static_cast<uint32_t>(std::stoul(
-        s.substr(c1 + 1, c2 == std::string::npos ? std::string::npos : c2 - c1 - 1)));
-    pt.gamma      = -1.0f;
-    if (c2 != std::string::npos) {
-      pt.gamma = std::stof(s.substr(c2 + 1));
-      if (!(pt.gamma >= 0.0f))
-        throw std::runtime_error("gamma must be >= 0 (omit it for beam-width "
-                                 "termination), got: " + s);
+    std::vector<std::string> f;
+    for (size_t b = 0;;) {
+      const size_t c = s.find(':', b);
+      f.push_back(s.substr(b, c == std::string::npos ? std::string::npos : c - b));
+      if (c == std::string::npos) break;
+      b = c + 1;
     }
+    if (f.size() < 2 || f.size() > 4)
+      throw std::runtime_error("Expected beam_width:limit[:gamma[:rerank]] format, got: " + s);
+    search_point pt{};
+    pt.beam_width = static_cast<uint32_t>(std::stoul(f[0]));
+    pt.limit      = static_cast<uint32_t>(std::stoul(f[1]));
+    pt.gamma      = -1.0f;
+    pt.rerank     = 0;
+    if (f.size() > 2 && f[2] != "-" && !f[2].empty()) {
+      pt.gamma = std::stof(f[2]);
+      if (!(pt.gamma >= 0.0f))
+        throw std::runtime_error("gamma must be >= 0 (omit it, or give \"-\", for "
+                                 "beam-width termination), got: " + s);
+    }
+    if (f.size() > 3)
+      pt.rerank = static_cast<uint32_t>(std::stoul(f[3]));
     points.push_back(pt);
   }
   return points;
@@ -1248,10 +1282,12 @@ int main(int argc, char** argv) {
       "1:128", "2:128", "4:128", "8:128", "16:128", "32:128", "64:128", "128:256", "256:512"
     })
     .nargs(argparse::nargs_pattern::at_least_one)
-    .help("beam_width:limit[:gamma] points to benchmark (e.g. 16:128 64:256 "
-          "256:2048:0.1). A gamma switches that point to Adaptive Beam Search "
-          "termination, with beam_width as the candidate-list cap; it needs "
-          "--lsh, --pq or --rabitq.");
+    .help("beam_width:limit[:gamma[:rerank]] points to benchmark (e.g. 16:128 "
+          "64:256 256:2048:0.1 256:2048:-:100). A gamma switches that point to "
+          "Adaptive Beam Search termination, with beam_width as the "
+          "candidate-list cap (\"-\" = off); a rerank re-ranks that many "
+          "unexpanded candidates with exact distances. Both need --lsh, --pq "
+          "or --rabitq.");
 
   program.add_argument("--lsh")
     .default_value(false)
@@ -1294,6 +1330,11 @@ int main(int argc, char** argv) {
     .implicit_value(true)
     .help("Move the loaded graph to host before querying.");
 
+  program.add_argument("--query_chunk")
+    .default_value(uint32_t{0}).scan<'u', uint32_t>()
+    .help("Search the queries in back-to-back launches of this many (0 = all "
+          "at once). Bounds the searches in flight; matters with --on_host.");
+
   program.add_argument("--prepopulated")
     .default_value(false)
     .implicit_value(true)
@@ -1335,6 +1376,7 @@ int main(int argc, char** argv) {
   auto use_pq       = program.get<bool>("--pq");
   auto use_rq       = program.get<bool>("--rabitq");
   auto on_host      = program.get<bool>("--on_host");
+  g_query_chunk     = program.get<uint32_t>("--query_chunk");
   auto k_ranks      = program.get<uint32_t>("--k_ranks");
   auto pq_train     = program.get<uint32_t>("--pq_train");
   auto no_rotate    = program.get<bool>("--no_rotate");
@@ -1363,6 +1405,11 @@ int main(int argc, char** argv) {
                      "only implemented for --lsh, --pq and --rabitq" << std::endl;
         return 1;
       }
+      if (pt.rerank > 0) {
+        std::cerr << "Error: rerank (beam_width:limit:gamma:rerank) is only "
+                     "implemented for --lsh, --pq and --rabitq" << std::endl;
+        return 1;
+      }
     }
   }
 
@@ -1378,7 +1425,9 @@ int main(int argc, char** argv) {
   std::cout << "  beam_limits:  ";
   for (const search_point& pt : search_points) {
     std::cout << pt.beam_width << ":" << pt.limit;
-    if (pt.gamma >= 0.0f) std::cout << ":" << pt.gamma;
+    if (pt.gamma >= 0.0f || pt.rerank > 0)
+      std::cout << ":" << (pt.gamma >= 0.0f ? std::to_string(pt.gamma) : std::string("-"));
+    if (pt.rerank > 0) std::cout << ":" << pt.rerank;
     std::cout << " ";
   }
   std::cout << std::endl;
@@ -1386,6 +1435,8 @@ int main(int argc, char** argv) {
   std::cout << "  pq:           " << (use_pq ? "true" : "false") << std::endl;
   std::cout << "  rabitq:       " << (use_rq ? "true" : "false") << std::endl;
   std::cout << "  on_host:      " << (on_host ? "true" : "false") << std::endl;
+  std::cout << "  query_chunk:  "
+            << (g_query_chunk ? std::to_string(g_query_chunk) : std::string("all")) << std::endl;
   if (use_lsh || use_pq || use_rq) {
     std::cout << "  k_ranks:      " << k_ranks << std::endl;
     if (use_rq)

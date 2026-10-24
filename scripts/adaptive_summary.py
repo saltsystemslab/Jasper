@@ -6,14 +6,14 @@ Joins the two halves of sbatch/bench_adaptive_termination.sbatch for every
 search k of recall k@k:
 
   <ds>_<method>_k<k_ranks>_top<k>_<placement>.qps.log
-                                run_query output: per point, one
-                                "beam_width=.. limit=.. [gamma=..] .. throughput=.. QPS"
+                                run_query output: per point, one "beam_width=..
+                                limit=.. [gamma=..] [rerank=..] .. throughput=.. QPS"
                                 line followed by "Recall@k: ..". A point listed
                                 more than once (REPEATS) is reduced to its
                                 median QPS.
   <ds>_<method>_k<k_ranks>_top<k>_<placement>.pops.csv
                                 distortion_test --pops over the same points,
-                                with the stop,gamma columns.
+                                with the stop,gamma (and rerank) columns.
 
 placement is device or host (graph in pinned host memory, --on_host).
 
@@ -21,6 +21,11 @@ Writes --out, one row per (cell, point):
 
   dataset,method,k_ranks,topk,placement,stop,beam_width,limit,gamma,recall,qps,qps_runs,
   recall_pops,mean_pops,p50_pops,p95_pops,capped_frac
+
+A point with a re-rank (rerank > 0, beam-width rule) is its own rule, stop =
+"rerank", compared with plain beam search on QPS and on vectors read (it reads
+a vector per re-ranked candidate on top of one per pop, so pops alone would
+flatter it).
 
 and prints, per cell and target recall, the best configuration of each rule
 that reaches the target: the highest QPS (recall from the timed run) and,
@@ -49,19 +54,21 @@ NAME_RE = re.compile(r"^(?P<ds>.+)_(?P<method>conventional|lsh|pq|rabitq)_k(?P<k
                      r"_top(?P<topk>\d+)"
                      r"_(?P<place>device|host)"
                      r"\.(?P<kind>qps\.log|pops\.csv)$")
-QPS_RE = re.compile(r"beam_width=(\d+) limit=(\d+)(?: gamma=(\S+))? duration=\S+ "
-                    r"throughput=(\d+) QPS")
+QPS_RE = re.compile(r"beam_width=(\d+) limit=(\d+)(?: gamma=(\S+))?(?: rerank=(\d+))? "
+                    r"duration=\S+ throughput=(\d+) QPS")
 RECALL_RE = re.compile(r"Recall@\d+: ([0-9.]+)")
 
 FIELDS = ["dataset", "method", "k_ranks", "topk", "placement", "stop", "beam_width", "limit", "gamma",
           "recall", "qps", "qps_runs", "recall_pops", "mean_pops", "p50_pops",
           "p95_pops", "capped_frac", "mean_vectors_fetched", "mean_unique_pops",
-          "dup_topk_frac"]
+          "dup_topk_frac", "rerank", "mean_reranked"]
 
 
-def point_key(bw, limit, gamma):
-    """gamma None = beam-width rule. Rounded so log and CSV spellings agree."""
-    return (int(bw), int(limit), None if gamma in (None, "") else round(float(gamma), 6))
+def point_key(bw, limit, gamma, rerank=None):
+    """gamma None = beam-width rule; rerank 0 = none. Rounded so log and CSV
+    spellings agree."""
+    return (int(bw), int(limit), None if gamma in (None, "") else round(float(gamma), 6),
+            int(rerank or 0))
 
 
 def read_qps(path: Path) -> dict:
@@ -71,8 +78,8 @@ def read_qps(path: Path) -> dict:
     for line in path.read_text(errors="replace").splitlines():
         m = QPS_RE.search(line)
         if m:
-            pending = point_key(m[1], m[2], m[3])
-            out.setdefault(pending, {"qps": [], "recall": []})["qps"].append(float(m[4]))
+            pending = point_key(m[1], m[2], m[3], m[4])
+            out.setdefault(pending, {"qps": [], "recall": []})["qps"].append(float(m[5]))
             continue
         m = RECALL_RE.search(line)
         if m and pending is not None:
@@ -85,7 +92,8 @@ def read_pops(path: Path) -> dict:
     out: dict = {}
     with path.open() as f:
         for r in csv.DictReader(f):
-            out.setdefault(point_key(r["beam_width"], r["limit"], r.get("gamma")), r)
+            out.setdefault(point_key(r["beam_width"], r["limit"], r.get("gamma"),
+                                     r.get("rerank")), r)
     return out
 
 
@@ -96,12 +104,15 @@ def fnum(x):
 def cell_rows(ds, method, k, topk, place, qps: dict, pops: dict) -> list[dict]:
     rows = []
     for key in list(qps) + [k_ for k_ in pops if k_ not in qps]:
-        bw, limit, gamma = key
+        bw, limit, gamma, rerank = key
         q, p = qps.get(key), pops.get(key)
+        stop = "beam" if gamma is None else "adaptive"
+        if rerank:
+            stop = "rerank" if gamma is None else "adaptive+rerank"
         rows.append({
             "dataset": ds, "method": method, "k_ranks": k, "topk": topk,
             "placement": place,
-            "stop": "beam" if gamma is None else "adaptive",
+            "stop": stop,
             "beam_width": bw, "limit": limit, "gamma": "" if gamma is None else gamma,
             "recall": statistics.fmean(q["recall"]) if q and q["recall"] else None,
             "qps": statistics.median(q["qps"]) if q else None,
@@ -117,14 +128,19 @@ def cell_rows(ds, method, k, topk, place, qps: dict, pops: dict) -> list[dict]:
             # Duplicate columns; absent from --pops CSVs written before them.
             "mean_unique_pops": fnum(p.get("mean_unique_pops")) if p else None,
             "dup_topk_frac": fnum(p.get("dup_topk_frac")) if p else None,
+            # Re-rank setting, and candidates it actually read per query (some
+            # queries have fewer unexpanded candidates than rerank).
+            "rerank": rerank,
+            "mean_reranked": fnum(p.get("mean_reranked")) if p else None,
         })
     return rows
 
 
 def config(r: dict) -> str:
-    if r["stop"] == "beam":
-        return f"bw={r['beam_width']}"
-    return f"L={r['beam_width']} g={r['gamma']:g}"
+    rr = f" M={r['rerank']}" if r.get("rerank") else ""
+    if r["gamma"] in (None, ""):
+        return f"bw={r['beam_width']}{rr}"
+    return f"L={r['beam_width']} g={r['gamma']:g}{rr}"
 
 
 def best(rows, stop, target, recall_col, value_col, pick):
@@ -191,6 +207,35 @@ def report(ds, method, k, topk, place, rows, targets):
         print(f"  WARNING: {len(capped)} point(s) hit LIMIT on some queries "
               f"(worst {100 * worst['capped_frac']:.2f}% at {config(worst)}); raise LIMIT")
     duplicates(rows)
+    rerank_report(rows, targets)
+
+
+def rerank_report(rows, targets) -> None:
+    """Beam search with and without a re-rank of the best unexpanded candidates.
+    Work is vectors read, not pops: a re-ranked candidate costs a vector read
+    but no pop, so pops alone would flatter the re-rank."""
+    if not any(r["stop"] == "rerank" for r in rows):
+        return
+    print("  beam vs beam + re-rank (M = candidates re-ranked):")
+    hdr = (f"  {'recall':>6} | {'beam QPS':>9} {'':<12} {'rerank QPS':>10} {'':<18} {'QPS x':>6} |"
+           f" {'beam vecs':>9} {'':<12} {'rerank vecs':>11} {'':<18} {'vecs':>7}")
+    print(hdr)
+    print("  " + "-" * (len(hdr) - 2))
+    for t in targets:
+        bq = best(rows, "beam", t, "recall", "qps", max)
+        rq = best(rows, "rerank", t, "recall", "qps", max)
+        bv = best(rows, "beam", t, "recall_pops", "mean_vectors_fetched", min)
+        rv = best(rows, "rerank", t, "recall_pops", "mean_vectors_fetched", min)
+
+        def cell(r, col, fmt, width, cw):
+            return (f"{format(r[col], fmt):>{width}} {('(' + config(r) + ')'):<{cw}}" if r
+                    else f"{'—':>{width}} {'':<{cw}}")
+        speed = f"{rq['qps'] / bq['qps']:.2f}x" if rq and bq else "—"
+        saved = (f"{100 * (rv['mean_vectors_fetched'] / bv['mean_vectors_fetched'] - 1):+.1f}%"
+                 if rv and bv else "—")
+        print(f"  {t:>6.3f} | {cell(bq, 'qps', '.0f', 9, 12)} {cell(rq, 'qps', '.0f', 10, 18)} "
+              f"{speed:>6} | {cell(bv, 'mean_vectors_fetched', '.1f', 9, 12)} "
+              f"{cell(rv, 'mean_vectors_fetched', '.1f', 11, 18)} {saved:>7}")
 
 
 def duplicates(rows) -> None:
@@ -208,7 +253,7 @@ def duplicates(rows) -> None:
         print("  duplicates: none (every pop a distinct node, no repeated top-k id)")
         return
     parts = []
-    for stop in ("beam", "adaptive"):
+    for stop in ("beam", "adaptive", "rerank"):
         sub = [r for r in d if r["stop"] == stop]
         if sub:
             avg = statistics.fmean(1 - r["mean_unique_pops"] / r["mean_pops"] for r in sub)
@@ -225,11 +270,11 @@ def placement_check(ds, method, k, topk, by_place: dict) -> None:
     agree point for point. Codes are rebuilt per run, so allow a little drift."""
     if not {"device", "host"} <= by_place.keys():
         return
-    dev = {(r["stop"], r["beam_width"], r["gamma"]): r for r in by_place["device"]}
+    dev = {(r["stop"], r["beam_width"], r["gamma"], r["rerank"]): r for r in by_place["device"]}
     worst_pops = worst_recall = 0.0
     n = 0
     for r in by_place["host"]:
-        d = dev.get((r["stop"], r["beam_width"], r["gamma"]))
+        d = dev.get((r["stop"], r["beam_width"], r["gamma"], r["rerank"]))
         if not d or d["mean_pops"] is None or r["mean_pops"] is None:
             continue
         n += 1

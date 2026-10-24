@@ -24,6 +24,8 @@
 // FIN_CFG construct configs and passing n_dup.
 #pragma once
 
+#include <cerrno>
+#include <cstdio>
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
@@ -1108,6 +1110,7 @@ struct diskann_intermediate_graph {
       graph_construct_params<INT_CFG> sp;
       sp.data_vectors   = shard_vecs;
       sp.alpha          = params.alpha;
+      sp.two_pass       = params.two_pass;
       sp.max_batch_size = std::max<uint32_t>(1, std::min(batch_cap, count));
       sp.on_host        = false;
       sp.prerotate      = false;   // shards must share one space; no per-shard rotation
@@ -1310,7 +1313,8 @@ struct diskann_intermediate_graph {
 
     std::ofstream outFile(output_fname, std::ios::binary);
     if (!outFile.is_open())
-      throw std::runtime_error("Failed to open " + output_fname + " for graph save");
+      throw std::runtime_error("Failed to open " + output_fname + " for graph save: " +
+                               std::strerror(errno));
 
     uint64_t big_n_vectors  = static_cast<uint64_t>(n_vectors);
     uint64_t medoid         = 0;
@@ -1329,6 +1333,14 @@ struct diskann_intermediate_graph {
       outFile.write(reinterpret_cast<const char*>(&edges[i]),  sizeof(fin_edge_list_t));
     }
     outFile.close();
+    // A full disk or quota fails the writes, not the open; without this the
+    // truncated file is left behind looking like an index.
+    if (outFile.fail()) {
+      const std::string why = std::strerror(errno);
+      std::remove(output_fname.c_str());
+      throw std::runtime_error("Failed writing " + output_fname + " (" + why +
+                               "); partial file removed");
+    }
 
     std::cout << "Saved graph to " << output_fname << "\n"
               << "  n_vectors       : " << big_n_vectors << "\n"

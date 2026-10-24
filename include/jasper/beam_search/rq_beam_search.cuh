@@ -101,12 +101,14 @@ __device__ __forceinline__ float rq_block_sum(float local) {
 //
 // `est_vec` is the rq_dim-long estimator vector in shared memory: the residual
 // prefix (L2) or the query prefix (IP).
+//
+// `u_rq` is u's edge list, staged in shared memory by the search kernel or the
+// graph's own (distortion.cuh); plain loads, not __ldg, so either works.
 template <typename GRAPH_CFG, distance_func DISTANCE_FUNC>
 __device__ __forceinline__ void rq_populate_estimated_distances(
     float                                   exact_u,    // A (L2) or <q,u> (IP)
     float                                   node_scale,
-    typename graph<GRAPH_CFG>::device_view& graph,
-    typename GRAPH_CFG::index_t             u_gid,
+    const typename GRAPH_CFG::edge_rq_list_t& u_rq,
     const typename GRAPH_CFG::data_t* __restrict__ est_vec,
     ENTRY_T*     __restrict__               result_buffer,
     uint32_t                                offset,
@@ -125,13 +127,6 @@ __device__ __forceinline__ void rq_populate_estimated_distances(
   constexpr float    CB =
       rq_globals<GRAPH_CFG::rq_dim, GRAPH_CFG::rq_bits>::cb();
 
-  // Hoist u-side segment lookup (same layout math as the LSH/PQ estimators).
-  const INDEX_T  u_lid    = u_gid - graph.global_offset;
-  const uint32_t u_segid  = static_cast<uint32_t>(u_lid / GRAPH_CFG::vectors_per_segment);
-  const uint32_t u_locidx = static_cast<uint32_t>(u_lid % GRAPH_CFG::vectors_per_segment);
-  const auto&    u_segment = graph.segments[u_segid];
-
-  const auto& u_rq = u_segment.edge_rqs[u_locidx];
   const uint32_t*      __restrict__ code_base    = u_rq.code;
   const __half*        __restrict__ rescale_base = u_rq.rescale;
   const __nv_bfloat16* __restrict__ mag_base     = u_rq.mag_sq;
@@ -148,7 +143,7 @@ __device__ __forceinline__ void rq_populate_estimated_distances(
     float dot = 0.0f;
     #pragma unroll
     for (uint32_t w = 0; w < N_WORDS; ++w) {
-      const uint32_t word = __ldg(code_base + w * N_NEIGHBORS + e);
+      const uint32_t word = code_base[w * N_NEIGHBORS + e];
       #pragma unroll
       for (uint32_t t = 0; t < DIMS_PER_WORD; ++t) {
         const float level =
@@ -158,8 +153,8 @@ __device__ __forceinline__ void rq_populate_estimated_distances(
       }
     }
 
-    const float mag_sq  = __bfloat162float(__ldg(mag_base + e));
-    const float rescale = __half2float(__ldg(rescale_base + e));
+    const float mag_sq  = __bfloat162float(mag_base[e]);
+    const float rescale = __half2float(rescale_base[e]);
     const float mag     = sqrtf(mag_sq);
     const float cross   = node_scale * mag * rescale * dot;
 
@@ -179,12 +174,21 @@ __device__ __forceinline__ void rq_populate_estimated_distances(
 //   - globals_t            = rq_globals<rq_dim, rq_bits>  (build-side constants)
 //   - extra_smem_size()    = rq_dim residual prefix (L2) / nothing (IP)
 //   - constructor          = (IP) ||q|| / ||q_d||, which is query-invariant
+//   - edge_codes_t / edge_codes() = u's edge_rq_list in graph memory
 //   - visit()              = one exact I/O of u; (L2) the per-node cosine scale
 //   - estimate_neighbors() = dot each out-edge's code against the estimator vector
 template <typename GRAPH_CFG, distance_func DISTANCE_FUNC, uint32_t BLOCK_SIZE>
 struct rq_estimator {
-  using DATA_T  = typename GRAPH_CFG::data_t;
-  using INDEX_T = typename GRAPH_CFG::index_t;
+  using DATA_T       = typename GRAPH_CFG::data_t;
+  using INDEX_T      = typename GRAPH_CFG::index_t;
+  using edge_codes_t = typename GRAPH_CFG::edge_rq_list_t;
+
+  __device__ static const edge_codes_t* edge_codes(
+      const typename graph<GRAPH_CFG>::device_view& graph, INDEX_T u_gid) {
+    const INDEX_T u_lid = u_gid - graph.global_offset;
+    return &graph.segments[u_lid / GRAPH_CFG::vectors_per_segment]
+                .edge_rqs[u_lid % GRAPH_CFG::vectors_per_segment];
+  }
 
   static constexpr uint32_t RQ_DIM  = GRAPH_CFG::rq_dim;
   static constexpr uint32_t RQ_BITS = GRAPH_CFG::rq_bits;
@@ -291,12 +295,13 @@ struct rq_estimator {
 
   // ESTIMATE ||q-v||² (or -<q,v>) for the newly-appended neighbors from the
   // RaBitQ code stored on each edge (u, v) — no fetch of v's vector.
-  __device__ void estimate_neighbors(typename graph<GRAPH_CFG>::device_view& graph,
-                                     INDEX_T u_gid, DATA_T* /*smem_query_vec*/,
+  __device__ void estimate_neighbors(typename graph<GRAPH_CFG>::device_view& /*graph*/,
+                                     DATA_T* /*smem_query_vec*/,
+                                     const edge_codes_t& codes,
                                      ENTRY_T* result_buffer, uint32_t offset,
                                      uint8_t n_edges) {
     rq_populate_estimated_distances<GRAPH_CFG, DISTANCE_FUNC>(
-        exact_u, node_scale, graph, u_gid, est_vec, result_buffer, offset, n_edges);
+        exact_u, node_scale, codes, est_vec, result_buffer, offset, n_edges);
   }
 };
 

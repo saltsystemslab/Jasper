@@ -62,6 +62,14 @@ struct beam_search_params {
   // directional kernel (graph_beam_search.cuh) implements it. A runtime knob
   // like get_visited, not a template axis.
   float                       adaptive_gamma  = -1.0f;
+
+  // Re-rank: keep this many candidates past the beam_width that get expanded,
+  // and when the search stops give the best of them not yet expanded (by
+  // estimate) an exact distance — one vector read each, no expansion — so they
+  // can enter the top-k. 0 (the default) = off. The list then holds
+  // beam_width + rerank entries, which is what picks MAX_SEARCH_WIDTH.
+  // Directional kernel only; a runtime knob like adaptive_gamma.
+  uint32_t                    rerank          = 0;
 };
 
 template <typename GRAPH_CFG>
@@ -72,6 +80,9 @@ struct beam_search_result {
   entry_t* frontier;   // [n_query_vectors * k]
   entry_t* visited;    // [n_query_vectors * max_result_size] (if get_visited)
   uint32_t*              visited_counts; // [n_query_vectors] (if get_visited)
+  // [n_query_vectors] candidates re-ranked (if get_visited and rerank > 0),
+  // i.e. the vectors read on top of one per pop. Freed by the caller.
+  uint32_t*              rerank_counts = nullptr;
 };
 
 }

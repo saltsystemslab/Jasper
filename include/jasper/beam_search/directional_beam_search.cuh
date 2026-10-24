@@ -28,12 +28,14 @@ namespace jasper {
 //   INNER_PRODUCT → x = q:         ⟨q,v⟩   ≈ ⟨q,u⟩ + mag·îp(q, r̂),
 //                                  and the stored distance is −⟨q,v⟩ (as in
 //                                  inner_product_distance) so smaller == closer.
+//
+// `u_lsh` is u's edge list: a copy the search kernel staged in shared memory,
+// or the graph's own (distortion.cuh). Plain loads, not __ldg, so either works.
 template <typename GRAPH_CFG, distance_func DISTANCE_FUNC>
 __device__ __forceinline__ void populate_estimated_distances(
     const typename GRAPH_CFG::data_t* __restrict__ smem_est_vec,
     float                                          exact_u,
-    typename graph<GRAPH_CFG>::device_view&        graph,
-    typename GRAPH_CFG::index_t                    u_gid,
+    const typename GRAPH_CFG::edge_lsh_list_t&     u_lsh,
     const lsh_globals<GRAPH_CFG::k_ranks>&         globals,
     float                                          inv_norm_denom,
     ENTRY_T*  __restrict__                         result_buffer,
@@ -51,18 +53,11 @@ __device__ __forceinline__ void populate_estimated_distances(
   constexpr PACKED_T COORD_MASK   = static_cast<PACKED_T>(~SIGN_MASK);
   constexpr uint32_t PACKED_BYTES = static_cast<uint32_t>(K_RANKS) * sizeof(PACKED_T);
 
-  // Hoist u-side segment lookup.
-  const INDEX_T  u_lid    = u_gid - graph.global_offset;
-  const uint32_t u_segid  = static_cast<uint32_t>(u_lid / GRAPH_CFG::vectors_per_segment);
-  const uint32_t u_locidx = static_cast<uint32_t>(u_lid % GRAPH_CFG::vectors_per_segment);
-  const auto&    u_segment = graph.segments[u_segid];
-
   // SoA edge-LSH layout: all edges' packed words, then a parallel bf16 mag_sq
   // array. Edge e's K_RANKS words start at packed_base + e*K_RANKS; that offset
   // is 4-byte aligned (K_RANKS*sizeof(PACKED_T) is a multiple of 4 for supported
   // configs and edge_lsh_list is alignas(4)), so the vectorized 32-bit loads
   // below stay valid.
-  const auto& u_lsh = u_segment.edge_lshs[u_locidx];
   const PACKED_T*      __restrict__ packed_base = u_lsh.packed;
   const __nv_bfloat16* __restrict__ mag_base    = u_lsh.mag_sq;
 
@@ -87,7 +82,7 @@ __device__ __forceinline__ void populate_estimated_distances(
       const uint32_t* __restrict__ p32 = reinterpret_cast<const uint32_t*>(row);
       uint32_t words[N_WORDS];
       #pragma unroll
-      for (uint32_t w = 0; w < N_WORDS; ++w) words[w] = __ldg(p32 + w);
+      for (uint32_t w = 0; w < N_WORDS; ++w) words[w] = p32[w];
       #pragma unroll
       for (uint32_t r = 0; r < K_RANKS; ++r) {
         if constexpr (sizeof(PACKED_T) == 1u) {
@@ -100,11 +95,11 @@ __device__ __forceinline__ void populate_estimated_distances(
       // Odd packed size (e.g. uint8_t with K_RANKS not a multiple of 4): load
       // each packed word directly.
       #pragma unroll
-      for (uint8_t r = 0; r < K_RANKS; ++r) p[r] = __ldg(row + r);
+      for (uint8_t r = 0; r < K_RANKS; ++r) p[r] = row[r];
     }
 
     // mag_sq lives in the parallel bf16 array, indexed by edge.
-    const float mag_sq = __bfloat162float(__ldg(mag_base + e));
+    const float mag_sq = __bfloat162float(mag_base[e]);
 
     // ─── Estimator ───
     float dot_acc = 0.0f;
@@ -138,13 +133,22 @@ __device__ __forceinline__ void populate_estimated_distances(
 // Fulfills the graph_beam_search_kernel estimator API (see graph_beam_search.cuh):
 //   - globals_t            = lsh_globals<k_ranks>            (calibration constants)
 //   - extra_smem_size()    = smem for (q - u), the L2 residual used to score edges
+//   - edge_codes_t / edge_codes() = u's edge_lsh_list in graph memory
 //   - visit()              = one exact I/O of u + (L2) store (q - u) for later use
 //   - estimate_neighbors() = score u's out-edges via packed sign/coord + magnitude
 template <typename GRAPH_CFG, distance_func DISTANCE_FUNC, uint32_t BLOCK_SIZE>
 struct lsh_estimator {
-  using DATA_T    = typename GRAPH_CFG::data_t;
-  using INDEX_T   = typename GRAPH_CFG::index_t;
-  using globals_t = lsh_globals<GRAPH_CFG::k_ranks>;
+  using DATA_T       = typename GRAPH_CFG::data_t;
+  using INDEX_T      = typename GRAPH_CFG::index_t;
+  using globals_t    = lsh_globals<GRAPH_CFG::k_ranks>;
+  using edge_codes_t = typename GRAPH_CFG::edge_lsh_list_t;
+
+  __device__ static const edge_codes_t* edge_codes(
+      const typename graph<GRAPH_CFG>::device_view& graph, INDEX_T u_gid) {
+    const INDEX_T u_lid = u_gid - graph.global_offset;
+    return &graph.segments[u_lid / GRAPH_CFG::vectors_per_segment]
+                .edge_lshs[u_lid % GRAPH_CFG::vectors_per_segment];
+  }
 
   __host__ static uint32_t extra_smem_size(uint32_t padded_dim) {
     return sizeof(DATA_T) * padded_dim;  // smem_qu_diff
@@ -178,15 +182,16 @@ struct lsh_estimator {
 
   // ESTIMATE ||q-v||² for the newly-appended neighbors using the LSH info
   // stored on edges (u, v) — no fetch of v's vector required.
-  __device__ void estimate_neighbors(typename graph<GRAPH_CFG>::device_view& graph,
-                                      INDEX_T u_gid, DATA_T* smem_query_vec,
+  __device__ void estimate_neighbors(typename graph<GRAPH_CFG>::device_view& /*graph*/,
+                                      DATA_T* smem_query_vec,
+                                      const edge_codes_t& codes,
                                       ENTRY_T* result_buffer, uint32_t offset,
                                       uint8_t n_edges) {
     // L2 dots the residual (q-u) against r̂; IP dots the query q directly.
     const DATA_T* __restrict__ smem_est_vec =
         (DISTANCE_FUNC == distance_func::L2) ? smem_qu_diff : smem_query_vec;
     populate_estimated_distances<GRAPH_CFG, DISTANCE_FUNC>(
-        smem_est_vec, exact_u, graph, u_gid, globals, inv_norm_denom,
+        smem_est_vec, exact_u, codes, globals, inv_norm_denom,
         result_buffer, offset, n_edges);
   }
 };
