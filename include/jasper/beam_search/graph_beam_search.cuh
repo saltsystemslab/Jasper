@@ -74,6 +74,7 @@
 #include "jasper/beam_search/entry.cuh"
 #include "jasper/beam_search/device_kernels.cuh"
 #include "jasper/beam_search/beam_search_common.cuh"
+#include "jasper/beam_search/list_ops.cuh"
 
 namespace jasper {
 
@@ -123,7 +124,8 @@ __global__ void graph_beam_search_kernel(
     uint32_t                               max_result_size,
     float                                  adaptive_slack,
     uint32_t                               rerank,
-    uint32_t*                              rerank_counts)
+    uint32_t*                              rerank_counts,
+    uint32_t                               list_opts)
 {
   using INDEX_T    = typename GRAPH_CFG::index_t;
   using DATA_T     = typename GRAPH_CFG::data_t;
@@ -213,6 +215,17 @@ __global__ void graph_beam_search_kernel(
   constexpr uint32_t NEW_ID_HASH_SLOTS = 1u << NEW_ID_HASH_BITS;
   __shared__ uint32_t new_id_hash[NEW_ID_HASH_SLOTS];  // node id, or EMPTY_SLOT
   __shared__ uint32_t new_id_pos[NEW_ID_HASH_SLOTS];   // its offset past `offset`
+
+  // ---- Candidate-list variants (list_opts; list_ops.cuh) ----
+  const bool opt_prefilter = list_opts & LIST_PREFILTER;
+  const bool opt_rank_sort = list_opts & LIST_RANK_SORT;
+  const bool opt_fused     = list_opts & LIST_FUSED_MERGE;
+  __shared__ uint32_t s_kept;                          // LIST_PREFILTER: new entries kept
+  __shared__ uint32_t s_n_drops;                       // LIST_FUSED_MERGE: old entries dropped
+  __shared__ uint32_t s_drops[GRAPH_CFG::n_neighbors]; //   ... and their positions
+#if defined(JASPER_PROFILE_CLOCKS)
+  __shared__ uint32_t s_matched;                       // step 6b matches, for the profile
+#endif
 
   // ---- CUB temp storage for candidate sort/dedup ----
   constexpr uint32_t TAIL_EPT =
@@ -394,6 +407,37 @@ __global__ void graph_beam_search_kernel(
                                  result_buffer, offset, n_edges);
     CLOCK_ACCUM(t_estimate, PHASE_ESTIMATE);
 
+    // 6a) LIST_PREFILTER: once the list is full, a new entry ranked after its
+    //     last entry cannot survive the clip (list_ops.cuh says why), so it is
+    //     dropped here; if none is left, the list is unchanged and steps 6b-9
+    //     are skipped.
+    if (opt_prefilter) {
+      CLOCK_START(t_filter);
+      if (threadIdx.x == 0) s_kept = 0;
+      __syncthreads();
+      const bool    full = offset >= list_capacity;
+      const ENTRY_T last = full ? result_buffer[list_capacity - 1] : empty_entry();
+      uint32_t kept = 0;
+      for (uint32_t j = threadIdx.x; j < n_edges; j += BLOCK_SIZE) {
+        const ENTRY_T e = result_buffer[offset + j];
+        if (full && !CustomPairLess{}(e, last))
+          result_buffer[offset + j] = set_index(e, DROPPED_INDEX);
+        else
+          ++kept;
+      }
+      if (kept) atomicAdd(&s_kept, kept);
+      __syncthreads();
+      const uint32_t n_kept = s_kept;
+      PROFILE_ADD(PROFILE_KEPT, n_kept);
+      CLOCK_ACCUM(t_filter, PHASE_FILTER);
+      if (n_kept == 0) {
+        PROFILE_COUNT(PROFILE_SKIPPED);
+        if (threadIdx.x == 0) result_buffer_count[0] = offset;
+        __syncthreads();
+        continue;
+      }
+    }
+
     // 6b) Keep one list entry per node. A node reached from two parents carries
     //     two different estimates, so its copies do not sort next to each
     //     other and dedup_results cannot pair them. Left alone, every copy
@@ -427,11 +471,16 @@ __global__ void graph_beam_search_kernel(
 
       for (uint32_t s = threadIdx.x; s < NEW_ID_HASH_SLOTS; s += BLOCK_SIZE)
         new_id_hash[s] = EMPTY_SLOT;
+      if (threadIdx.x == 0) s_n_drops = 0;
+#if defined(JASPER_PROFILE_CLOCKS)
+      if (threadIdx.x == 0) s_matched = 0;
+#endif
       __syncthreads();
 
       for (uint32_t j = threadIdx.x; j < n_edges; j += BLOCK_SIZE) {
         const uint32_t id = get_index(result_buffer[offset + j]);
-        if (id == INVALID_INDEX) continue;  // out-of-range neighbor
+        // out-of-range neighbor, or dropped by LIST_PREFILTER
+        if (id == INVALID_INDEX || id == DROPPED_INDEX) continue;
         for (uint32_t s = slot_of(id);; s = (s + 1) & (NEW_ID_HASH_SLOTS - 1)) {
           const uint32_t prev = atomicCAS(&new_id_hash[s], EMPTY_SLOT, id);
           if (prev == EMPTY_SLOT) { new_id_pos[s] = j; break; }
@@ -457,27 +506,66 @@ __global__ void graph_beam_search_kernel(
         if (id == INVALID_INDEX || id == DROPPED_INDEX) continue;
         const uint32_t j = new_copy_of(id);
         if (j == ~0u) continue;
+#if defined(JASPER_PROFILE_CLOCKS)
+        atomicAdd(&s_matched, 1u);
+#endif
         const ENTRY_T fresh = result_buffer[offset + j];
         // Qualified: the kernel's bool `get_visited` parameter hides the helper.
         if (jasper::get_visited(e) || get_distance(e) <= get_distance(fresh))
           result_buffer[offset + j] = drop(fresh);
+        else if (opt_fused)  // by position: the list keeps its order
+          s_drops[atomicAdd(&s_n_drops, 1u)] = i;
         else
           result_buffer[i] = drop(e);
       }
       for (uint32_t i = threadIdx.x; i < frontier_buffer_count[0]; i += BLOCK_SIZE) {
         const uint32_t j = new_copy_of(get_index(frontier_buffer[i]));
         if (j != ~0u) result_buffer[offset + j] = drop(result_buffer[offset + j]);
+#if defined(JASPER_PROFILE_CLOCKS)
+        if (j != ~0u) atomicAdd(&s_matched, 1u);
+#endif
       }
       __syncthreads();
+#if defined(JASPER_PROFILE_CLOCKS)
+      PROFILE_ADD(PROFILE_MATCHED, s_matched);
+#endif
     }
     CLOCK_ACCUM(t_unique, PHASE_UNIQUE);
 
     // 7) Sort / dedup / clip the candidate buffer (estimated distances).
+    if (opt_fused) {
+      // LIST_FUSED_MERGE: rank-sort the new entries and the dropped
+      // positions, then one pass merges, deduplicates and clips.
+      CLOCK_START(t_sort);
+      const uint32_t n_drops = s_n_drops;
+      const uint32_t n_new = rank_sort_new_entries<BLOCK_SIZE, GRAPH_CFG::n_neighbors>(
+          result_buffer, offset, n_edges, merge_scratch, /*dedup_out_of_range=*/true,
+          s_drops, n_drops);
+      fused_merge_clip<BLOCK_SIZE, MAX_SEARCH_WIDTH, GRAPH_CFG::n_neighbors>(
+          result_buffer, result_buffer_count, offset,
+          merge_scratch, n_new, s_drops, n_drops, list_capacity);
+      CLOCK_ACCUM(t_sort, PHASE_SORT);
+      continue;
+    }
+
     CLOCK_START(t_sort);
-    merge_sort_tail<INDEX_T, DISTANCE_T, BLOCK_SIZE, MAX_SEARCH_WIDTH,
-                GRAPH_CFG::n_neighbors, TailSortT>(
-      result_buffer, result_buffer_count, /*head_len=*/offset,
-      merge_scratch, temp_storage.tail_sort_storage);
+    if (opt_rank_sort) {
+      // LIST_RANK_SORT: rank-sort the new entries, dropped ones left out,
+      // then the reference merge.
+      const uint32_t n_new = rank_sort_new_entries<BLOCK_SIZE, GRAPH_CFG::n_neighbors>(
+          result_buffer, offset, n_edges, merge_scratch, /*dedup_out_of_range=*/false,
+          nullptr, 0);
+      if (n_new > 0)
+        merge_tail_into_head<BLOCK_SIZE, MAX_SEARCH_WIDTH>(
+            result_buffer, offset, n_new, merge_scratch);
+      if (threadIdx.x == 0) result_buffer_count[0] = offset + n_new;
+      __syncthreads();
+    } else {
+      merge_sort_tail<INDEX_T, DISTANCE_T, BLOCK_SIZE, MAX_SEARCH_WIDTH,
+                  GRAPH_CFG::n_neighbors, TailSortT>(
+        result_buffer, result_buffer_count, /*head_len=*/offset,
+        merge_scratch, temp_storage.tail_sort_storage);
+    }
     CLOCK_ACCUM(t_sort, PHASE_SORT);
 
     CLOCK_START(t_dedup);
@@ -635,7 +723,7 @@ graph_beam_search(
       p.query_vectors, p.use_range, p.query_start, p.query_end,
       p.medoid, p.k, p.beam_width, p.limit,
       p.get_visited, p.max_result_size, adaptive_slack,
-      p.rerank, result.rerank_counts);
+      p.rerank, result.rerank_counts, p.list_opts);
 
   cudaError_t err = cudaStreamSynchronize(stream);
   if (err != cudaSuccess) {
@@ -685,7 +773,7 @@ graph_beam_search(
       p.query_vectors, p.use_range, p.query_start, p.query_end,
       p.medoid, p.k, p.beam_width, p.limit,
       p.get_visited, p.max_result_size, adaptive_slack,
-      p.rerank, result.rerank_counts);
+      p.rerank, result.rerank_counts, p.list_opts);
 
   cudaError_t err = cudaStreamSynchronize(stream);
   if (err != cudaSuccess) {

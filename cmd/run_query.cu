@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <set>
 #include <stdexcept>
+#include <sstream>
 #include <vector>
 #include <chrono>
 #include <type_traits>
@@ -201,6 +202,14 @@ struct search_point {
 // so sweep the size and keep each method's best.
 static uint32_t g_query_chunk = 0;
 
+// list_opt bits (config.cuh) for the directional search being run: the
+// candidate-list maintenance variants, 0 = the reference. --list_opts takes a
+// comma-separated set; with more than one, every point runs each in turn (so
+// they share the load, and clock drift spreads over all of them) and the
+// throughput line names it as list_opts=.
+static uint32_t              g_list_opts = 0;
+static std::vector<uint32_t> g_list_opts_set{0};
+
 // Runs `search` (vector_view -> beam_search_result) over consecutive slices of
 // the queries, back to back, and returns one [n_queries * k] frontier covering
 // them all. duration_ms times the searches only; the slices are stitched
@@ -342,6 +351,7 @@ void run_directional_round(jasper::graph<GraphCfg>& graph,
     .max_result_size = limit + 1,  // also a pop cap without a visited log; let limit be the one cap
     .adaptive_gamma = gamma,
     .rerank = rerank,
+    .list_opts = g_list_opts,
   };
 
   cudaDeviceSynchronize();
@@ -365,6 +375,8 @@ void run_directional_round(jasper::graph<GraphCfg>& graph,
       std::cout << " gamma=" << std::defaultfloat << std::setprecision(6) << gamma;
     if (rerank > 0)
       std::cout << " rerank=" << rerank;
+    if (g_list_opts_set.size() > 1)
+      std::cout << " list_opts=" << g_list_opts;
     std::cout << " duration=" << std::fixed << std::setprecision(2) << duration_ms << "ms"
               << " throughput=" << std::setprecision(0) << throughput << " QPS"
               << std::endl;
@@ -423,6 +435,7 @@ void run_pq_round(jasper::graph<GraphCfg>& graph,
     .max_result_size = limit + 1,  // also a pop cap without a visited log; let limit be the one cap
     .adaptive_gamma = gamma,
     .rerank = rerank,
+    .list_opts = g_list_opts,
   };
 
   cudaDeviceSynchronize();
@@ -446,6 +459,8 @@ void run_pq_round(jasper::graph<GraphCfg>& graph,
       std::cout << " gamma=" << std::defaultfloat << std::setprecision(6) << gamma;
     if (rerank > 0)
       std::cout << " rerank=" << rerank;
+    if (g_list_opts_set.size() > 1)
+      std::cout << " list_opts=" << g_list_opts;
     std::cout << " duration=" << std::fixed << std::setprecision(2) << duration_ms << "ms"
               << " throughput=" << std::setprecision(0) << throughput << " QPS"
               << std::endl;
@@ -504,6 +519,7 @@ void run_rq_round(jasper::graph<GraphCfg>& graph,
     .max_result_size = limit + 1,  // also a pop cap without a visited log; let limit be the one cap
     .adaptive_gamma = gamma,
     .rerank = rerank,
+    .list_opts = g_list_opts,
   };
 
   cudaDeviceSynchronize();
@@ -527,6 +543,8 @@ void run_rq_round(jasper::graph<GraphCfg>& graph,
       std::cout << " gamma=" << std::defaultfloat << std::setprecision(6) << gamma;
     if (rerank > 0)
       std::cout << " rerank=" << rerank;
+    if (g_list_opts_set.size() > 1)
+      std::cout << " list_opts=" << g_list_opts;
     std::cout << " duration=" << std::fixed << std::setprecision(2) << duration_ms << "ms"
               << " throughput=" << std::setprecision(0) << throughput << " QPS"
               << std::endl;
@@ -811,6 +829,7 @@ void load_and_bench_lsh(const std::string& index_path,
   // Warmup
   std::cout << "\nWarmup..." << std::endl;
   auto [warmup_bw, warmup_limit, warmup_gamma, warmup_rerank] = search_points.front();
+  g_list_opts = g_list_opts_set.front();
   run_directional_round<GraphCfg, DataT>(
     graph, lsh_globals, d_queries, n_queries, dim, k,
     warmup_bw, warmup_limit, warmup_gamma, warmup_rerank, nullptr, false);
@@ -818,9 +837,12 @@ void load_and_bench_lsh(const std::string& index_path,
   // Benchmark rounds
   std::cout << "\n=== Directional Beam Search Benchmark (k=" << k << ") ===" << std::endl;
   for (auto& [bw, lim, gamma, rerank] : search_points) {
-    run_directional_round<GraphCfg, DataT>(
-      graph, lsh_globals, d_queries, n_queries, dim, k,
-      bw, lim, gamma, rerank, has_gt ? &gt : nullptr, true);
+    for (uint32_t opts : g_list_opts_set) {
+      g_list_opts = opts;
+      run_directional_round<GraphCfg, DataT>(
+        graph, lsh_globals, d_queries, n_queries, dim, k,
+        bw, lim, gamma, rerank, has_gt ? &gt : nullptr, true);
+    }
   }
 
   cudaFree(d_queries);
@@ -948,6 +970,7 @@ void load_and_bench_pq(const std::string& index_path,
   // Warmup
   std::cout << "\nWarmup..." << std::endl;
   auto [warmup_bw, warmup_limit, warmup_gamma, warmup_rerank] = search_points.front();
+  g_list_opts = g_list_opts_set.front();
   run_pq_round<GraphCfg, DataT>(
     graph, pq_codebooks.view(), d_queries, n_queries, dim, k,
     warmup_bw, warmup_limit, warmup_gamma, warmup_rerank, nullptr, false);
@@ -955,9 +978,12 @@ void load_and_bench_pq(const std::string& index_path,
   // Benchmark rounds
   std::cout << "\n=== PQ Directional Beam Search Benchmark (k=" << k << ") ===" << std::endl;
   for (auto& [bw, lim, gamma, rerank] : search_points) {
-    run_pq_round<GraphCfg, DataT>(
-      graph, pq_codebooks.view(), d_queries, n_queries, dim, k,
-      bw, lim, gamma, rerank, has_gt ? &gt : nullptr, true);
+    for (uint32_t opts : g_list_opts_set) {
+      g_list_opts = opts;
+      run_pq_round<GraphCfg, DataT>(
+        graph, pq_codebooks.view(), d_queries, n_queries, dim, k,
+        bw, lim, gamma, rerank, has_gt ? &gt : nullptr, true);
+    }
   }
 
   cudaFree(d_queries);
@@ -1097,6 +1123,7 @@ void load_and_bench_rq(const std::string& index_path,
   // Warmup
   std::cout << "\nWarmup..." << std::endl;
   auto [warmup_bw, warmup_limit, warmup_gamma, warmup_rerank] = search_points.front();
+  g_list_opts = g_list_opts_set.front();
   run_rq_round<GraphCfg, DataT>(
     graph, rq_globals, d_queries, n_queries, dim, k,
     warmup_bw, warmup_limit, warmup_gamma, warmup_rerank, nullptr, false);
@@ -1105,9 +1132,12 @@ void load_and_bench_rq(const std::string& index_path,
   std::cout << "\n=== RaBitQ Directional Beam Search Benchmark (k=" << k << ") ==="
             << std::endl;
   for (auto& [bw, lim, gamma, rerank] : search_points) {
-    run_rq_round<GraphCfg, DataT>(
-      graph, rq_globals, d_queries, n_queries, dim, k,
-      bw, lim, gamma, rerank, has_gt ? &gt : nullptr, true);
+    for (uint32_t opts : g_list_opts_set) {
+      g_list_opts = opts;
+      run_rq_round<GraphCfg, DataT>(
+        graph, rq_globals, d_queries, n_queries, dim, k,
+        bw, lim, gamma, rerank, has_gt ? &gt : nullptr, true);
+    }
   }
 
   cudaFree(d_queries);
@@ -1339,6 +1369,12 @@ int main(int argc, char** argv) {
     .help("Search the queries in back-to-back launches of this many (0 = all "
           "at once). Bounds the searches in flight; matters with --on_host.");
 
+  program.add_argument("--list_opts")
+    .default_value(std::string{"0"})
+    .help("Candidate-list variants for directional searches, as bits: 1 prefilter, "
+          "2 rank sort, 4 fused merge (config.cuh list_opt); 0 = reference. A "
+          "comma-separated set (e.g. 0,1,7) runs each at every point.");
+
   program.add_argument("--prepopulated")
     .default_value(false)
     .implicit_value(true)
@@ -1381,6 +1417,17 @@ int main(int argc, char** argv) {
   auto use_rq       = program.get<bool>("--rabitq");
   auto on_host      = program.get<bool>("--on_host");
   g_query_chunk     = program.get<uint32_t>("--query_chunk");
+  try {
+    g_list_opts_set.clear();
+    std::stringstream ss(program.get<std::string>("--list_opts"));
+    for (std::string tok; std::getline(ss, tok, ',');)
+      if (!tok.empty()) g_list_opts_set.push_back(static_cast<uint32_t>(std::stoul(tok)));
+    if (g_list_opts_set.empty()) g_list_opts_set.push_back(0);
+  } catch (const std::exception& e) {
+    std::cerr << "Error parsing --list_opts: " << e.what() << std::endl;
+    return 1;
+  }
+  g_list_opts = g_list_opts_set.front();
   auto k_ranks      = program.get<uint32_t>("--k_ranks");
   auto pq_train     = program.get<uint32_t>("--pq_train");
   auto no_rotate    = program.get<bool>("--no_rotate");
@@ -1441,6 +1488,9 @@ int main(int argc, char** argv) {
   std::cout << "  on_host:      " << (on_host ? "true" : "false") << std::endl;
   std::cout << "  query_chunk:  "
             << (g_query_chunk ? std::to_string(g_query_chunk) : std::string("all")) << std::endl;
+  std::cout << "  list_opts:   ";
+  for (uint32_t o : g_list_opts_set) std::cout << ' ' << o;
+  std::cout << std::endl;
   std::cout << "  max list:     " << jasper::directional_max_width
             << " (directional), 2048 (conventional, pq)" << std::endl;
   if (use_lsh || use_pq || use_rq) {

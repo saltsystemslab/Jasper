@@ -131,6 +131,8 @@ struct Opts {
   Method      method = Method::LSH;
 
   std::string pops_out, traj_out, random_out, visit_out;
+  uint32_t    list_opts = 0;        // list_opt bits for every search
+  uint32_t    check_list_opts = 0;  // nonzero: also run each --pops point with these, compare
   std::vector<search_point> beam_limits;
   std::pair<uint32_t, uint32_t> traj_beam{64, 256};
   uint32_t    samples = 10000;
@@ -257,13 +259,15 @@ template <typename GraphCfg, Method M>
 static Trajectories<GraphCfg> search_logged(jasper::graph<GraphCfg>& g, Codes<GraphCfg>& c,
                                             jasper::vector_view<__half> q, uint32_t k,
                                             uint32_t bw, uint32_t limit,
-                                            float gamma, uint32_t rerank) {
+                                            float gamma, uint32_t rerank,
+                                            uint32_t list_opts) {
   jasper::search_params p{
     .k = k, .beam_width = bw, .limit = limit,
     .get_visited = true,
     .max_result_size = limit + 1,  // the loop pops at most limit + 1 nodes
     .adaptive_gamma = gamma,
     .rerank = rerank,
+    .list_opts = list_opts,
   };
   jasper::beam_search_result<GraphCfg> r{};
   if constexpr (M == Method::LSH) r = jasper::directional_search(g, c.lsh, q, p);
@@ -449,6 +453,49 @@ static void write_visit_stats(std::ofstream& out, const std::string& point_cols,
       << (found ? share / found : 0.0) << ',' << double(never) / t.n_queries << '\n';
 }
 
+// ── List-variant check (--check_list_opts) ─────────────────────────────────
+// The list_opt variants are exact (list_ops.cuh): with any of them a search
+// must pop the same nodes in the same order, get the same exact distances,
+// re-rank as many, and return the same top-k as the reference, query by
+// query. Prints one "list_check:" line per point; result=identical or not.
+template <typename GraphCfg>
+static void check_list_variant(const Trajectories<GraphCfg>& base,
+                               const Trajectories<GraphCfg>& var, uint32_t k,
+                               const std::string& point, uint32_t base_opts,
+                               uint32_t var_opts) {
+  uint32_t differ = 0, pops_differ = 0, topk_differ = 0;
+  int64_t first_q = -1, first_pop = -1;
+  double base_pops = 0, var_pops = 0;
+  for (uint32_t i = 0; i < base.n_queries; ++i) {
+    base_pops += base.counts[i];
+    var_pops  += var.counts[i];
+    const auto* a = base.visited.data() + size_t(i) * base.stride;
+    const auto* b = var.visited.data() + size_t(i) * var.stride;
+    const uint32_t n = std::min(base.counts[i], var.counts[i]);
+    uint32_t j = 0;
+    while (j < n && a[j].first == b[j].first && a[j].second == b[j].second) ++j;
+    const bool pops_same = j == n && base.counts[i] == var.counts[i] &&
+                           base.reranked[i] == var.reranked[i];
+    const bool topk_same = std::equal(base.topk.begin() + size_t(i) * k,
+                                      base.topk.begin() + size_t(i + 1) * k,
+                                      var.topk.begin() + size_t(i) * k);
+    pops_differ += !pops_same;
+    topk_differ += !topk_same;
+    if (!pops_same || !topk_same) {
+      if (first_q < 0) { first_q = i; first_pop = j; }
+      ++differ;
+    }
+  }
+  std::cout << "  list_check: " << point << " base=" << base_opts << " variant=" << var_opts
+            << " queries=" << base.n_queries << " differ=" << differ
+            << " pops_differ=" << pops_differ << " topk_differ=" << topk_differ
+            << " first=" << first_q << ':' << first_pop << std::fixed << std::setprecision(1)
+            << " mean_pops_base=" << base_pops / base.n_queries
+            << " mean_pops_variant=" << var_pops / base.n_queries
+            << " result=" << (differ == 0 ? "identical" : "DIFFERENT") << std::endl;
+  std::cout.unsetf(std::ios::fixed);
+}
+
 // ── The three experiments ──────────────────────────────────────────────────
 template <typename GraphCfg, Method M>
 static void run_pops(jasper::graph<GraphCfg>& g, Codes<GraphCfg>& c,
@@ -469,7 +516,7 @@ static void run_pops(jasper::graph<GraphCfg>& g, Codes<GraphCfg>& c,
             << static_cast<uint32_t>(GraphCfg::k_ranks) << ") ===" << std::endl;
 
   for (auto [bw, lim, gamma, rerank] : o.beam_limits) {
-    auto t = search_logged<GraphCfg, M>(g, c, q, o.k, bw, lim, gamma, rerank);
+    auto t = search_logged<GraphCfg, M>(g, c, q, o.k, bw, lim, gamma, rerank, o.list_opts);
 
     // Duplicates. In directional search a node reached from two parents
     // carries two different estimates, so dedup_results cannot pair its
@@ -548,6 +595,16 @@ static void run_pops(jasper::graph<GraphCfg>& g, Codes<GraphCfg>& c,
     if (rerank > 0) std::cout << std::setprecision(1) << " reranked=" << reranked;
     std::cout << std::endl;
     std::cout.unsetf(std::ios::fixed);
+
+    if (o.check_list_opts != 0) {
+      const auto v = search_logged<GraphCfg, M>(g, c, q, o.k, bw, lim, gamma, rerank,
+                                                o.check_list_opts);
+      std::ostringstream point;
+      point << "beam_width=" << bw << " limit=" << lim;
+      if (gamma >= 0.0f) point << " gamma=" << std::setprecision(6) << gamma;
+      if (rerank > 0) point << " rerank=" << rerank;
+      check_list_variant(t, v, o.k, point.str(), o.list_opts, o.check_list_opts);
+    }
   }
   std::cout << "  wrote " << o.pops_out << std::endl;
   if (visit_out.is_open()) std::cout << "  wrote " << o.visit_out << std::endl;
@@ -562,7 +619,7 @@ static void run_trajectory(jasper::graph<GraphCfg>& g, Codes<GraphCfg>& c,
             << " limit=" << lim << ", " << o.samples << " pops, seed " << o.seed
             << ") ===" << std::endl;
   auto t = search_logged<GraphCfg, M>(g, c, q, o.k, bw, lim, /*gamma=*/-1.0f,
-                                      /*rerank=*/0);
+                                      /*rerank=*/0, o.list_opts);
 
   // Uniform over every (query, pop) the search made. Each method samples its
   // OWN trajectories — the pops it actually ranks — so pairs differ by method;
@@ -752,6 +809,12 @@ int main(int argc, char** argv) {
   program.add_argument("--visit_stats").default_value(std::string{})
       .help("CSV (with --pops): per point, the share of pops a cache of the most-visited "
             "nodes would serve, and the pops before the first true neighbor.");
+  program.add_argument("--list_opts").default_value(uint32_t{0}).scan<'u', uint32_t>()
+      .help("Candidate-list variants for every search, as bits: 1 prefilter, 2 rank "
+            "sort, 4 fused merge (config.cuh list_opt). 0 = reference.");
+  program.add_argument("--check_list_opts").default_value(uint32_t{0}).scan<'u', uint32_t>()
+      .help("With --pops: also search every point with these list_opts and compare "
+            "pops, exact distances and top-k query by query (list_check: lines).");
   program.add_argument("--beam_limits", "-b")
       .default_value(std::vector<std::string>{"8:64", "16:128", "32:128", "64:256",
                                               "128:256", "256:512", "512:1024"})
@@ -789,6 +852,8 @@ int main(int argc, char** argv) {
   o.rotate_seed = program.get<uint64_t>("--rotate_seed");
   o.pops_out    = program.get<std::string>("--pops");
   o.visit_out   = program.get<std::string>("--visit_stats");
+  o.list_opts   = program.get<uint32_t>("--list_opts");
+  o.check_list_opts = program.get<uint32_t>("--check_list_opts");
   o.traj_out    = program.get<std::string>("--trajectory");
   o.random_out  = program.get<std::string>("--random");
   o.samples     = program.get<uint32_t>("--samples");
@@ -805,6 +870,14 @@ int main(int argc, char** argv) {
     o.traj_beam = parse_pair(program.get<std::string>("--traj_beam"));
   } catch (const std::exception& e) {
     std::cerr << "Error: " << e.what() << std::endl;
+    return 1;
+  }
+  if (o.method == Method::CONV && (o.list_opts != 0 || o.check_list_opts != 0)) {
+    std::cerr << "Error: --list_opts / --check_list_opts are directional-only" << std::endl;
+    return 1;
+  }
+  if (o.check_list_opts != 0 && o.pops_out.empty()) {
+    std::cerr << "Error: --check_list_opts needs --pops (it checks those searches)" << std::endl;
     return 1;
   }
   if (!o.visit_out.empty() && o.pops_out.empty()) {

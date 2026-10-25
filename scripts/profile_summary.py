@@ -7,7 +7,7 @@
 Phases: for each profiled search, the cycles per pop the kernel spent in each
 phase, as a share of the loop, plus the total and the measured pop rate (QPS x
 mean pops). "list" adds up the phases that work on the candidate list (pop,
-unique, sort, dedup, clip) and so grow with its width; "fetch" is the phase
+filter, unique, sort, dedup, clip) and so grow with its width; "fetch" is the phase
 that issues the per-pop reads (exact for directional search, expand +
 estimate for conventional). A width that ran more than once keeps its last
 run, so the first pass's cold start drops out.
@@ -27,8 +27,8 @@ import sys
 from pathlib import Path
 
 PHASES = ["pop", "exact", "frontier", "expand", "estimate",
-          "unique", "sort", "dedup", "clip"]
-LIST_PHASES = ["pop", "unique", "sort", "dedup", "clip"]
+          "filter", "unique", "sort", "dedup", "clip"]
+LIST_PHASES = ["pop", "filter", "unique", "sort", "dedup", "clip"]
 
 LOG_RE = re.compile(r"^(?P<ds>.+?)_(?P<m>conventional|lsh|rabitq|pq)_top(?P<k>\d+)_"
                     r"(?P<place>device|host)\.phase\.log$")
@@ -71,14 +71,15 @@ def phases(raw: Path, out_dir: Path) -> list[str]:
         return [f"no profiled searches in {raw}"]
 
     fields = ["dataset", "method", "k", "placement", "beam_width", "qps", "recall",
-              "queries", "pops", "mean_pops", "mpops_per_s", "cycles_per_pop"] + PHASES + ["rerank"]
+              "queries", "pops", "mean_pops", "mpops_per_s", "cycles_per_pop"] + PHASES + \
+             ["rerank", "kept_per_pop", "skipped_frac"]
     with (out_dir / "phases.csv").open("w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
         w.writeheader()
         w.writerows(rows)
 
     lines = [f"wrote {out_dir / 'phases.csv'} ({len(rows)} searches)",
-             "cycles per pop by phase, as % of the loop; list = pop+unique+sort+dedup+clip"]
+             "cycles per pop by phase, as % of the loop; list = pop+filter+unique+sort+dedup+clip"]
     hdr = (f"  {'method':<12} {'width':>5} {'recall':>6} {'Mpops/s':>8} {'cyc/pop':>8} |"
            + "".join(f" {p[:6]:>6}" for p in PHASES) + f" | {'list':>5}")
     key = lambda r: (r["dataset"], r["k"], r["placement"])

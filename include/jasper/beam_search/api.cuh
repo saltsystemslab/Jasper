@@ -53,6 +53,9 @@ struct search_params {
   // > 0: re-rank this many unexpanded candidates with exact distances when the
   // search stops, see beam_search_params::rerank. Directional searches only.
   uint32_t rerank           = 0;
+  // Candidate-list maintenance variants (list_opt bits, config.cuh); 0 = the
+  // reference. Directional searches only.
+  uint32_t list_opts        = 0;
 };
 
 template <typename GRAPH_CFG,
@@ -109,6 +112,10 @@ beam_search_result<GRAPH_CFG> search(
     throw std::invalid_argument(
         "rerank is implemented for directional_search / pq_search / "
         "rq_search only, not for conventional search()");
+  if (params.list_opts != 0)
+    throw std::invalid_argument(
+        "list_opts are implemented for directional_search / pq_search / "
+        "rq_search only, not for conventional search()");
   const uint32_t bw = params.beam_width;
   if      (bw + 64 < 128)  return search_dispatch_width<GRAPH_CFG, BLOCK_SIZE, 128,  TILE_SIZE>(g, d_queries, params);
   else if (bw + 64 < 256)  return search_dispatch_width<GRAPH_CFG, BLOCK_SIZE, 256,  TILE_SIZE>(g, d_queries, params);
@@ -150,6 +157,7 @@ beam_search_result<GRAPH_CFG> directional_search_impl(
     .max_result_size = params.max_result_size,
     .adaptive_gamma  = params.adaptive_gamma,
     .rerank          = params.rerank,
+    .list_opts       = params.list_opts,
   };
   return directional_beam_search<Cfg>(bp, globals);
 }
@@ -221,6 +229,7 @@ beam_search_result<GRAPH_CFG> pq_search_impl(
     .max_result_size = params.max_result_size,
     .adaptive_gamma  = params.adaptive_gamma,
     .rerank          = params.rerank,
+    .list_opts       = params.list_opts,
   };
   return pq_beam_search<Cfg>(bp, codebooks);
 }
@@ -294,6 +303,7 @@ beam_search_result<GRAPH_CFG> rq_search_impl(
     .max_result_size = params.max_result_size,
     .adaptive_gamma  = params.adaptive_gamma,
     .rerank          = params.rerank,
+    .list_opts       = params.list_opts,
   };
   return rq_beam_search<Cfg>(bp, globals);
 }

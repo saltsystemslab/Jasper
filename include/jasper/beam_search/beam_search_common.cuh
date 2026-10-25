@@ -37,15 +37,19 @@ enum PhaseIdx : int {
   PHASE_FRONTIER = 2,   // insert u into the top-k (+ visited log)
   PHASE_EXPAND   = 3,   // append u's neighbors to the list
   PHASE_ESTIMATE = 4,   // neighbor distances: estimates, or exact for conventional
-  PHASE_UNIQUE   = 5,   // directional step 6b: drop copies of nodes already listed
-  PHASE_SORT     = 6,   // merge (directional) / sort (conventional) the list
-  PHASE_DEDUP    = 7,   // dedup_results
-  PHASE_CLIP     = 8,   // clip_k
-  PHASE_RERANK   = 9,   // after the loop, once per query: the re-rank
-  PHASE_COUNT    = 10,
+  PHASE_FILTER   = 5,   // LIST_PREFILTER: drop new entries past a full list's end
+  PHASE_UNIQUE   = 6,   // directional step 6b: drop copies of nodes already listed
+  PHASE_SORT     = 7,   // merge (directional) / sort (conventional) the list
+  PHASE_DEDUP    = 8,   // dedup_results
+  PHASE_CLIP     = 9,   // clip_k
+  PHASE_RERANK   = 10,  // after the loop, once per query: the re-rank
+  PHASE_COUNT    = 11,
   PROFILE_POPS    = PHASE_COUNT,      // pops in sampled blocks
   PROFILE_QUERIES = PHASE_COUNT + 1,  // sampled blocks
-  PROFILE_SLOTS   = PHASE_COUNT + 2,
+  PROFILE_KEPT    = PHASE_COUNT + 2,  // LIST_PREFILTER: new entries it kept
+  PROFILE_SKIPPED = PHASE_COUNT + 3,  // LIST_PREFILTER: pops that kept none
+  PROFILE_MATCHED = PHASE_COUNT + 4,  // step 6b: new entries already listed or in the top-k
+  PROFILE_SLOTS   = PHASE_COUNT + 5,
 };
 
 extern __device__ uint64_t g_phase_clocks[PROFILE_SLOTS];
@@ -64,10 +68,12 @@ extern __device__ uint64_t g_phase_clocks[PROFILE_SLOTS];
               static_cast<unsigned long long>(_end - (var))); \
   }
 
-#define PROFILE_COUNT(slot) \
+#define PROFILE_ADD(slot, n) \
   if (PROFILE_SAMPLED()) { \
-    atomicAdd(reinterpret_cast<unsigned long long*>(&g_phase_clocks[slot]), 1ull); \
+    atomicAdd(reinterpret_cast<unsigned long long*>(&g_phase_clocks[slot]), \
+              static_cast<unsigned long long>(n)); \
   }
+#define PROFILE_COUNT(slot) PROFILE_ADD(slot, 1)
 
 // One machine-readable line, then a table: cycles per pop for each phase of
 // the loop, and the re-rank in cycles per query.
@@ -76,7 +82,7 @@ inline void print_phase_clocks() {
   cudaMemcpyFromSymbol(h, g_phase_clocks, sizeof(h));
   const char* names[PHASE_COUNT] = {
     "pop", "exact", "frontier", "expand", "estimate",
-    "unique", "sort", "dedup", "clip", "rerank"
+    "filter", "unique", "sort", "dedup", "clip", "rerank"
   };
   const double pops    = h[PROFILE_POPS] ? double(h[PROFILE_POPS]) : 1.0;
   const double queries = h[PROFILE_QUERIES] ? double(h[PROFILE_QUERIES]) : 1.0;
@@ -87,7 +93,8 @@ inline void print_phase_clocks() {
          loop / pops);
   for (int i = 0; i < PHASE_COUNT; ++i)
     printf(" %s=%.1f", names[i], i == PHASE_RERANK ? h[i] / queries : h[i] / pops);
-  printf("\n");
+  printf(" kept_per_pop=%.2f skipped_frac=%.4f matched_per_pop=%.2f\n",
+         h[PROFILE_KEPT] / pops, h[PROFILE_SKIPPED] / pops, h[PROFILE_MATCHED] / pops);
   printf("  %-10s %12s %7s\n", "phase", "cycles/pop", "share");
   for (int i = 0; i < PHASE_COUNT; ++i) {
     if (i == PHASE_RERANK) continue;
@@ -108,6 +115,7 @@ inline void reset_phase_clocks() {
 #else
 #define CLOCK_START(var)        ((void)0)
 #define CLOCK_ACCUM(var, phase) ((void)0)
+#define PROFILE_ADD(slot, n)    ((void)0)
 #define PROFILE_COUNT(slot)     ((void)0)
 inline void print_phase_clocks() {}
 inline void reset_phase_clocks() {}

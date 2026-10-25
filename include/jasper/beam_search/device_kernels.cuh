@@ -307,52 +307,18 @@ __device__ __forceinline__ uint32_t merge_path_search(
   return lo;
 }
 
-// Sort result_buffer[0..count) exploiting the fact that
-//   result_buffer[0 .. head_len)      is already sorted ascending,
-//   result_buffer[head_len .. count)  (≤ MAX_NEIGHBORS items) is unordered.
-//
-// Phase 1 — small CUB block sort over just the tail (TAIL_EPT items/thread).
-// Phase 2 — parallel merge-path merge of head (in result_buffer) with sorted
-//           tail (staged in `scratch`), writing back into result_buffer.
-//
-// `scratch` must have ≥ MAX_NEIGHBORS ENTRY_T slots in shared memory.
-template <typename INDEX_T, typename DISTANCE_T,
-          uint32_t BLOCK_SIZE, uint32_t MAX_SEARCH_WIDTH,
-          uint32_t MAX_NEIGHBORS, typename TailSortT>
-__device__ void merge_sort_tail(
-    ENTRY_T*  __restrict__ result_buffer,
-    uint32_t* __restrict__ result_buffer_count,
-    uint32_t               head_len,
-    ENTRY_T*  __restrict__ scratch,
-    typename TailSortT::TempStorage& tail_temp)
+// Phase 2 of merge_sort_tail, on its own: merge the sorted head
+// result_buffer[0 .. head_len) with the sorted tail staged in
+// scratch[0 .. tail_len), in place, by merge-path partitioning. The result
+// fills result_buffer[0 .. head_len + tail_len); the caller sets the count.
+template <uint32_t BLOCK_SIZE, uint32_t MAX_SEARCH_WIDTH>
+__device__ void merge_tail_into_head(
+    ENTRY_T*       __restrict__ result_buffer,
+    uint32_t                    head_len,
+    uint32_t                    tail_len,
+    const ENTRY_T* __restrict__ scratch)
 {
-  const uint32_t count    = result_buffer_count[0];
-  const uint32_t tail_len = (count > head_len) ? (count - head_len) : 0u;
-
-  // No new neighbors → head is already the answer.
-  if (tail_len == 0) { __syncthreads(); return; }
-
-  // ─── Phase 1: load + sort the tail in registers ──────────────────────
-  constexpr uint32_t TAIL_EPT =
-      (MAX_NEIGHBORS + BLOCK_SIZE - 1) / BLOCK_SIZE;
-  ENTRY_T tail_items[TAIL_EPT];
-
-  #pragma unroll
-  for (uint32_t i = 0; i < TAIL_EPT; ++i) {
-    const uint32_t lid = threadIdx.x * TAIL_EPT + i;
-    tail_items[i] = (lid < tail_len)
-        ? result_buffer[head_len + lid]
-        : empty_entry();                  // pad sorts to the end
-  }
-  TailSortT(tail_temp).Sort(tail_items, CustomPairLess());
-
-  // Stage sorted tail in scratch so the merge can address it randomly.
-  #pragma unroll
-  for (uint32_t i = 0; i < TAIL_EPT; ++i) {
-    const uint32_t lid = threadIdx.x * TAIL_EPT + i;
-    if (lid < tail_len) scratch[lid] = tail_items[i];
-  }
-  __syncthreads();
+  const uint32_t count = head_len + tail_len;
 
   // Degenerate: empty head → result_buffer is just the sorted tail.
   if (head_len == 0) {
@@ -405,6 +371,57 @@ __device__ void merge_sort_tail(
     result_buffer[diag_lo + k] = out;
   }
   __syncthreads();
+}
+
+// Sort result_buffer[0..count) exploiting the fact that
+//   result_buffer[0 .. head_len)      is already sorted ascending,
+//   result_buffer[head_len .. count)  (≤ MAX_NEIGHBORS items) is unordered.
+//
+// Phase 1 — small CUB block sort over just the tail (TAIL_EPT items/thread).
+// Phase 2 — parallel merge-path merge of head (in result_buffer) with sorted
+//           tail (staged in `scratch`), writing back into result_buffer.
+//
+// `scratch` must have ≥ MAX_NEIGHBORS ENTRY_T slots in shared memory.
+template <typename INDEX_T, typename DISTANCE_T,
+          uint32_t BLOCK_SIZE, uint32_t MAX_SEARCH_WIDTH,
+          uint32_t MAX_NEIGHBORS, typename TailSortT>
+__device__ void merge_sort_tail(
+    ENTRY_T*  __restrict__ result_buffer,
+    uint32_t* __restrict__ result_buffer_count,
+    uint32_t               head_len,
+    ENTRY_T*  __restrict__ scratch,
+    typename TailSortT::TempStorage& tail_temp)
+{
+  const uint32_t count    = result_buffer_count[0];
+  const uint32_t tail_len = (count > head_len) ? (count - head_len) : 0u;
+
+  // No new neighbors → head is already the answer.
+  if (tail_len == 0) { __syncthreads(); return; }
+
+  // ─── Phase 1: load + sort the tail in registers ──────────────────────
+  constexpr uint32_t TAIL_EPT =
+      (MAX_NEIGHBORS + BLOCK_SIZE - 1) / BLOCK_SIZE;
+  ENTRY_T tail_items[TAIL_EPT];
+
+  #pragma unroll
+  for (uint32_t i = 0; i < TAIL_EPT; ++i) {
+    const uint32_t lid = threadIdx.x * TAIL_EPT + i;
+    tail_items[i] = (lid < tail_len)
+        ? result_buffer[head_len + lid]
+        : empty_entry();                  // pad sorts to the end
+  }
+  TailSortT(tail_temp).Sort(tail_items, CustomPairLess());
+
+  // Stage sorted tail in scratch so the merge can address it randomly.
+  #pragma unroll
+  for (uint32_t i = 0; i < TAIL_EPT; ++i) {
+    const uint32_t lid = threadIdx.x * TAIL_EPT + i;
+    if (lid < tail_len) scratch[lid] = tail_items[i];
+  }
+  __syncthreads();
+
+  merge_tail_into_head<BLOCK_SIZE, MAX_SEARCH_WIDTH>(
+      result_buffer, head_len, tail_len, scratch);
 }
 
 }

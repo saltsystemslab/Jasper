@@ -70,6 +70,32 @@ struct beam_search_params {
   // beam_width + rerank entries, which is what picks MAX_SEARCH_WIDTH.
   // Directional kernel only; a runtime knob like adaptive_gamma.
   uint32_t                    rerank          = 0;
+
+  // Candidate-list maintenance variants, as list_opt bits (below). 0 = the
+  // reference path. Directional kernel only; a runtime knob so one build can
+  // A/B them and check each against the reference.
+  uint32_t                    list_opts       = 0;
+};
+
+// Cheaper candidate-list maintenance for the directional kernel (see
+// list_ops.cuh), one bit each in beam_search_params::list_opts. Every one is
+// exact: the list after each pop, and so every pop, estimate and result, is
+// the reference's. LIST_FUSED_MERGE can differ only where the reference
+// misorders entries with equal estimates (list_ops.cuh says how).
+enum list_opt : uint32_t {
+  // Once the list is full, drop new neighbors ranked after its last entry:
+  // the clip would remove them anyway. A pop whose neighbors are all dropped
+  // skips the duplicate check, sort, merge, dedup and clip.
+  LIST_PREFILTER   = 1u << 0,
+  // Sort only the new entries not dropped, by rank (one thread each counts
+  // the ones ranked before it), instead of a CUB block sort over all 64
+  // slots, then the reference merge.
+  LIST_RANK_SORT   = 1u << 1,
+  // Merge, dedup and clip as one pass that moves each entry straight to its
+  // final position, touching only the part of the list that changes. Sorts
+  // the new entries with the rank sort whether or not LIST_RANK_SORT is set.
+  LIST_FUSED_MERGE = 1u << 2,
+  LIST_ALL         = LIST_PREFILTER | LIST_RANK_SORT | LIST_FUSED_MERGE,
 };
 
 template <typename GRAPH_CFG>
