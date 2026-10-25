@@ -11,8 +11,8 @@
 #SBATCH --error=list_opts_%j.err
 #SBATCH --time=08:00:00
 #
-# The candidate-list maintenance variants of the directional kernel
-# (list_ops.cuh), one list_opt bit each, against the reference (0):
+# The candidate-list maintenance variants of the directional and conventional
+# kernels (list_ops.cuh), one list_opt bit each, against the reference (0):
 #
 #   1  LIST_PREFILTER    drop new entries ranked past a full list's last one;
 #                        a pop that keeps none skips the rest of the list work
@@ -53,7 +53,7 @@ set -euo pipefail
 
 # ── Tunables ───────────────────────────────────────────────────────────────
 DATASETS="${DATASETS:-deep10M sra50}"
-METHODS="${METHODS:-lsh rabitq}"
+METHODS="${METHODS:-conventional lsh rabitq}"
 K_RANKS="${K_RANKS:-16}"
 K="${K:-10 100}"
 MASKS="${MASKS:-1 2 4 7}"
@@ -64,6 +64,7 @@ WIDTHS="${WIDTHS:-63 191 447 959 1983 4031}"   # each compiled width's top
 GAMMAS="${GAMMAS:-0.1}"                        # adaptive points (check only), at 447 and 1983
 RERANK_MULT="${RERANK_MULT:-4}"                # re-rank points (check only): M = mult x k at 447 and 1983
 PASSES="${PASSES:-3}"
+QUERY_CHUNK_host_conventional="${QUERY_CHUNK_host_conventional:-1000}"  # its best on host (bench_adaptive_termination)
 LIMIT="${LIMIT:-8192}"
 R_INT="${R_INT:-64}"
 R_FIN="${R_FIN:-64}"
@@ -98,15 +99,17 @@ summarize() {
 }
 if [ "$SUMMARY_ONLY" != "0" ]; then summarize; exit 0; fi
 
-# Points for search k: beam at every width that fits (list + 64 < 4096, the
-# wide build; width >= k). With extras (check step): γ points and re-rank
-# points at 447 and 1983 too.
-points_for() {                         # $1 = k, $2 = with_extras (0/1)
-  local k=$1 w g rr out=""
+# Points for search k and method: beam at every width that fits (list + 64 <
+# 4096 for lsh / rabitq in the wide build, < 2048 for conventional; width >=
+# k). With extras (check step, directional only): γ points and re-rank points
+# at 447 and 1983 too.
+points_for() {                         # $1 = k, $2 = with_extras (0/1), $3 = method
+  local k=$1 w g rr out="" max=4096
+  [ "$3" = conventional ] && max=2048
   for w in $WIDTHS; do
-    if [ "$w" -ge "$k" ] && [ $(( w + 64 )) -lt 4096 ]; then out="$out $w:$LIMIT"; fi
+    if [ "$w" -ge "$k" ] && [ $(( w + 64 )) -lt "$max" ]; then out="$out $w:$LIMIT"; fi
   done
-  if [ "$2" = 1 ]; then
+  if [ "$2" = 1 ] && [ "$3" != conventional ]; then
     rr=$(( RERANK_MULT * k ))
     for w in 447 1983; do
       [ "$w" -ge "$k" ] || continue
@@ -126,8 +129,8 @@ echo "  methods:    $METHODS    k_ranks: $K_RANKS    k: $K"
 echo "  masks:      $MASKS  (vs 0; 1 prefilter, 2 rank sort, 4 fused merge)"
 echo "  steps:      $STEPS"
 for k in $K; do
-  echo "  ${k}@${k} points:  qps/phases: $(points_for "$k" 0)"
-  echo "               check: $(points_for "$k" 1)"
+  echo "  ${k}@${k} points:  qps/phases: $(points_for "$k" 0 lsh)  (conventional: up to 1983)"
+  echo "               check: $(points_for "$k" 1 lsh)"
 done
 echo "  qps:        $PASSES passes, placements $PLACEMENTS    phases: $PHASE_PLACEMENTS"
 echo "  out:        $OUT"
@@ -138,7 +141,7 @@ for ds in $DATASETS; do
   printf "  %-10s dim=%-5s index=%s%s\n" "$ds" "$dim" "$idx" "$([ -s "$idx" ] && echo '' || echo ' (MISSING)')"
 done
 for m in $METHODS; do
-  case "$m" in lsh|rabitq|pq) ;; *) echo "list variants are directional-only: $m" >&2; exit 2;; esac
+  case "$m" in conventional|lsh|rabitq|pq) ;; *) echo "unknown method: $m" >&2; exit 2;; esac
 done
 if [ "$DRY_RUN" != "0" ]; then echo; echo "DRY_RUN set — nothing run."; exit 0; fi
 
@@ -174,14 +177,18 @@ for ds in $DATASETS; do
   idx=$(index_of "$ds")
   [ -s "$idx" ] || { echo "[$(stamp)] $ds: no index at $idx — skipping"; continue; }
   for m in $METHODS; do
+    # run_query picks the search by flag (conventional is the default path);
+    # distortion_test needs a k_ranks to pick a config, which conventional ignores.
+    if [ "$m" = conventional ]; then qps_mode=(); pops_k=4
+    else qps_mode=("--$m" --k_ranks "$K_RANKS"); pops_k=$K_RANKS; fi
     for k in $K; do
       case " $STEPS " in *" check "*)
-        pts=$(points_for "$k" 1)
+        pts=$(points_for "$k" 1 "$m")
         for mask in $MASKS; do
           name="${ds}_${m}_top${k}_m${mask}"
           echo "[$(stamp)] check $ds $m ${k}@${k} mask $mask"
           build_wide/bin/distortion_test -i "$idx" --dim "$dim" -t "$dtype" -n "$R_FIN" -k "$k" \
-              -m "$m" -r "$K_RANKS" -q "$q" -g "$gt" \
+              -m "$m" -r "$pops_k" -q "$q" -g "$gt" \
               --pops "$RAW/$name.pops.csv" --check_list_opts "$mask" -b $pts \
               >| "$RAW/$name.check.log" 2>&1 \
             || echo "  FAILED ($name) — see $RAW/$name.check.log"
@@ -189,16 +196,17 @@ for ds in $DATASETS; do
                "$(grep -c 'result=DIFFERENT' "$RAW/$name.check.log" || true) different"
         done;;
       esac
-      pts=$(points_for "$k" 0)
+      pts=$(points_for "$k" 0 "$m")
       all=""; for _ in $(seq "$PASSES"); do all="$all $pts"; done
       case " $STEPS " in *" qps "*)
         for place in $PLACEMENTS; do
           host_arg=(); [ "$place" = host ] && host_arg=(--on_host)
+          cvar="QUERY_CHUNK_${place}_${m}"; chunk="${!cvar:-0}"
           name="${ds}_${m}_top${k}_${place}"
           echo "[$(stamp)] qps $ds $m ${k}@${k} on $place"
           build_wide/bin/run_query -i "$idx" --dim "$dim" -d l2 -t "$dtype" -n "$R_FIN" -k "$k" \
-              "--$m" --k_ranks "$K_RANKS" ${host_arg[@]+"${host_arg[@]}"} \
-              --list_opts "$ALL_OPTS" -q "$q" -g "$gt" --beam_limits $all \
+              ${qps_mode[@]+"${qps_mode[@]}"} ${host_arg[@]+"${host_arg[@]}"} \
+              --query_chunk "$chunk" --list_opts "$ALL_OPTS" -q "$q" -g "$gt" --beam_limits $all \
               >| "$RAW/$name.qps.log" 2>&1 \
             || echo "  FAILED ($name) — see $RAW/$name.qps.log"
         done;;
@@ -206,11 +214,12 @@ for ds in $DATASETS; do
       case " $STEPS " in *" phases "*)
         for place in $PHASE_PLACEMENTS; do
           host_arg=(); [ "$place" = host ] && host_arg=(--on_host)
+          cvar="QUERY_CHUNK_${place}_${m}"; chunk="${!cvar:-0}"
           name="${ds}_${m}_top${k}_${place}"
           echo "[$(stamp)] phases $ds $m ${k}@${k} on $place"
           build_prof/bin/run_query -i "$idx" --dim "$dim" -d l2 -t "$dtype" -n "$R_FIN" -k "$k" \
-              "--$m" --k_ranks "$K_RANKS" ${host_arg[@]+"${host_arg[@]}"} \
-              --list_opts "$ALL_OPTS" -q "$q" -g "$gt" --beam_limits $pts $pts \
+              ${qps_mode[@]+"${qps_mode[@]}"} ${host_arg[@]+"${host_arg[@]}"} \
+              --query_chunk "$chunk" --list_opts "$ALL_OPTS" -q "$q" -g "$gt" --beam_limits $pts $pts \
               >| "$RAW/$name.phase.log" 2>&1 \
             || echo "  FAILED ($name) — see $RAW/$name.phase.log"
         done;;
@@ -222,3 +231,14 @@ done
 summarize
 echo
 echo "=== done: $(stamp) ==="
+# Fail the job if any variant differed from the reference or a check did not
+# run, so a dependent job (sbatch --dependency=afterok:<id>) does not start.
+case " $STEPS " in *" check "*)
+  bad=$(cat /dev/null "$RAW"/*.check.log 2>/dev/null | grep -c 'result=DIFFERENT' || true)
+  failed=$( { grep -L 'list_check:' "$RAW"/*.check.log 2>/dev/null || true; } | wc -l | tr -d ' ')
+  if [ "${bad:-0}" != 0 ] || [ "${failed:-0}" != 0 ]; then
+    echo "CHECK FAILED: $bad point(s) differ, $failed check log(s) without results"
+    exit 1
+  fi
+  echo "check: every variant identical to the reference";;
+esac

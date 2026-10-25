@@ -13,6 +13,7 @@
 #include "jasper/beam_search/entry.cuh"
 #include "jasper/beam_search/device_kernels.cuh"
 #include "jasper/beam_search/beam_search_common.cuh"  // phase clocks
+#include "jasper/beam_search/list_ops.cuh"
 #include "jasper/distance/distance.cuh"
 
 #include "assert.h"
@@ -39,7 +40,8 @@ __global__ void beam_search_kernel(
     uint32_t beam_width,
     uint32_t limit,
     bool get_visited,
-    uint32_t max_result_size) {
+    uint32_t max_result_size,
+    uint32_t list_opts) {
 
   #ifdef _CLK_BREAKDOWN
     std::uint64_t clk_init = 0;
@@ -103,6 +105,14 @@ __global__ void beam_search_kernel(
     typename cub::BlockScan<uint32_t, BLOCK_SIZE>::TempStorage scan_storage;
   };
   __shared__ TempStorage temp_storage;
+
+  // Candidate-list variants (list_opts; list_ops.cuh), as in the directional
+  // kernel; the new entries are staged in new_scratch.
+  const bool opt_prefilter = list_opts & LIST_PREFILTER;
+  const bool opt_rank_sort = list_opts & LIST_RANK_SORT;
+  const bool opt_fused     = list_opts & LIST_FUSED_MERGE;
+  __shared__ ENTRY_T  new_scratch[GRAPH_CFG::n_neighbors];
+  __shared__ uint32_t s_kept;
 
   // initialize shared memory to default (invalid) key
   for (unsigned i = threadIdx.x; i < result_buffer_size; i += blockDim.x) {
@@ -194,12 +204,67 @@ __global__ void beam_search_kernel(
     _CLK_REC(clk_populate_distances);
     CLOCK_ACCUM(t_estimate, PHASE_ESTIMATE);
 
+    // The new entries are result_buffer[offset .. offset + n_new), now with
+    // exact distances.
+    const uint32_t n_new = result_buffer_count[0] - offset;
+
+    // LIST_PREFILTER: once the list is full, a new entry ranked after its
+    // last entry cannot survive the clip (here every listed entry ranked
+    // before it stays), so it is dropped; if none is left the list is
+    // unchanged and the sort, dedup and clip are skipped.
+    if (opt_prefilter) {
+      CLOCK_START(t_filter);
+      if (threadIdx.x == 0) s_kept = 0;
+      __syncthreads();
+      const bool    full = offset >= beam_width;
+      const ENTRY_T last = full ? result_buffer[beam_width - 1] : empty_entry();
+      uint32_t kept = 0;
+      for (uint32_t j = threadIdx.x; j < n_new; j += BLOCK_SIZE) {
+        const ENTRY_T e = result_buffer[offset + j];
+        if (full && !CustomPairLess{}(e, last))
+          result_buffer[offset + j] = set_index(e, DROPPED_INDEX);
+        else
+          ++kept;
+      }
+      if (kept) atomicAdd(&s_kept, kept);
+      __syncthreads();
+      const uint32_t n_kept = s_kept;
+      PROFILE_ADD(PROFILE_KEPT, n_kept);
+      CLOCK_ACCUM(t_filter, PHASE_FILTER);
+      if (n_kept == 0) {
+        PROFILE_COUNT(PROFILE_SKIPPED);
+        if (threadIdx.x == 0) result_buffer_count[0] = offset;
+        __syncthreads();
+        continue;
+      }
+    }
+
     // sort the result buffer
     CLOCK_START(t_sort);
-    _CLK_START();
-    merge_sort<INDEX_T, DISTANCE_T, BLOCK_SIZE, MAX_SEARCH_WIDTH, BlockMergeSortT>(
-        result_buffer, result_buffer_count, temp_storage.sort_storage);
-    _CLK_REC(clk_merge_sort);
+    if (opt_fused || opt_rank_sort) {
+      // Drop new copies of listed nodes and rank-sort the rest; then either
+      // one pass merges and clips (LIST_FUSED_MERGE), or the reference merge,
+      // dedup and clip follow (LIST_RANK_SORT).
+      const uint32_t n_kept = rank_sort_new_exact<BLOCK_SIZE, GRAPH_CFG::n_neighbors>(
+          result_buffer, offset, n_new, new_scratch);
+      if (opt_fused) {
+        fused_merge_clip<BLOCK_SIZE, MAX_SEARCH_WIDTH, GRAPH_CFG::n_neighbors>(
+            result_buffer, result_buffer_count, offset,
+            new_scratch, n_kept, nullptr, 0, beam_width);
+        CLOCK_ACCUM(t_sort, PHASE_SORT);
+        continue;
+      }
+      if (n_kept > 0)
+        merge_tail_into_head<BLOCK_SIZE, MAX_SEARCH_WIDTH>(
+            result_buffer, offset, n_kept, new_scratch);
+      if (threadIdx.x == 0) result_buffer_count[0] = offset + n_kept;
+      __syncthreads();
+    } else {
+      _CLK_START();
+      merge_sort<INDEX_T, DISTANCE_T, BLOCK_SIZE, MAX_SEARCH_WIDTH, BlockMergeSortT>(
+          result_buffer, result_buffer_count, temp_storage.sort_storage);
+      _CLK_REC(clk_merge_sort);
+    }
     CLOCK_ACCUM(t_sort, PHASE_SORT);
 
     CLOCK_START(t_dedup);
@@ -340,7 +405,8 @@ beam_search(const beam_search_params<Cfg>& p, cudaStream_t stream = 0) {
         p.beam_width,
         p.limit,
         p.get_visited,
-        p.max_result_size);
+        p.max_result_size,
+        p.list_opts);
 
   cudaError_t err = cudaStreamSynchronize(stream);
   if (err != cudaSuccess) {
@@ -394,7 +460,8 @@ __host__ void beam_search(
         p.beam_width,
         p.limit,
         p.get_visited,
-        p.max_result_size);
+        p.max_result_size,
+        p.list_opts);
 
   cudaError_t err = cudaStreamSynchronize(stream);
   if (err != cudaSuccess) {

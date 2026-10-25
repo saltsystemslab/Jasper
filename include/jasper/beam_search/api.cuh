@@ -54,7 +54,7 @@ struct search_params {
   // search stops, see beam_search_params::rerank. Directional searches only.
   uint32_t rerank           = 0;
   // Candidate-list maintenance variants (list_opt bits, config.cuh); 0 = the
-  // reference. Directional searches only.
+  // reference. Every search, conventional included.
   uint32_t list_opts        = 0;
 };
 
@@ -81,6 +81,7 @@ beam_search_result<GRAPH_CFG> search_impl(
     .limit           = params.limit,
     .get_visited     = params.get_visited,
     .max_result_size = params.max_result_size,
+    .list_opts       = params.list_opts,
   };
   return beam_search<Cfg>(bp);
 }
@@ -111,10 +112,6 @@ beam_search_result<GRAPH_CFG> search(
   if (params.rerank > 0)
     throw std::invalid_argument(
         "rerank is implemented for directional_search / pq_search / "
-        "rq_search only, not for conventional search()");
-  if (params.list_opts != 0)
-    throw std::invalid_argument(
-        "list_opts are implemented for directional_search / pq_search / "
         "rq_search only, not for conventional search()");
   const uint32_t bw = params.beam_width;
   if      (bw + 64 < 128)  return search_dispatch_width<GRAPH_CFG, BLOCK_SIZE, 128,  TILE_SIZE>(g, d_queries, params);

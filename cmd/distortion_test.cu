@@ -872,10 +872,6 @@ int main(int argc, char** argv) {
     std::cerr << "Error: " << e.what() << std::endl;
     return 1;
   }
-  if (o.method == Method::CONV && (o.list_opts != 0 || o.check_list_opts != 0)) {
-    std::cerr << "Error: --list_opts / --check_list_opts are directional-only" << std::endl;
-    return 1;
-  }
   if (o.check_list_opts != 0 && o.pops_out.empty()) {
     std::cerr << "Error: --check_list_opts needs --pops (it checks those searches)" << std::endl;
     return 1;

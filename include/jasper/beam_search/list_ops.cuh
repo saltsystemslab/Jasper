@@ -40,6 +40,13 @@
 // Every variant leaves the list as the reference does after each pop, so a
 // search with any list_opts makes the same pops and returns the same results;
 // distortion_test --check_list_opts compares them query by query.
+//
+// Conventional search (beam_search.cuh) takes the same bits. Its distances
+// are exact and it has no step 6b: duplicates sort next to the listed copy, so
+// its reference sorts the whole list and dedup_results removes them. Its
+// variants drop a new copy of a listed node by a binary search for its exact
+// key instead (rank_sort_new_exact), then share the prefilter and
+// fused_merge_clip.
 #pragma once
 
 #include <cstdint>
@@ -118,6 +125,62 @@ __device__ uint32_t rank_sort_new_entries(const ENTRY_T* __restrict__ result_buf
   else if (sorts_drop) drops[rank]   = d;
   __syncthreads();
   return n;
+}
+
+// Conventional search's counterpart of rank_sort_new_entries. There every
+// distance is exact, so a new copy of a listed node carries the listed entry's
+// key exactly, and the reference (a stable sort of the whole list, then
+// dedup_results) keeps the listed entry, visited flag and all, and drops the
+// copy; copies among the new entries are identical, and one of them stays. So
+// this drops new entries that are DROPPED (the prefilter) or whose key a
+// binary search finds in the list (result_buffer[0 .. offset), sorted),
+// gathers the rest into scratch, and rank-sorts them keeping one of each key.
+// Every thread must call it; returns the count kept.
+template <uint32_t BLOCK_SIZE, uint32_t MAX_NEIGHBORS>
+__device__ uint32_t rank_sort_new_exact(const ENTRY_T* __restrict__ result_buffer,
+                                        uint32_t offset, uint32_t n_new,
+                                        ENTRY_T* __restrict__ scratch) {
+  static_assert(BLOCK_SIZE >= MAX_NEIGHBORS, "one thread per new entry");
+  __shared__ uint32_t s_n, s_kept;
+  __shared__ uint8_t  s_first[MAX_NEIGHBORS];
+  CustomPairLess less;
+  if (threadIdx.x == 0) { s_n = 0; s_kept = 0; }
+  __syncthreads();
+  for (uint32_t j = threadIdx.x; j < n_new; j += BLOCK_SIZE) {
+    const ENTRY_T e = result_buffer[offset + j];
+    if (get_index(e) == DROPPED_INDEX) continue;
+    uint32_t lo = 0, hi = offset;
+    while (lo < hi) {
+      const uint32_t m = (lo + hi) >> 1;
+      if (less(result_buffer[m], e)) lo = m + 1; else hi = m;
+    }
+    if (lo < offset && !less(e, result_buffer[lo])) continue;  // already listed
+    scratch[atomicAdd(&s_n, 1u)] = e;
+  }
+  __syncthreads();
+
+  const uint32_t n = s_n;
+  const uint32_t t = threadIdx.x;
+  ENTRY_T e = 0;
+  bool first = false;
+  if (t < n) {
+    e = scratch[t];
+    first = true;
+    for (uint32_t m = 0; m < t; ++m) {
+      const ENTRY_T o = scratch[m];
+      if (!less(o, e) && !less(e, o)) { first = false; break; }
+    }
+    s_first[t] = first;
+    if (first) atomicAdd(&s_kept, 1u);
+  }
+  __syncthreads();
+  uint32_t rank = 0;
+  if (first)
+    for (uint32_t m = 0; m < n; ++m) rank += s_first[m] && less(scratch[m], e);
+  __syncthreads();
+  if (first) scratch[rank] = e;
+  __syncthreads();
+  return s_kept;
 }
 
 // LIST_FUSED_MERGE: the list is result_buffer[0 .. head_len), sorted, with the

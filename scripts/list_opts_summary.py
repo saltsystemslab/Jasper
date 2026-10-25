@@ -27,8 +27,8 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-CHECK_NAME = re.compile(r"^(?P<ds>.+?)_(?P<m>lsh|rabitq|pq)_top(?P<k>\d+)_m(?P<mask>\d+)\.check\.log$")
-RUN_NAME = re.compile(r"^(?P<ds>.+?)_(?P<m>lsh|rabitq|pq)_top(?P<k>\d+)_(?P<place>device|host)"
+CHECK_NAME = re.compile(r"^(?P<ds>.+?)_(?P<m>conventional|lsh|rabitq|pq)_top(?P<k>\d+)_m(?P<mask>\d+)\.check\.log$")
+RUN_NAME = re.compile(r"^(?P<ds>.+?)_(?P<m>conventional|lsh|rabitq|pq)_top(?P<k>\d+)_(?P<place>device|host)"
                       r"\.(?P<kind>qps|phase)\.log$")
 CHECK_RE = re.compile(r"list_check: (?P<point>beam_width=\d+ limit=\d+(?: gamma=\S+)?(?: rerank=\d+)?) "
                       r"base=\d+ variant=\d+ queries=(?P<q>\d+) differ=(?P<d>\d+) "

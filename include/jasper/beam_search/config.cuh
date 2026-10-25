@@ -72,13 +72,13 @@ struct beam_search_params {
   uint32_t                    rerank          = 0;
 
   // Candidate-list maintenance variants, as list_opt bits (below). 0 = the
-  // reference path. Directional kernel only; a runtime knob so one build can
-  // A/B them and check each against the reference.
+  // reference path. Both kernels; a runtime knob so one build can A/B them
+  // and check each against the reference.
   uint32_t                    list_opts       = 0;
 };
 
-// Cheaper candidate-list maintenance for the directional kernel (see
-// list_ops.cuh), one bit each in beam_search_params::list_opts. Every one is
+// Cheaper candidate-list maintenance for the directional and conventional
+// kernels (see list_ops.cuh), one bit each in beam_search_params::list_opts. Every one is
 // exact: the list after each pop, and so every pop, estimate and result, is
 // the reference's. LIST_FUSED_MERGE can differ only where the reference
 // misorders entries with equal estimates (list_ops.cuh says how).

@@ -274,6 +274,7 @@ void run_search_round(jasper::graph<GraphCfg>& graph,
     .limit      = limit,
     .get_visited = false,
     .max_result_size = limit + 1,  // also a pop cap without a visited log; let limit be the one cap
+    .list_opts = g_list_opts,
   };
 
   cudaDeviceSynchronize();
@@ -292,8 +293,10 @@ void run_search_round(jasper::graph<GraphCfg>& graph,
   if (print_throughput) {
     float throughput = (n_queries * 1000.0f) / duration_ms;
     std::cout << "  beam_width=" << beam_width
-              << " limit=" << limit
-              << " duration=" << std::fixed << std::setprecision(2) << duration_ms << "ms"
+              << " limit=" << limit;
+    if (g_list_opts_set.size() > 1)
+      std::cout << " list_opts=" << g_list_opts;
+    std::cout << " duration=" << std::fixed << std::setprecision(2) << duration_ms << "ms"
               << " throughput=" << std::setprecision(0) << throughput << " QPS"
               << std::endl;
   }
@@ -1222,6 +1225,7 @@ void load_and_bench(const std::string& index_path,
   // Warmup
   std::cout << "\nWarmup..." << std::endl;
   const search_point& warmup = search_points.front();
+  g_list_opts = g_list_opts_set.front();
   run_search_round<GraphCfg, DataT>(
     graph, d_queries, n_queries, dim, k,
     warmup.beam_width, warmup.limit, nullptr, false);
@@ -1229,9 +1233,12 @@ void load_and_bench(const std::string& index_path,
   // Benchmark rounds
   std::cout << "\n=== Benchmark (k=" << k << ") ===" << std::endl;
   for (const search_point& pt : search_points) {
-    run_search_round<GraphCfg, DataT>(
-      graph, d_queries, n_queries, dim, k,
-      pt.beam_width, pt.limit, has_gt ? &gt : nullptr, true);
+    for (uint32_t opts : g_list_opts_set) {
+      g_list_opts = opts;
+      run_search_round<GraphCfg, DataT>(
+        graph, d_queries, n_queries, dim, k,
+        pt.beam_width, pt.limit, has_gt ? &gt : nullptr, true);
+    }
   }
 
   // Cleanup
@@ -1371,7 +1378,7 @@ int main(int argc, char** argv) {
 
   program.add_argument("--list_opts")
     .default_value(std::string{"0"})
-    .help("Candidate-list variants for directional searches, as bits: 1 prefilter, "
+    .help("Candidate-list variants for every search, as bits: 1 prefilter, "
           "2 rank sort, 4 fused merge (config.cuh list_opt); 0 = reference. A "
           "comma-separated set (e.g. 0,1,7) runs each at every point.");
 

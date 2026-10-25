@@ -77,6 +77,12 @@
 # points whose list lands in the 4096 width, for a quick check of whether the
 # recall ceiling moves (cells left with no points are skipped).
 #
+# ── List maintenance ───────────────────────────────────────────────────────
+# LIST_OPTS passes --list_opts to every search of every method, conventional
+# included, so both sides of the comparison use the same candidate-list code
+# (list_ops.cuh). 7 = prefilter + rank sort + fused merge, checked exact
+# against 0 by sbatch/bench_list_opts.sbatch.
+#
 # ── Placements ─────────────────────────────────────────────────────────────
 #   device   the graph is resident on the card
 #   host     the graph lives in pinned host memory (--on_host), so every
@@ -184,6 +190,7 @@ WIDE_TIER_BLOCK="${WIDE_TIER_BLOCK:-256}" # its block size; 0 = the other widths
 WIDE_WIDTHS="${WIDE_WIDTHS:-2380 2856 3427 4031}"
 WIDE_CAPACITIES="${WIDE_CAPACITIES-4031}"
 ONLY_WIDE="${ONLY_WIDE:-0}"            # 1 = only points whose list lands in the 4096 width
+LIST_OPTS="${LIST_OPTS:-0}"            # list_opt bits for every search, every method (7 = all; see bench_list_opts)
 BUILD_DIR="${BUILD_DIR:-build$([ "$WIDE_TIER" != 1 ] || echo "_wide$([ "$WIDE_TIER_BLOCK" = 256 ] || echo "$WIDE_TIER_BLOCK")")}"
 DRY_RUN="${DRY_RUN:-0}"
 SUMMARY_ONLY="${SUMMARY_ONLY:-0}"
@@ -363,6 +370,7 @@ echo "  limit:      $LIMIT pops    qps passes: $REPEATS    query batch: $([ "$QU
 echo "  chunks:     device $QUERY_CHUNK_device, host $QUERY_CHUNK_host (0 = all at once; per-method QUERY_CHUNK_<placement>_<method> overrides)"
 echo "  build:      $BUILD_TAG -> $INDEX_DIR"
 echo "  wide tier:  $([ "$WIDE_TIER" = 1 ] && echo "on (lsh, rabitq; block $([ "$WIDE_TIER_BLOCK" = 0 ] && echo 128 || echo "$WIDE_TIER_BLOCK")), widths $WIDE_WIDTHS, capacities ${WIDE_CAPACITIES:-none}$([ "$ONLY_WIDE" = 1 ] && echo ', ONLY those points')" || echo off)    binaries: $BUILD_DIR"
+echo "  list_opts:  $LIST_OPTS (0 = reference list maintenance; 7 = prefilter + rank sort + fused merge)"
 echo "  placements: $PLACEMENTS"
 echo "  steps:      $([ "$RUN_QPS" = 1 ] && echo 'run_query ')$([ "$RUN_POPS" = 1 ] && echo 'distortion_test --pops')"
 echo "  graph:      R_int=$R_INT R_fin=$R_FIN dist=l2"
@@ -507,7 +515,7 @@ for ds in $DATASETS; do
         # same way distortion_test builds them below.
         "$BUILD_DIR"/bin/run_query -i "$idx" --dim "$dim" -d l2 -t "$dtype" -n "$R_FIN" -k "$topk" \
             ${qps_mode[@]+"${qps_mode[@]}"} ${host_arg[@]+"${host_arg[@]}"} \
-            --query_chunk "$chunk" \
+            --query_chunk "$chunk" --list_opts "$LIST_OPTS" \
             -q "$qq" -g "$qg" --beam_limits $QPS_POINTS >| "$RAW/$name.qps.log" 2>&1 \
           || echo "  QPS FAILED ($name) — see $RAW/$name.qps.log"
         echo "  qps:  $(grep -c 'throughput=' "$RAW/$name.qps.log" || true) timed searches -> raw/$name.qps.log"
@@ -516,6 +524,7 @@ for ds in $DATASETS; do
       if [ "$RUN_POPS" = "1" ]; then
         "$BUILD_DIR"/bin/distortion_test -i "$idx" --dim "$dim" -t "$dtype" -n "$R_FIN" -k "$topk" \
             -m "$m" -r "$pops_k" ${host_arg[@]+"${host_arg[@]}"} \
+            --list_opts "$LIST_OPTS" \
             -q "$q" -g "$gt" --pops "$RAW/$name.pops.csv" -b $POINTS >| "$RAW/$name.pops.log" 2>&1 \
           || echo "  POPS FAILED ($name) — see $RAW/$name.pops.log"
         echo "  pops: $(grep -c 'mean_pops=' "$RAW/$name.pops.log" || true) logged searches -> raw/$name.pops.csv"
