@@ -15,64 +15,101 @@
 namespace jasper {
 
 // ── Clock-based phase profiling ───────────────────────────────────────────────
+// With JASPER_PROFILE_CLOCKS, thread 0 of every JASPER_PROFILE_STRIDE-th block
+// (one query in 64 by default) adds each phase's clock64() cycles to
+// g_phase_clocks, and counts its pops and queries, so the report is cycles
+// per pop per phase, averaged over a sample of queries rather than one.
+// Cycles are a block's elapsed time, stalls included: with the graph in host
+// memory, the PCIe round trip lands in the phase that issues the reads.
+// CLOCK_ACCUM ends with a barrier first (in every block, sampled or not), so
+// a phase is charged until the whole block is done with it, not just thread
+// 0; it must sit where the whole block reaches it. That perturbs the timing a
+// little, so profile builds are for the breakdown, not for QPS.
 #if defined(JASPER_PROFILE_CLOCKS)
 
+#ifndef JASPER_PROFILE_STRIDE
+#define JASPER_PROFILE_STRIDE 64
+#endif
+
 enum PhaseIdx : int {
-  PHASE_POP      = 0,
-  PHASE_EXACT    = 1,
-  PHASE_FRONTIER = 2,
-  PHASE_EXPAND   = 3,
-  PHASE_ESTIMATE = 4,
-  PHASE_SORT     = 5,
-  PHASE_DEDUP    = 6,
-  PHASE_CLIP     = 7,
-  PHASE_COUNT    = 8,
+  PHASE_POP      = 0,   // pick the next candidate (+ adaptive test, visited mark)
+  PHASE_EXACT    = 1,   // directional: read u's edges, codes and vector; exact d(q,u)
+  PHASE_FRONTIER = 2,   // insert u into the top-k (+ visited log)
+  PHASE_EXPAND   = 3,   // append u's neighbors to the list
+  PHASE_ESTIMATE = 4,   // neighbor distances: estimates, or exact for conventional
+  PHASE_UNIQUE   = 5,   // directional step 6b: drop copies of nodes already listed
+  PHASE_SORT     = 6,   // merge (directional) / sort (conventional) the list
+  PHASE_DEDUP    = 7,   // dedup_results
+  PHASE_CLIP     = 8,   // clip_k
+  PHASE_RERANK   = 9,   // after the loop, once per query: the re-rank
+  PHASE_COUNT    = 10,
+  PROFILE_POPS    = PHASE_COUNT,      // pops in sampled blocks
+  PROFILE_QUERIES = PHASE_COUNT + 1,  // sampled blocks
+  PROFILE_SLOTS   = PHASE_COUNT + 2,
 };
 
-extern __device__ uint64_t g_phase_clocks[PHASE_COUNT];
+extern __device__ uint64_t g_phase_clocks[PROFILE_SLOTS];
+
+#define PROFILE_SAMPLED() (blockIdx.x % JASPER_PROFILE_STRIDE == 0 && threadIdx.x == 0)
 
 #define CLOCK_START(var) \
   uint64_t var = 0; \
-  if (blockIdx.x == 0 && threadIdx.x == 0) { var = clock64(); }
+  if (PROFILE_SAMPLED()) { var = clock64(); }
 
 #define CLOCK_ACCUM(var, phase) \
-  if (blockIdx.x == 0 && threadIdx.x == 0) { \
+  __syncthreads(); \
+  if (PROFILE_SAMPLED()) { \
     uint64_t _end = clock64(); \
     atomicAdd(reinterpret_cast<unsigned long long*>(&g_phase_clocks[phase]), \
               static_cast<unsigned long long>(_end - (var))); \
   }
 
-inline void print_phase_clocks(double sm_clock_ghz = 1.98) {
-  uint64_t h_clocks[PHASE_COUNT];
-  cudaMemcpyFromSymbol(h_clocks, g_phase_clocks, sizeof(uint64_t) * PHASE_COUNT);
-  const char* names[PHASE_COUNT] = {
-    "pop_candidate", "exact_distance", "frontier_insert",
-    "expand_neighbors", "estimate_distances",
-    "sort_and_merge", "dedup_results", "clip_k"
-  };
-  uint64_t total = 0;
-  for (int i = 0; i < PHASE_COUNT; ++i) total += h_clocks[i];
-  printf("\n=== Phase clock breakdown (block 0) ===\n");
-  for (int i = 0; i < PHASE_COUNT; ++i) {
-    double pct = total > 0 ? 100.0 * h_clocks[i] / total : 0.0;
-    double ms  = h_clocks[i] / (sm_clock_ghz * 1e6);
-    printf("  %-22s %12llu cycles  %6.1f%%  %.3f ms\n",
-           names[i], (unsigned long long)h_clocks[i], pct, ms);
+#define PROFILE_COUNT(slot) \
+  if (PROFILE_SAMPLED()) { \
+    atomicAdd(reinterpret_cast<unsigned long long*>(&g_phase_clocks[slot]), 1ull); \
   }
-  printf("  %-22s %12llu cycles  100.0%%\n",
-         "TOTAL", (unsigned long long)total);
+
+// One machine-readable line, then a table: cycles per pop for each phase of
+// the loop, and the re-rank in cycles per query.
+inline void print_phase_clocks() {
+  uint64_t h[PROFILE_SLOTS];
+  cudaMemcpyFromSymbol(h, g_phase_clocks, sizeof(h));
+  const char* names[PHASE_COUNT] = {
+    "pop", "exact", "frontier", "expand", "estimate",
+    "unique", "sort", "dedup", "clip", "rerank"
+  };
+  const double pops    = h[PROFILE_POPS] ? double(h[PROFILE_POPS]) : 1.0;
+  const double queries = h[PROFILE_QUERIES] ? double(h[PROFILE_QUERIES]) : 1.0;
+  uint64_t loop = 0;
+  for (int i = 0; i < PHASE_COUNT; ++i) if (i != PHASE_RERANK) loop += h[i];
+  printf("phase_profile: queries=%llu pops=%llu cycles_per_pop=%.1f",
+         (unsigned long long)h[PROFILE_QUERIES], (unsigned long long)h[PROFILE_POPS],
+         loop / pops);
+  for (int i = 0; i < PHASE_COUNT; ++i)
+    printf(" %s=%.1f", names[i], i == PHASE_RERANK ? h[i] / queries : h[i] / pops);
+  printf("\n");
+  printf("  %-10s %12s %7s\n", "phase", "cycles/pop", "share");
+  for (int i = 0; i < PHASE_COUNT; ++i) {
+    if (i == PHASE_RERANK) continue;
+    printf("  %-10s %12.1f %6.1f%%\n", names[i], h[i] / pops,
+           loop ? 100.0 * h[i] / loop : 0.0);
+  }
+  printf("  %-10s %12.1f\n", "total", loop / pops);
+  if (h[PHASE_RERANK])
+    printf("  %-10s %12.1f cycles/query\n", "rerank", h[PHASE_RERANK] / queries);
 }
 
 inline void reset_phase_clocks() {
   void* ptr = nullptr;
   cudaGetSymbolAddress(&ptr, g_phase_clocks);
-  cudaMemset(ptr, 0, sizeof(uint64_t) * PHASE_COUNT);
+  cudaMemset(ptr, 0, sizeof(uint64_t) * PROFILE_SLOTS);
 }
 
 #else
 #define CLOCK_START(var)        ((void)0)
 #define CLOCK_ACCUM(var, phase) ((void)0)
-inline void print_phase_clocks(double = 1.98) {}
+#define PROFILE_COUNT(slot)     ((void)0)
+inline void print_phase_clocks() {}
 inline void reset_phase_clocks() {}
 #endif  // JASPER_PROFILE_CLOCKS
 

@@ -175,6 +175,12 @@ if(JASPER_BUILD_CMD)
   
   add_executable(run_query cmd/run_query.cu)
   target_link_libraries(run_query PRIVATE jasper)
+  # Per-phase cycle counts of the search kernels, printed after every timed
+  # search (beam_search_common.cuh). A profile build's QPS is not comparable.
+  option(JASPER_PROFILE_CLOCKS "Phase clock profiling in run_query" OFF)
+  if(JASPER_PROFILE_CLOCKS)
+    target_compile_definitions(run_query PRIVATE JASPER_PROFILE_CLOCKS)
+  endif()
   set_target_properties(run_query PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"

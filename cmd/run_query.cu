@@ -19,7 +19,7 @@
 
 #if defined(JASPER_PROFILE_CLOCKS)
 namespace jasper {
-__device__ uint64_t g_phase_clocks[PHASE_COUNT];
+__device__ uint64_t g_phase_clocks[PROFILE_SLOTS];
 }  // namespace jasper
 #endif
 
@@ -270,6 +270,8 @@ void run_search_round(jasper::graph<GraphCfg>& graph,
   cudaDeviceSynchronize();
   CUDA_CHECK(cudaGetLastError());
 
+  jasper::reset_phase_clocks();
+
   float duration_ms = 0;
   auto* frontier = chunked_search(
       d_queries, dim, n_queries, k,
@@ -309,6 +311,8 @@ void run_search_round(jasper::graph<GraphCfg>& graph,
   if (gt) {
     get_recall(*gt, h_indices.data(), k, n_queries);
   }
+
+  if (print_throughput) jasper::print_phase_clocks();
 
   cudaFree(d_indices);
   cudaFree(d_distances);

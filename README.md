@@ -130,6 +130,7 @@ scripts and `distortion_sweep`):
 
 | Script | What it measures |
 |---|---|
+| `profile_search.sbatch` | Where a search's time goes and how its pops spread over the graph, to pick the next optimization. Builds `run_query` with `-DJASPER_PROFILE_CLOCKS=ON` (every 64th query's block counts cycles per kernel phase: pop, fetch + exact, top-k insert, expand, estimate, duplicate check, sort, dedup, clip) and runs conventional, LSH and RaBitQ search at each compiled width's top, on device and host. Then `distortion_test --visit_stats` reports, per width, the share of pops a GPU-resident cache of the 0.1–20% most popped nodes would serve (ranked on half the queries, scored on the other half) and the pops before each query reaches its first true neighbor. `scripts/profile_summary.py` writes the tables. |
 | `bench_graph_build.sbatch` | Whether a better graph build helps. Builds each dataset's plain index under each `VARIANTS` entry (`L<n>` = the build search's beam width, `_2pass` = Vamana's two-pass build, otherwise `--one_pass`; `create_diskann_index` now defaults to `L192` two-pass, which needed 0.3–0.8× the nodes expanded of the old `L64` one-pass build at matched recall), then measures recall against nodes expanded per query with `distortion_test --pops` for conventional and directional search at 10@10 and 100@100. `L` is a build-time constant (`cmake -DJASPER_BUILD_L=<n>`), so each distinct `L` gets its own build directory. `scripts/compare_builds.py` summarizes. |
 
 ### Index construction at scale (DiskANN-style shard and merge)

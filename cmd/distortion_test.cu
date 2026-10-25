@@ -57,6 +57,7 @@
 #include <iostream>
 #include <random>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -129,7 +130,7 @@ struct Opts {
   bool        do_rotate = true, on_host = false;
   Method      method = Method::LSH;
 
-  std::string pops_out, traj_out, random_out;
+  std::string pops_out, traj_out, random_out, visit_out;
   std::vector<search_point> beam_limits;
   std::pair<uint32_t, uint32_t> traj_beam{64, 256};
   uint32_t    samples = 10000;
@@ -357,6 +358,97 @@ static void score_and_write(jasper::graph<GraphCfg>& g, Codes<GraphCfg>& c,
             << " neighborhoods -> " << path << std::endl;
 }
 
+// ── Visit skew (--visit_stats) ─────────────────────────────────────────────
+// How concentrated one search point's pops are on few nodes: what a cache of
+// the most-visited nodes in GPU memory would serve when the graph lives in
+// host memory. In the directional layout every pop reads the same bytes (u's
+// vector, edges and codes), so the share of pops on cached nodes is the share
+// of per-pop PCIe traffic the cache absorbs. (Conventional search reads its
+// neighbors' vectors rather than the popped node's, so for it this is only
+// the pop distribution.) The ranking is learned on the even-numbered queries
+// and scored on the odd ones, so a node does not look hot just because the
+// queries scoring it are the ones that chose it.
+//
+// Also the descent: pops before a query first expands one of its true k
+// nearest neighbors, the part of the search spent getting near the answer
+// (better entry points would cut it). Queries that never expand one count in
+// never_frac and not in the descent figures.
+static constexpr double kCacheFracs[] = {0.001, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2};
+
+static void write_visit_stats_header(std::ofstream& out) {
+  out << "method,k_ranks,beam_width,limit,stop,gamma,rerank,recall,mean_pops,n_nodes,"
+         "distinct_frac,test_pops";
+  for (double f : kCacheFracs) out << ",hit_" << f;
+  out << ",descent_mean,descent_p50,descent_p95,descent_share,never_frac\n";
+}
+
+template <typename GraphCfg>
+static void write_visit_stats(std::ofstream& out, const std::string& point_cols,
+                              const Trajectories<GraphCfg>& t, const GroundTruth& gt,
+                              uint32_t k, uint64_t n_nodes) {
+  constexpr uint32_t NONE = 0xFFFFFFFFu;
+  const auto pops_of = [&](uint32_t i) { return t.visited.data() + size_t(i) * t.stride; };
+
+  // Rank nodes by pops over the even queries; mark every node popped at all.
+  std::vector<uint32_t> train(n_nodes, 0);
+  std::vector<uint8_t>  seen(n_nodes, 0);
+  for (uint32_t i = 0; i < t.n_queries; ++i) {
+    const auto* v = pops_of(i);
+    for (uint32_t j = 0; j < t.counts[i]; ++j) {
+      const uint32_t id = v[j].first;
+      if (id >= n_nodes) continue;
+      seen[id] = 1;
+      if (i % 2 == 0) ++train[id];
+    }
+  }
+  std::vector<uint32_t> hot;
+  for (uint32_t id = 0; id < n_nodes; ++id) if (train[id]) hot.push_back(id);
+  std::stable_sort(hot.begin(), hot.end(),
+                   [&](uint32_t a, uint32_t b) { return train[a] > train[b]; });
+  std::vector<uint32_t> rank(n_nodes, NONE);
+  for (uint32_t r = 0; r < hot.size(); ++r) rank[hot[r]] = r;
+
+  // Score the odd queries' pops against caches of each size.
+  constexpr size_t NF = sizeof(kCacheFracs) / sizeof(kCacheFracs[0]);
+  uint64_t cap[NF], hits[NF] = {}, test_pops = 0;
+  for (size_t f = 0; f < NF; ++f) cap[f] = uint64_t(std::ceil(kCacheFracs[f] * n_nodes));
+  for (uint32_t i = 1; i < t.n_queries; i += 2) {
+    const auto* v = pops_of(i);
+    for (uint32_t j = 0; j < t.counts[i]; ++j) {
+      ++test_pops;
+      const uint32_t id = v[j].first;
+      const uint32_t r = id < n_nodes ? rank[id] : NONE;
+      for (size_t f = 0; f < NF; ++f) hits[f] += (r < cap[f]);
+    }
+  }
+
+  // Descent: pops before the first expanded true neighbor.
+  std::vector<uint32_t> descent;
+  double share = 0;
+  uint32_t never = 0;
+  for (uint32_t i = 0; i < t.n_queries; ++i) {
+    std::set<uint32_t> truth(gt.ids.begin() + size_t(i) * k, gt.ids.begin() + size_t(i + 1) * k);
+    const auto* v = pops_of(i);
+    uint32_t j = 0;
+    while (j < t.counts[i] && !truth.count(v[j].first)) ++j;
+    if (j == t.counts[i]) { ++never; continue; }
+    descent.push_back(j);
+    share += double(j) / t.counts[i];
+  }
+  double mean = 0;
+  for (uint32_t d : descent) mean += d;
+  std::sort(descent.begin(), descent.end());
+  const auto pct = [&](size_t p) { return descent.empty() ? 0u : descent[descent.size() * p / 100]; };
+  const size_t found = descent.size();
+
+  uint64_t distinct = 0;
+  for (uint8_t x : seen) distinct += x;
+  out << point_cols << ',' << n_nodes << ',' << double(distinct) / n_nodes << ',' << test_pops;
+  for (size_t f = 0; f < NF; ++f) out << ',' << (test_pops ? double(hits[f]) / test_pops : 0.0);
+  out << ',' << (found ? mean / found : 0.0) << ',' << pct(50) << ',' << pct(95) << ','
+      << (found ? share / found : 0.0) << ',' << double(never) / t.n_queries << '\n';
+}
+
 // ── The three experiments ──────────────────────────────────────────────────
 template <typename GraphCfg, Method M>
 static void run_pops(jasper::graph<GraphCfg>& g, Codes<GraphCfg>& c,
@@ -366,6 +458,13 @@ static void run_pops(jasper::graph<GraphCfg>& g, Codes<GraphCfg>& c,
   out << "method,k_ranks,beam_width,limit,recall,mean_pops,p50_pops,p95_pops,capped_frac,"
          "mean_vectors_fetched,stop,gamma,mean_unique_pops,dup_topk_frac,rerank,"
          "mean_reranked\n";
+  std::ofstream visit_out;
+  if (!o.visit_out.empty()) {
+    visit_out.open(o.visit_out);
+    if (!visit_out) throw std::runtime_error("Cannot open output: " + o.visit_out);
+    write_visit_stats_header(visit_out);
+    visit_out << std::setprecision(6);
+  }
   std::cout << "\n=== recall vs pops (" << method_name(M) << " k_ranks="
             << static_cast<uint32_t>(GraphCfg::k_ranks) << ") ===" << std::endl;
 
@@ -426,6 +525,15 @@ static void run_pops(jasper::graph<GraphCfg>& g, Codes<GraphCfg>& c,
     if (gamma >= 0.0f) out << "adaptive," << gamma;
     else               out << "beam,";
     out << ',' << mean_unique << ',' << dup_frac << ',' << rerank << ',' << reranked << '\n';
+    if (visit_out.is_open()) {
+      std::ostringstream cols;
+      cols << std::setprecision(6) << method_name(M) << ','
+           << static_cast<uint32_t>(GraphCfg::k_ranks) << ',' << bw << ',' << lim << ','
+           << (gamma >= 0.0f ? "adaptive," : "beam,");
+      if (gamma >= 0.0f) cols << gamma;
+      cols << ',' << rerank << ',' << recall << ',' << mean;
+      write_visit_stats(visit_out, cols.str(), t, gt, o.k, g.n_vectors);
+    }
     std::cout << "  beam_width=" << bw << " limit=" << lim;
     if (gamma >= 0.0f) std::cout << " gamma=" << std::setprecision(6) << gamma;
     if (rerank > 0) std::cout << " rerank=" << rerank;
@@ -442,6 +550,7 @@ static void run_pops(jasper::graph<GraphCfg>& g, Codes<GraphCfg>& c,
     std::cout.unsetf(std::ios::fixed);
   }
   std::cout << "  wrote " << o.pops_out << std::endl;
+  if (visit_out.is_open()) std::cout << "  wrote " << o.visit_out << std::endl;
 }
 
 template <typename GraphCfg, Method M>
@@ -640,6 +749,9 @@ int main(int argc, char** argv) {
 
   program.add_argument("--pops").default_value(std::string{})
       .help("CSV: recall@k vs nodes popped per query, one row per --beam_limits pair.");
+  program.add_argument("--visit_stats").default_value(std::string{})
+      .help("CSV (with --pops): per point, the share of pops a cache of the most-visited "
+            "nodes would serve, and the pops before the first true neighbor.");
   program.add_argument("--beam_limits", "-b")
       .default_value(std::vector<std::string>{"8:64", "16:128", "32:128", "64:256",
                                               "128:256", "256:512", "512:1024"})
@@ -676,6 +788,7 @@ int main(int argc, char** argv) {
   o.do_rotate   = !program.get<bool>("--no_rotate");
   o.rotate_seed = program.get<uint64_t>("--rotate_seed");
   o.pops_out    = program.get<std::string>("--pops");
+  o.visit_out   = program.get<std::string>("--visit_stats");
   o.traj_out    = program.get<std::string>("--trajectory");
   o.random_out  = program.get<std::string>("--random");
   o.samples     = program.get<uint32_t>("--samples");
@@ -692,6 +805,10 @@ int main(int argc, char** argv) {
     o.traj_beam = parse_pair(program.get<std::string>("--traj_beam"));
   } catch (const std::exception& e) {
     std::cerr << "Error: " << e.what() << std::endl;
+    return 1;
+  }
+  if (!o.visit_out.empty() && o.pops_out.empty()) {
+    std::cerr << "Error: --visit_stats needs --pops (it reads the same searches)" << std::endl;
     return 1;
   }
   if (o.pops_out.empty() && o.traj_out.empty() && o.random_out.empty()) {

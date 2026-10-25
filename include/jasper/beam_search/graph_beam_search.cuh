@@ -258,7 +258,6 @@ __global__ void graph_beam_search_kernel(
     auto [frontierIdx, found] =
         choose_new_frontier<INDEX_T, DISTANCE_T, BLOCK_SIZE, MAX_SEARCH_WIDTH>(
             result_buffer, result_buffer_count);
-    CLOCK_ACCUM(t_pop, PHASE_POP);
     if (!found || frontierIdx >= beam_width) break;
 
     // 1b) Adaptive termination (adaptive_stop_slack): stop before visiting u
@@ -301,6 +300,8 @@ __global__ void graph_beam_search_kernel(
         result_buffer[frontierIdx] = set_visited(result_buffer[frontierIdx]);
     }
     __syncthreads();
+    CLOCK_ACCUM(t_pop, PHASE_POP);
+    PROFILE_COUNT(PROFILE_POPS);
 
     const INDEX_T u_gid =
         static_cast<INDEX_T>(get_index(result_buffer[frontierIdx]));
@@ -469,7 +470,7 @@ __global__ void graph_beam_search_kernel(
       }
       __syncthreads();
     }
-    CLOCK_ACCUM(t_unique, PHASE_DEDUP);
+    CLOCK_ACCUM(t_unique, PHASE_UNIQUE);
 
     // 7) Sort / dedup / clip the candidate buffer (estimated distances).
     CLOCK_START(t_sort);
@@ -504,8 +505,10 @@ __global__ void graph_beam_search_kernel(
   // clears every other slot; the scan and the merge are serial but touch only
   // shared memory.
   uint32_t n_reranked = 0;  // thread 0's count
+  PROFILE_COUNT(PROFILE_QUERIES);
   if (rerank > 0) {
     __syncthreads();
+    CLOCK_START(t_rerank);
     if (threadIdx.x == 0) {
       const uint32_t count = result_buffer_count[0];
       for (uint32_t i = 0; i < count; ++i) {
@@ -529,6 +532,7 @@ __global__ void graph_beam_search_kernel(
                                frontier_buffer, frontier_buffer_count, k);
       }
     }
+    CLOCK_ACCUM(t_rerank, PHASE_RERANK);
   }
 
   // ---- Write top-k from frontier_buffer (already sorted ascending),

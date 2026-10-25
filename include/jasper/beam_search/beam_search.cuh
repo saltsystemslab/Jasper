@@ -12,6 +12,7 @@
 #include "jasper/beam_search/config.cuh"
 #include "jasper/beam_search/entry.cuh"
 #include "jasper/beam_search/device_kernels.cuh"
+#include "jasper/beam_search/beam_search_common.cuh"  // phase clocks
 #include "jasper/distance/distance.cuh"
 
 #include "assert.h"
@@ -130,6 +131,7 @@ __global__ void beam_search_kernel(
 
     loop_count += 1;
     // choose a new frontier to explore
+    CLOCK_START(t_pop);
     _CLK_START();
     auto [frontierIdx, found] =
         choose_new_frontier<INDEX_T, DISTANCE_T, BLOCK_SIZE, MAX_SEARCH_WIDTH>(
@@ -151,6 +153,8 @@ __global__ void beam_search_kernel(
     }
     __syncthreads();
     _CLK_REC(clk_insert_hash);
+    CLOCK_ACCUM(t_pop, PHASE_POP);
+    PROFILE_COUNT(PROFILE_POPS);
     
     // Add frontier to visited list
     // we do not add the first point
@@ -172,35 +176,46 @@ __global__ void beam_search_kernel(
     __syncthreads();
 
     // Add frontier's neighbor to results
+    CLOCK_START(t_expand);
     _CLK_START();
     add_frontier_out<GRAPH_CFG>(graph, result_buffer, result_buffer_count,
                      get_index(result_buffer[frontierIdx]), k, beam_width);
     __syncthreads();
     _CLK_REC(clk_add_frontier_out);
+    CLOCK_ACCUM(t_expand, PHASE_EXPAND);
 
     // populate distance
+    CLOCK_START(t_estimate);
     _CLK_START();
     populate_distances<GRAPH_CFG, TILE_SIZE, DISTANCE_FUNC>(smem_query_vec, graph,
                                          result_buffer, result_buffer_count,
                                          offset);
     __syncthreads();
     _CLK_REC(clk_populate_distances);
+    CLOCK_ACCUM(t_estimate, PHASE_ESTIMATE);
 
     // sort the result buffer
+    CLOCK_START(t_sort);
     _CLK_START();
     merge_sort<INDEX_T, DISTANCE_T, BLOCK_SIZE, MAX_SEARCH_WIDTH, BlockMergeSortT>(
         result_buffer, result_buffer_count, temp_storage.sort_storage);
     _CLK_REC(clk_merge_sort);
+    CLOCK_ACCUM(t_sort, PHASE_SORT);
 
+    CLOCK_START(t_dedup);
     _CLK_START();
     dedup_results<INDEX_T, DISTANCE_T, BLOCK_SIZE, MAX_SEARCH_WIDTH, BlockScanT>(
         result_buffer, result_buffer_count, temp_storage.scan_storage);
     _CLK_REC(clk_dedup);
+    CLOCK_ACCUM(t_dedup, PHASE_DEDUP);
 
+    CLOCK_START(t_clip);
     _CLK_START();
     clip_k(result_buffer_count, beam_width);
     _CLK_REC(clk_clip_k);
+    CLOCK_ACCUM(t_clip, PHASE_CLIP);
   }
+  PROFILE_COUNT(PROFILE_QUERIES);
 
   // copy to the external result, skipping any soft-deleted vertices so they
   // never surface in search results (matches JasperGPUANNS beam search).

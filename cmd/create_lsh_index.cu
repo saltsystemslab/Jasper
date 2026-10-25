@@ -17,7 +17,7 @@
 
 #if defined(JASPER_PROFILE_CLOCKS)
 namespace jasper {
-__device__ uint64_t g_phase_clocks[PHASE_COUNT];
+__device__ uint64_t g_phase_clocks[PROFILE_SLOTS];
 }  // namespace jasper
 #endif
 
